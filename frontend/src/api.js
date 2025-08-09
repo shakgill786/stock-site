@@ -1,5 +1,3 @@
-// frontend/src/api.js
-
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 export async function fetchHello() {
@@ -31,6 +29,24 @@ export async function fetchEarnings(ticker) {
   const res = await fetch(`${API_BASE}/earnings?ticker=${ticker}`);
   if (!res.ok) {
     const err = await res.json();
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchDividends(ticker) {
+  const res = await fetch(`${API_BASE}/dividends?ticker=${ticker}`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchMarket() {
+  const res = await fetch(`${API_BASE}/market`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `HTTP ${res.status}`);
   }
   return res.json();
