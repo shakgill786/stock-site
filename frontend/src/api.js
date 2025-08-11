@@ -17,7 +17,7 @@ export async function fetchPredict({ ticker, models }) {
 }
 
 export async function fetchQuote(ticker) {
-  const res = await fetch(`${API_BASE}/quote?ticker=${ticker}`);
+  const res = await fetch(`${API_BASE}/quote?ticker=${encodeURIComponent(ticker)}`);
   if (!res.ok) {
     const err = await res.json();
     throw new Error(err.detail || `HTTP ${res.status}`);
@@ -26,7 +26,7 @@ export async function fetchQuote(ticker) {
 }
 
 export async function fetchEarnings(ticker) {
-  const res = await fetch(`${API_BASE}/earnings?ticker=${ticker}`);
+  const res = await fetch(`${API_BASE}/earnings?ticker=${encodeURIComponent(ticker)}`);
   if (!res.ok) {
     const err = await res.json();
     throw new Error(err.detail || `HTTP ${res.status}`);
@@ -34,8 +34,9 @@ export async function fetchEarnings(ticker) {
   return res.json();
 }
 
+// (unused but harmless)
 export async function fetchDividends(ticker) {
-  const res = await fetch(`${API_BASE}/dividends?ticker=${ticker}`);
+  const res = await fetch(`${API_BASE}/dividends?ticker=${encodeURIComponent(ticker)}`);
   if (!res.ok) {
     const err = await res.json();
     throw new Error(err.detail || `HTTP ${res.status}`);
@@ -50,4 +51,11 @@ export async function fetchMarket() {
     throw new Error(err.detail || `HTTP ${res.status}`);
   }
   return res.json();
+}
+
+// ---- NEW: closes for sparkline ----
+export async function fetchCloses(ticker, days = 7) {
+  const res = await fetch(`${API_BASE}/closes?ticker=${encodeURIComponent(ticker)}&days=${days}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json(); // { ticker, closes: number[] }
 }

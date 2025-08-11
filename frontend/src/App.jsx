@@ -3,6 +3,7 @@ import {
   fetchPredict,
   fetchQuote,
   fetchEarnings,
+  fetchCloses,
   fetchMarket,
 } from "./api";
 import MarketCard from "./components/MarketCard";
@@ -12,6 +13,7 @@ import MetricsList from "./components/MetricsList";
 import WatchlistPanel from "./components/WatchlistPanel";
 import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
+import CompareMode from "./components/CompareMode"; // ⬅️ NEW
 import "./App.css";
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
@@ -41,6 +43,9 @@ export default function App() {
   const prevPriceRef = useRef(null);
   const tweenPrice = useTweenNumber(quote?.current_price ?? 0, { duration: 450 });
   const [blinkClass, setBlinkClass] = useState("");
+
+  // Compare Mode
+  const [compareOpen, setCompareOpen] = useState(false); // ⬅️ NEW
 
   const loadData = useCallback(async () => {
     setQuoteErr(false);
@@ -172,6 +177,20 @@ export default function App() {
       {/* RIGHT: Main content */}
       <div>
         <h1>Real-Time Stock & Crypto Dashboard</h1>
+
+        {/* Compare Mode Toggle */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+          <button onClick={() => setCompareOpen((v) => !v)}>
+            {compareOpen ? "Close Compare" : "Open Compare"}
+          </button>
+        </div>
+
+        {compareOpen && (
+          <CompareMode
+            defaultModels={models}
+            onExit={() => setCompareOpen(false)}
+          />
+        )}
 
         <form onSubmit={handleSubmit} style={{ marginBottom: 16, display: "flex", gap: 8 }}>
           <input

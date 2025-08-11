@@ -1,3 +1,5 @@
+# backend/app/routes.py
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List
@@ -43,31 +45,26 @@ async def predict(req: PredictRequest):
 # ---------- Quote / Earnings / Market ----------
 @router.get("/quote")
 async def quote_endpoint(ticker: str):
-    return get_quote(ticker)
+  return get_quote(ticker)
 
 @router.get("/earnings")
 async def earnings_endpoint(ticker: str):
-    return get_earnings(ticker)
+  return get_earnings(ticker)
 
 @router.get("/market")
 async def market_endpoint():
-    return get_market_breadth()
+  return get_market_breadth()
 
 # ---------- Live quote stream (SSE) ----------
 @router.get("/quote_stream")
 async def quote_stream(ticker: str, interval: float = 5.0):
-    """
-    Server-Sent Events stream of quotes.
-    usage (browser): new EventSource(`/quote_stream?ticker=AAPL&interval=5`)
-    """
     interval = max(1.0, min(float(interval), 60.0))
-
     async def event_gen():
         try:
             while True:
-                q = get_quote(ticker)  # reuse your existing provider
+                q = get_quote(ticker)
                 payload = {
-                    "ticker": q.get("ticker", ticker.upper()),
+                    "ticker": q.get("ticker", str(ticker).upper()),
                     "current_price": q.get("current_price"),
                     "last_close": q.get("last_close"),
                     "change_pct": q.get("change_pct"),
@@ -76,7 +73,20 @@ async def quote_stream(ticker: str, interval: float = 5.0):
                 yield f"data: {json.dumps(payload)}\n\n"
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
-            # client disconnected
             return
-
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+# ---------- Tiny closes endpoint for sparklines ----------
+@router.get("/closes")
+async def closes_endpoint(ticker: str, days: int = 7):
+    """
+    Returns the last N daily closes for a ticker.
+    Shape: { "ticker": "AAPL", "closes": [ ... ] }
+    """
+    # Lazy import to avoid coupling at module import time
+    from app.services.tech_service import _fetch_series_first, _base_variants
+    days = max(2, min(int(days), 60))
+    series = _fetch_series_first(_base_variants(ticker), max(days, 10))
+    if not series:
+        return {"ticker": str(ticker).upper(), "closes": []}
+    return {"ticker": str(ticker).upper(), "closes": series[-days:]}
