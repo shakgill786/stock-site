@@ -40,3 +40,18 @@
 .read-the-docs {
   color: #888;
 }
+
+.blink-up {
+  animation: blinkUp 500ms ease-out;
+}
+.blink-down {
+  animation: blinkDown 500ms ease-out;
+}
+@keyframes blinkUp {
+  0% { background: rgba(0, 200, 0, 0.2); }
+  100% { background: transparent; }
+}
+@keyframes blinkDown {
+  0% { background: rgba(220, 0, 0, 0.2); }
+  100% { background: transparent; }
+}

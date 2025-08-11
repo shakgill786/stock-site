@@ -1,21 +1,22 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   fetchPredict,
   fetchQuote,
   fetchEarnings,
-  fetchDividends,
   fetchMarket,
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
-import DividendCard from "./components/DividendCard";
 import RecommendationCard from "./components/RecommendationCard";
 import MetricsList from "./components/MetricsList";
-import RSIChart from "./components/RSIChart";
-import CorrelationChart from "./components/CorrelationChart";
+import WatchlistPanel from "./components/WatchlistPanel";
+import useEventSource from "./hooks/useEventSource";
+import useTweenNumber from "./hooks/useTweenNumber";
 import "./App.css";
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
+const API_BASE =
+  (import.meta.env.VITE_API_BASE || import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000");
 
 export default function App() {
   const [ticker, setTicker] = useState("AAPL");
@@ -24,38 +25,35 @@ export default function App() {
   // Data states
   const [quote, setQuote] = useState(null);
   const [earnings, setEarnings] = useState(null);
-  const [dividends, setDividends] = useState(null);
   const [market, setMarket] = useState(null);
 
-  // Error flags for individual cards
+  // Errors
   const [quoteErr, setQuoteErr] = useState(false);
   const [earningsErr, setEarningsErr] = useState(false);
-  const [dividendsErr, setDividendsErr] = useState(false);
 
-  // Prediction states
+  // Predictions
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const [autoRefresh, setAutoRefresh] = useState(false);
-
-  // --- NEW: tech states (optional; they render N/A if backend not ready) ---
-  const [rsi, setRsi] = useState(null);           // { period: 14, values: number[] }
-  const [corr, setCorr] = useState(null);         // { VIX: number, SPY: number, ... }
-  const [techErr, setTechErr] = useState(false);
+  // Live stream
+  const [live, setLive] = useState(true);
+  const prevPriceRef = useRef(null);
+  const tweenPrice = useTweenNumber(quote?.current_price ?? 0, { duration: 450 });
+  const [blinkClass, setBlinkClass] = useState("");
 
   const loadData = useCallback(async () => {
-    // reset errors
     setQuoteErr(false);
     setEarningsErr(false);
-    setDividendsErr(false);
-    setTechErr(false);
     setError("");
+
+    const t = String(ticker || "").toUpperCase().trim();
 
     // 1) Quote
     try {
-      const q = await fetchQuote(ticker);
+      const q = await fetchQuote(t);
       setQuote(q);
+      prevPriceRef.current = q.current_price;
     } catch {
       setQuoteErr(true);
       setQuote(null);
@@ -63,23 +61,14 @@ export default function App() {
 
     // 2) Earnings
     try {
-      const e = await fetchEarnings(ticker);
+      const e = await fetchEarnings(t);
       setEarnings(e);
     } catch {
       setEarningsErr(true);
       setEarnings(null);
     }
 
-    // 3) Dividends
-    try {
-      const d = await fetchDividends(ticker);
-      setDividends(d);
-    } catch {
-      setDividendsErr(true);
-      setDividends(null);
-    }
-
-    // 4) Market
+    // 3) Market
     try {
       const m = await fetchMarket();
       setMarket(m);
@@ -87,43 +76,50 @@ export default function App() {
       setMarket(null);
     }
 
-    // 5) Predictions
+    // 4) Predictions
     setLoading(true);
     try {
-      const { results } = await fetchPredict({ ticker, models });
+      const { results } = await fetchPredict({ ticker: t, models });
       setResults(results);
     } catch (e) {
-      setError(e.message);
+      setError(e.message || "Prediction fetch failed");
       setResults([]);
     } finally {
       setLoading(false);
-    }
-
-    // 6) Tech (optional; will show N/A if not available)
-    try {
-      // These helpers call /rsi and /correlation if you add them later.
-      const [rsiMod, corrMod] = await Promise.allSettled([
-        import("./techApi").then(m => m.fetchRSI(ticker)),
-        import("./techApi").then(m => m.fetchCorrelation(ticker)),
-      ]);
-      if (rsiMod.status === "fulfilled") setRsi(rsiMod.value);
-      else setRsi(null);
-      if (corrMod.status === "fulfilled") setCorr(corrMod.value);
-      else setCorr(null);
-    } catch {
-      setTechErr(true);
-      setRsi(null);
-      setCorr(null);
     }
   }, [ticker, models]);
 
   useEffect(() => {
     loadData();
-    if (autoRefresh) {
-      const iv = setInterval(loadData, 60_000);
-      return () => clearInterval(iv);
-    }
-  }, [loadData, autoRefresh]);
+  }, [loadData]);
+
+  // Live SSE: only updates the quote card smoothly
+  const streamUrl = live ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5` : null;
+
+  useEventSource(streamUrl, {
+    enabled: !!streamUrl,
+    onMessage: (payload) => {
+      const prev = prevPriceRef.current;
+      const next = Number(payload.current_price);
+      if (typeof next === "number" && !Number.isNaN(next)) {
+        setQuote((q) =>
+          q
+            ? { ...q, current_price: next, change_pct: payload.change_pct }
+            : {
+                ticker: payload.ticker,
+                current_price: next,
+                last_close: payload.last_close,
+                change_pct: payload.change_pct,
+              }
+        );
+        if (typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
+          setBlinkClass(next > prev ? "blink-up" : "blink-down");
+          setTimeout(() => setBlinkClass(""), 520);
+        }
+        prevPriceRef.current = next;
+      }
+    },
+  });
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -135,7 +131,7 @@ export default function App() {
       prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]
     );
 
-  // --- NEW: compute proxy metrics & recommendation on the client ---
+  // Client-side metrics & recommendation
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
     const base = Number(quote.last_close) || 0;
@@ -148,17 +144,12 @@ export default function App() {
       const meanPred =
         r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
       const avgChangePct = ((meanPred - base) / base) * 100;
-      return {
-        model: r.model,
-        mapeProxy,        // 0.0123 -> 1.23%
-        avgChangePct,     // direction/strength
-      };
+      return { model: r.model, mapeProxy, avgChangePct };
     });
   }, [quote, results]);
 
   const recommendation = useMemo(() => {
     if (!metrics.length) return null;
-    // lowest proxy-MAPE wins
     const best = [...metrics].sort((a, b) => a.mapeProxy - b.mapeProxy)[0];
     let action = "Hold";
     if (best.avgChangePct > 1) action = "Buy";
@@ -167,112 +158,104 @@ export default function App() {
   }, [metrics]);
 
   return (
-    <div style={{ padding: 20, maxWidth: 1000, margin: "auto" }}>
-      <h1>Real-Time Stock & Crypto Dashboard</h1>
+    <div style={{ padding: 20, maxWidth: 1100, margin: "auto", display: "grid", gridTemplateColumns: "260px 1fr", gap: 16 }}>
+      {/* LEFT: Watchlist */}
+      <div>
+        <WatchlistPanel current={ticker} onLoad={(s) => setTicker(s)} />
+        <div style={{ marginTop: 12 }}>
+          <label>
+            <input type="checkbox" checked={live} onChange={() => setLive((v) => !v)} /> Live price updates (SSE)
+          </label>
+        </div>
+      </div>
 
-      <form onSubmit={handleSubmit} style={{ marginBottom: 16, display: "flex", gap: 8 }}>
-        <input
-          value={ticker}
-          onChange={(e) => setTicker(e.target.value.toUpperCase())}
-          placeholder="Ticker (e.g. AAPL or BTC-USD)"
-          required
-        />
-        <button disabled={loading}>
-          {loading ? "Loading…" : "Load Data"}
-        </button>
-      </form>
+      {/* RIGHT: Main content */}
+      <div>
+        <h1>Real-Time Stock & Crypto Dashboard</h1>
 
-      <label style={{ display: "block", marginBottom: 16 }}>
-        <input
-          type="checkbox"
-          checked={autoRefresh}
-          onChange={() => setAutoRefresh((v) => !v)}
-        />{" "}
-        🔄 Auto-refresh every 60 s
-      </label>
+        <form onSubmit={handleSubmit} style={{ marginBottom: 16, display: "flex", gap: 8 }}>
+          <input
+            value={ticker}
+            onChange={(e) => setTicker(e.target.value.toUpperCase())}
+            placeholder="Ticker (e.g. AAPL or BTC-USD)"
+            required
+          />
+          <button disabled={loading}>{loading ? "Loading…" : "Load Data"}</button>
+        </form>
 
-      {/* Top info row */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 12 }}>
-        {/* Quote Card */}
-        <div style={cardStyle}>
-          <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
-          {quoteErr ? (
-            <p style={{ color: "red", margin: 0 }}>Error loading quote</p>
-          ) : quote ? (
-            <>
-              <p style={{ margin: 0 }}>Last Close: ${quote.last_close}</p>
-              <p style={{ margin: 0 }}>
-                ${quote.current_price}{" "}
-                {quote.change_pct >= 0 ? "🔺" : "🔻"}{" "}
-                {Math.abs(quote.change_pct)}%
-              </p>
-            </>
-          ) : (
-            <p style={{ color: "#666", margin: 0 }}>N/A</p>
-          )}
+        {/* Top info row */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 12 }}>
+          {/* Quote Card */}
+          <div style={cardStyle} className={blinkClass}>
+            <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+            {quoteErr ? (
+              <p style={{ color: "red", margin: 0 }}>Error loading quote</p>
+            ) : quote ? (
+              <>
+                <p style={{ margin: 0 }}>Last Close: ${Number(quote.last_close).toFixed(2)}</p>
+                <p style={{ margin: 0 }}>
+                  ${tweenPrice.toFixed(2)}{" "}
+                  {quote.change_pct >= 0 ? "🔺" : "🔻"} {Math.abs(Number(quote.change_pct)).toFixed(2)}%
+                </p>
+              </>
+            ) : (
+              <p style={{ color: "#666", margin: 0 }}>N/A</p>
+            )}
+          </div>
+
+          {/* Earnings */}
+          <EarningsCard earnings={earnings} />
+
+          {/* Recommendation */}
+          <RecommendationCard recommendation={recommendation} />
         </div>
 
-        {/* Earnings & Dividends */}
-        <EarningsCard earnings={earnings} />
-        <DividendCard dividends={dividends} />
+        {/* Market Breadth */}
+        {market && <MarketCard market={market} />}
 
-        {/* NEW: Recommendation */}
-        <RecommendationCard recommendation={recommendation} />
-      </div>
+        {/* Metrics list */}
+        {!!metrics.length && <MetricsList metrics={metrics} />}
 
-      {/* Market Breadth */}
-      {market && <MarketCard market={market} />}
+        {/* Prediction Error */}
+        {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
-      {/* NEW: Metrics list (proxy MAPE per model) */}
-      {!!metrics.length && (
-        <MetricsList metrics={metrics} />
-      )}
+        {/* Model selector */}
+        <div style={{ marginTop: 12, marginBottom: 8 }}>
+          {MODEL_OPTIONS.map((m) => (
+            <label key={m} style={{ marginRight: 12 }}>
+              <input
+                type="checkbox"
+                checked={models.includes(m)}
+                onChange={() => toggleModel(m)}
+              />{" "}
+              {m}
+            </label>
+          ))}
+        </div>
 
-      {/* Prediction Error */}
-      {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
-
-      {/* Model selector */}
-      <div style={{ marginTop: 12, marginBottom: 8 }}>
-        {MODEL_OPTIONS.map((m) => (
-          <label key={m} style={{ marginRight: 12 }}>
-            <input
-              type="checkbox"
-              checked={models.includes(m)}
-              onChange={() => toggleModel(m)}
-            />{" "}
-            {m}
-          </label>
-        ))}
-      </div>
-
-      {/* Forecast Table */}
-      {results.length > 0 && (
-        <table style={tableStyle}>
-          <thead>
-            <tr>
-              <th style={thStyle}>Model</th>
-              {results[0].predictions.map((_, i) => (
-                <th key={i} style={thStyle}>{`+${i + 1}d`}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {results.map(({ model, predictions }) => (
-              <tr key={model}>
-                <td style={tdStyle}>{model}</td>
-                {predictions.map((val, i) => (
-                  <td key={i} style={tdStyle}>{val}</td>
+        {/* Forecast Table */}
+        {results.length > 0 && (
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={thStyle}>Model</th>
+                {results[0].predictions.map((_, i) => (
+                  <th key={i} style={thStyle}>{`+${i + 1}d`}</th>
                 ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {/* NEW: Tech section (scaffold) */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 16 }}>
-        <RSIChart rsi={rsi} />
-        <CorrelationChart corr={corr} />
+            </thead>
+            <tbody>
+              {results.map(({ model, predictions }) => (
+                <tr key={model}>
+                  <td style={tdStyle}>{model}</td>
+                  {predictions.map((val, i) => (
+                    <td key={i} style={tdStyle}>{val}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
