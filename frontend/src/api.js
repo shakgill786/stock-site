@@ -34,7 +34,7 @@ export async function fetchEarnings(ticker) {
   return res.json();
 }
 
-// (unused but harmless)
+// (unused but kept)
 export async function fetchDividends(ticker) {
   const res = await fetch(`${API_BASE}/dividends?ticker=${encodeURIComponent(ticker)}`);
   if (!res.ok) {
@@ -53,9 +53,15 @@ export async function fetchMarket() {
   return res.json();
 }
 
-// ---- NEW: closes for sparkline ----
 export async function fetchCloses(ticker, days = 7) {
   const res = await fetch(`${API_BASE}/closes?ticker=${encodeURIComponent(ticker)}&days=${days}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json(); // { ticker, closes: number[] }
+  return res.json();
+}
+
+// NEW: quick stats
+export async function fetchStats(ticker) {
+  const res = await fetch(`${API_BASE}/stats?ticker=${encodeURIComponent(ticker)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json(); // { ticker, high_52w, low_52w, market_cap, sector }
 }

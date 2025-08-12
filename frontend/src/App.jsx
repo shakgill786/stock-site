@@ -3,7 +3,6 @@ import {
   fetchPredict,
   fetchQuote,
   fetchEarnings,
-  fetchCloses,
   fetchMarket,
 } from "./api";
 import MarketCard from "./components/MarketCard";
@@ -13,7 +12,7 @@ import MetricsList from "./components/MetricsList";
 import WatchlistPanel from "./components/WatchlistPanel";
 import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
-import CompareMode from "./components/CompareMode"; // ⬅️ NEW
+import CompareMode from "./components/CompareMode";
 import "./App.css";
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
@@ -45,7 +44,7 @@ export default function App() {
   const [blinkClass, setBlinkClass] = useState("");
 
   // Compare Mode
-  const [compareOpen, setCompareOpen] = useState(false); // ⬅️ NEW
+  const [compareOpen, setCompareOpen] = useState(false);
 
   const loadData = useCallback(async () => {
     setQuoteErr(false);
@@ -163,145 +162,151 @@ export default function App() {
   }, [metrics]);
 
   return (
-    <div style={{ padding: 20, maxWidth: 1100, margin: "auto", display: "grid", gridTemplateColumns: "260px 1fr", gap: 16 }}>
-      {/* LEFT: Watchlist */}
-      <div>
-        <WatchlistPanel current={ticker} onLoad={(s) => setTicker(s)} />
-        <div style={{ marginTop: 12 }}>
-          <label>
-            <input type="checkbox" checked={live} onChange={() => setLive((v) => !v)} /> Live price updates (SSE)
-          </label>
-        </div>
-      </div>
-
-      {/* RIGHT: Main content */}
-      <div>
+    <div className="app-root">
+      {/* Top header (sticky at top, no overlap) */}
+      <header className="app-header">
         <h1>Real-Time Stock & Crypto Dashboard</h1>
+      </header>
 
-        {/* Compare Mode Toggle */}
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-          <button onClick={() => setCompareOpen((v) => !v)}>
-            {compareOpen ? "Close Compare" : "Open Compare"}
-          </button>
-        </div>
-
-        {compareOpen && (
-          <CompareMode
-            defaultModels={models}
-            onExit={() => setCompareOpen(false)}
-          />
-        )}
-
-        <form onSubmit={handleSubmit} style={{ marginBottom: 16, display: "flex", gap: 8 }}>
-          <input
-            value={ticker}
-            onChange={(e) => setTicker(e.target.value.toUpperCase())}
-            placeholder="Ticker (e.g. AAPL or BTC-USD)"
-            required
-          />
-          <button disabled={loading}>{loading ? "Loading…" : "Load Data"}</button>
-        </form>
-
-        {/* Top info row */}
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 12 }}>
-          {/* Quote Card */}
-          <div style={cardStyle} className={blinkClass}>
-            <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
-            {quoteErr ? (
-              <p style={{ color: "red", margin: 0 }}>Error loading quote</p>
-            ) : quote ? (
-              <>
-                <p style={{ margin: 0 }}>Last Close: ${Number(quote.last_close).toFixed(2)}</p>
-                <p style={{ margin: 0 }}>
-                  ${tweenPrice.toFixed(2)}{" "}
-                  {quote.change_pct >= 0 ? "🔺" : "🔻"} {Math.abs(Number(quote.change_pct)).toFixed(2)}%
-                </p>
-              </>
-            ) : (
-              <p style={{ color: "#666", margin: 0 }}>N/A</p>
-            )}
-          </div>
-
-          {/* Earnings */}
-          <EarningsCard earnings={earnings} />
-
-          {/* Recommendation */}
-          <RecommendationCard recommendation={recommendation} />
-        </div>
-
-        {/* Market Breadth */}
-        {market && <MarketCard market={market} />}
-
-        {/* Metrics list */}
-        {!!metrics.length && <MetricsList metrics={metrics} />}
-
-        {/* Prediction Error */}
-        {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
-
-        {/* Model selector */}
-        <div style={{ marginTop: 12, marginBottom: 8 }}>
-          {MODEL_OPTIONS.map((m) => (
-            <label key={m} style={{ marginRight: 12 }}>
+      <main className="container grid-2col">
+        {/* LEFT: Watchlist */}
+        <aside className="left-rail">
+          <WatchlistPanel current={ticker} onLoad={(s) => setTicker(s)} />
+          <div style={{ marginTop: 12 }}>
+            <label>
               <input
                 type="checkbox"
-                checked={models.includes(m)}
-                onChange={() => toggleModel(m)}
+                checked={live}
+                onChange={() => setLive((v) => !v)}
               />{" "}
-              {m}
+              Live price updates (SSE)
             </label>
-          ))}
-        </div>
+          </div>
+        </aside>
 
-        {/* Forecast Table */}
-        {results.length > 0 && (
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={thStyle}>Model</th>
-                {results[0].predictions.map((_, i) => (
-                  <th key={i} style={thStyle}>{`+${i + 1}d`}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {results.map(({ model, predictions }) => (
-                <tr key={model}>
-                  <td style={tdStyle}>{model}</td>
-                  {predictions.map((val, i) => (
-                    <td key={i} style={tdStyle}>{val}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+        {/* RIGHT: Main content */}
+        <section>
+          {/* Compare Mode Toggle */}
+          <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+            <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
+              {compareOpen ? "Close Compare" : "Open Compare"}
+            </button>
+          </div>
+
+          {compareOpen && (
+            <CompareMode
+              defaultModels={models}
+              onExit={() => setCompareOpen(false)}
+            />
+          )}
+
+          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16 }}>
+            <input
+              value={ticker}
+              onChange={(e) => setTicker(e.target.value.toUpperCase())}
+              placeholder="Ticker (e.g. AAPL or BTC-USD)"
+              required
+              type="text"
+            />
+            <button className="btn" disabled={loading}>
+              {loading ? "Loading…" : "Load Data"}
+            </button>
+          </form>
+
+          {/* Top info row */}
+          <div className="row" style={{ gap: 16, marginBottom: 12 }}>
+            {/* Quote Card */}
+            <div className={`card ${blinkClass}`} style={{ minWidth: 300, flex: "0 1 320px" }}>
+              <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+              {quoteErr ? (
+                <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
+                  Error loading quote
+                </p>
+              ) : quote ? (
+                <>
+                  <p style={{ margin: 0 }}>Last Close: ${Number(quote.last_close).toFixed(2)}</p>
+                  <p style={{ margin: 0 }}>
+                    ${tweenPrice.toFixed(2)}{" "}
+                    {quote.change_pct >= 0 ? "🔺" : "🔻"}{" "}
+                    {Math.abs(Number(quote.change_pct)).toFixed(2)}%
+                  </p>
+                </>
+              ) : (
+                <p className="muted" style={{ margin: 0 }}>N/A</p>
+              )}
+            </div>
+
+            {/* Earnings */}
+            <div className="card" style={{ minWidth: 300, flex: "0 1 320px" }}>
+              <EarningsCard earnings={earnings} />
+            </div>
+
+            {/* Recommendation */}
+            <div className="card" style={{ minWidth: 300, flex: "0 1 320px" }}>
+              <RecommendationCard recommendation={recommendation} />
+            </div>
+          </div>
+
+          {/* Market Breadth */}
+          {market && (
+            <div className="card">
+              <MarketCard market={market} />
+            </div>
+          )}
+
+          {/* Metrics list */}
+          {!!metrics.length && (
+            <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
+              <MetricsList metrics={metrics} />
+            </div>
+          )}
+
+          {/* Prediction Error */}
+          {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
+
+          {/* Model selector */}
+          <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
+            {MODEL_OPTIONS.map((m) => (
+              <label key={m} style={{ marginRight: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={models.includes(m)}
+                  onChange={() => toggleModel(m)}
+                />{" "}
+                {m}
+              </label>
+            ))}
+          </div>
+
+          {/* Forecast Table (wrapped to ensure no white bleed + proper overflow) */}
+          {results.length > 0 && (
+            <div className="card table-card">
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      {results[0].predictions.map((_, i) => (
+                        <th key={i}>{`+${i + 1}d`}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map(({ model, predictions }) => (
+                      <tr key={model}>
+                        <td>{model}</td>
+                        {predictions.map((val, i) => (
+                          <td key={i}>{Number(val).toFixed(2)}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+      </main>
     </div>
   );
 }
-
-const cardStyle = {
-  border: "1px solid #ddd",
-  borderRadius: 8,
-  padding: 16,
-  minWidth: 300,
-  flex: "0 1 320px",
-};
-
-const tableStyle = {
-  borderCollapse: "collapse",
-  width: "100%",
-  marginTop: 24,
-};
-
-const thStyle = {
-  border: "1px solid #ddd",
-  padding: 8,
-  background: "#f0f0f0",
-  textAlign: "left",
-};
-
-const tdStyle = {
-  border: "1px solid #ddd",
-  padding: 8,
-};

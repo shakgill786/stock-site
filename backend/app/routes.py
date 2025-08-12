@@ -4,13 +4,13 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List
 import random, json, asyncio, time
+from starlette.responses import StreamingResponse
 
 from app.services.finance_service import (
     get_quote,
     get_earnings,
     get_market_breadth,
 )
-from starlette.responses import StreamingResponse
 
 router = APIRouter()
 
@@ -45,15 +45,15 @@ async def predict(req: PredictRequest):
 # ---------- Quote / Earnings / Market ----------
 @router.get("/quote")
 async def quote_endpoint(ticker: str):
-  return get_quote(ticker)
+    return get_quote(ticker)
 
 @router.get("/earnings")
 async def earnings_endpoint(ticker: str):
-  return get_earnings(ticker)
+    return get_earnings(ticker)
 
 @router.get("/market")
 async def market_endpoint():
-  return get_market_breadth()
+    return get_market_breadth()
 
 # ---------- Live quote stream (SSE) ----------
 @router.get("/quote_stream")
@@ -76,17 +76,44 @@ async def quote_stream(ticker: str, interval: float = 5.0):
             return
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ---------- Tiny closes endpoint for sparklines ----------
+# ---------- Closes for sparklines ----------
 @router.get("/closes")
 async def closes_endpoint(ticker: str, days: int = 7):
-    """
-    Returns the last N daily closes for a ticker.
-    Shape: { "ticker": "AAPL", "closes": [ ... ] }
-    """
-    # Lazy import to avoid coupling at module import time
     from app.services.tech_service import _fetch_series_first, _base_variants
     days = max(2, min(int(days), 60))
     series = _fetch_series_first(_base_variants(ticker), max(days, 10))
     if not series:
         return {"ticker": str(ticker).upper(), "closes": []}
     return {"ticker": str(ticker).upper(), "closes": series[-days:]}
+
+# ---------- Quick stats (52w high/low; cap/sector placeholders) ----------
+@router.get("/stats")
+async def stats_endpoint(ticker: str):
+    """
+    Returns:
+      {
+        "ticker": "AAPL",
+        "high_52w": 229.35,
+        "low_52w": 155.12,
+        "market_cap": null,
+        "sector": null
+      }
+    """
+    from app.services.tech_service import _fetch_series_first, _base_variants
+    # ~52 trading weeks ≈ 252 trading days; grab a bit extra
+    series = _fetch_series_first(_base_variants(ticker), 270)
+    if not series:
+        return {
+            "ticker": str(ticker).upper(),
+            "high_52w": None,
+            "low_52w": None,
+            "market_cap": None,
+            "sector": None,
+        }
+    return {
+        "ticker": str(ticker).upper(),
+        "high_52w": float(max(series[-252:] if len(series) >= 252 else series)),
+        "low_52w": float(min(series[-252:] if len(series) >= 252 else series)),
+        "market_cap": None,  # TODO: wire to a profile endpoint if you like
+        "sector": None,      # TODO: wire to a profile endpoint if you like
+    }
