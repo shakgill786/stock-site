@@ -1,99 +1,92 @@
 import { useMemo, useState } from "react";
 import useLocalStorage from "../hooks/useLocalStorage";
 
-const TAGS = ["", "tech", "fintech", "crypto"];
-
 export default function WatchlistPanel({ current, onLoad }) {
   const [watchlist, setWatchlist] = useLocalStorage("WATCHLIST_V1", []);
-  const [sym, setSym] = useState("");
-  const [tag, setTag] = useState("");
-  const [filter, setFilter] = useState("");
+  const [symbol, setSymbol] = useState("");
+  const [tag, setTag] = useState("no tag");
+  const [filter, setFilter] = useState("all");
 
-  const list = useMemo(
-    () => (filter ? watchlist.filter((w) => (w.tag || "") === filter) : watchlist),
-    [watchlist, filter]
-  );
+  const filtered = useMemo(() => {
+    if (filter === "all") return watchlist;
+    return watchlist.filter((w) => (w.tag || "no tag") === filter);
+  }, [watchlist, filter]);
 
-  const add = (e) => {
-    e.preventDefault();
-    const s = sym.trim().toUpperCase();
+  const add = () => {
+    const s = symbol.trim().toUpperCase();
     if (!s) return;
     if (!watchlist.some((w) => w.symbol === s)) {
-      setWatchlist([{ symbol: s, tag: tag || "" }, ...watchlist]);
+      setWatchlist([...watchlist, { symbol: s, tag }]);
     }
-    setSym("");
+    setSymbol("");
   };
 
-  const remove = (symbol) => {
-    setWatchlist(watchlist.filter((w) => w.symbol !== symbol));
-  };
+  const remove = (s) => setWatchlist(watchlist.filter((w) => w.symbol !== s));
 
   return (
-    <div style={panel}>
-      <h3 style={{ margin: 0 }}>⭐ Watchlist</h3>
+    <div className="card">
+      <h3 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}>
+        <span>⭐</span> Watchlist
+      </h3>
 
-      <form onSubmit={add} style={{ display: "flex", gap: 8, marginTop: 8 }}>
+      {/* Header row — no overlap */}
+      <div className="watchlist-header">
         <input
-          value={sym}
-          onChange={(e) => setSym(e.target.value.toUpperCase())}
+          type="text"
           placeholder="Add ticker (e.g. MSFT)"
+          value={symbol}
+          onChange={(e) => setSymbol(e.target.value.toUpperCase())}
         />
         <select value={tag} onChange={(e) => setTag(e.target.value)}>
-          {TAGS.map((t) => (
-            <option key={t} value={t}>{t || "no tag"}</option>
-          ))}
+          <option>no tag</option>
+          <option>tech</option>
+          <option>fintech</option>
+          <option>crypto</option>
         </select>
-        <button type="submit">Add</button>
-      </form>
-
-      <div style={{ marginTop: 8 }}>
-        <label>
-          Filter:{" "}
-          <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-            {TAGS.map((t) => (
-              <option key={t} value={t}>{t || "all"}</option>
-            ))}
-          </select>
-        </label>
+        <button className="btn" onClick={add}>Add</button>
       </div>
 
-      <ul style={{ listStyle: "none", padding: 0, marginTop: 10 }}>
-        {list.map(({ symbol, tag }) => {
-          const active = symbol === current;
-          return (
-            <li key={symbol} style={row}>
-              <button onClick={() => onLoad(symbol)} style={loadBtn} title="Load">
-                {active ? "●" : "○"}
+      <div className="row" style={{ marginTop: 8 }}>
+        <label>Filter:</label>
+        <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+          <option value="all">all</option>
+          <option value="no tag">no tag</option>
+          <option value="tech">tech</option>
+          <option value="fintech">fintech</option>
+          <option value="crypto">crypto</option>
+        </select>
+      </div>
+
+      <div style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 12,
+        padding: 8,
+        maxHeight: 380,
+        overflow: "auto"
+      }}>
+        {filtered.map(({ symbol: s, tag: t }) => (
+          <div key={s} className="row"
+               style={{ justifyContent: "space-between", padding: "6px 8px", borderBottom: "1px solid #1b2446" }}>
+            <div className="row" style={{ gap: 10 }}>
+              <button
+                title="Load"
+                className="btn ghost"
+                onClick={() => onLoad?.(s)}
+                style={{ width: 32, height: 28, padding: 0, display: "grid", placeItems: "center" }}
+              >
+                {current === s ? "●" : "○"}
               </button>
-              <span style={{ minWidth: 70, display: "inline-block" }}>{symbol}</span>
-              <span style={{ color: "#666", fontSize: 12 }}>{tag}</span>
-              <button onClick={() => remove(symbol)} style={removeBtn} title="Remove">
-                ✕
-              </button>
-            </li>
-          );
-        })}
-        {!list.length && <li style={{ color: "#666" }}>No tickers yet.</li>}
-      </ul>
+              <div style={{ minWidth: 64 }}>{s}</div>
+              <div className="muted" style={{ fontSize: 12 }}>{t || "no tag"}</div>
+            </div>
+            <button className="btn" onClick={() => remove(s)} style={{ width: 32, height: 28, padding: 0 }}>
+              ×
+            </button>
+          </div>
+        ))}
+        {filtered.length === 0 && <div className="muted">No symbols.</div>}
+      </div>
     </div>
   );
 }
-
-const panel = {
-  border: "1px solid #ddd",
-  borderRadius: 8,
-  padding: 12,
-  minWidth: 260,
-  height: "100%",
-};
-
-const row = {
-  display: "flex",
-  alignItems: "center",
-  gap: 8,
-  padding: "6px 0",
-  borderBottom: "1px solid #f1f1f1",
-};
-
-const loadBtn = { cursor: "pointer" };
-const removeBtn = { marginLeft: "auto", cursor: "pointer" };

@@ -166,6 +166,23 @@ input:focus, select:focus{
 }
 .table tr:last-child td{ border-bottom: 0 }
 
+.watchlist-header{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;          /* allow wrapping on small widths */
+}
+.watchlist-header input{
+  flex: 1 1 140px;         /* grows but won’t squash too far */
+  min-width: 0;
+}
+.watchlist-header select{
+  flex: 0 0 120px;
+}
+.watchlist-header .btn{
+  flex: 0 0 auto;
+}
+
 /* ---------- Micro animations ---------- */
 .blink-up{ animation: blinkUp .5s ease }
 .blink-down{ animation: blinkDown .5s ease }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
 import useLocalStorage from "../hooks/useLocalStorage";
 
@@ -10,11 +10,16 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   const [selected, setSelected] = useState([]);
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
-  const [rows, setRows] = useState([]); // [{symbol, quote, results, closes, stats, metrics, recommendation, error, isWinner}]
+  const [rows, setRows] = useState([]); // {symbol, quote, results, closes, stats, metrics, recommendation, error, isWinner}
   const [winnerStrategy, setWinnerStrategy] = useState("long"); // "long" | "short"
 
-  // keep last-good data per symbol to avoid flicker/losing sparkline on partial fetches
-  const prevBySymbolRef = useRef({}); // { [symbol]: row }
+  // request versioning to avoid race conditions
+  const reqVerRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // restore last session
   useEffect(() => {
@@ -59,24 +64,53 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
     setSelected(picks);
   };
 
+  /** Clean/validate closes array */
+  const normalizeCloses = (arr) => {
+    if (!Array.isArray(arr)) return [];
+    const cleaned = arr
+      .map(Number)
+      .filter((v) => Number.isFinite(v));
+    // need 2+ points for a line
+    return cleaned.length >= 2 ? cleaned : [];
+  };
+
+  /** Attempt 2: fallback closes fetch (without days param) */
+  const fetchClosesSafe = async (ticker) => {
+    try {
+      const a = await fetchCloses(ticker, 7);
+      let c = normalizeCloses(a?.closes);
+      if (c.length >= 2) return c;
+      // retry looser
+      const b = await fetchCloses(ticker); // backend default window
+      c = normalizeCloses(b?.closes);
+      return c;
+    } catch (e) {
+      console.warn("[closes] failed for", ticker, e);
+      return [];
+    }
+  };
+
   const load = useCallback(async () => {
+    const myVer = ++reqVerRef.current;
+
     if (!selected.length) {
-      setRows([]);
+      if (mountedRef.current && reqVerRef.current === myVer) setRows([]);
       return;
     }
 
     const tasks = selected.map(async (symbol) => {
       const t = symbol.toUpperCase();
       try {
-        const [q, pred, hist, stat] = await Promise.all([
+        const [q, pred, c7, stat] = await Promise.all([
           fetchQuote(t),
           fetchPredict({ ticker: t, models }),
-          fetchCloses(t, 7),
-          fetchStats(t),
+          fetchClosesSafe(t),
+          fetchStats(t).catch(() => null),
         ]);
+
         const results = pred?.results || [];
         const quote = q || null;
-        const closes = hist?.closes || [];
+        const closes = c7 || [];
         const stats = stat || null;
 
         // metrics + recommendation
@@ -88,7 +122,8 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
               const mapeProxy =
                 r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
                 r.predictions.length;
-              const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+              const meanPred =
+                r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
               const avgChangePct = ((meanPred - base) / base) * 100;
               return { model: r.model, mapeProxy, avgChangePct };
             });
@@ -120,6 +155,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
     });
 
     const out = await Promise.all(tasks);
+    if (!mountedRef.current || reqVerRef.current !== myVer) return;
 
     // winner logic (strategy aware)
     const scoreMap =
@@ -140,32 +176,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
       .sort((a, b) => (b.score - a.score) || (b.magnitude - a.magnitude))[0];
 
     const withWinner = out.map((r, idx) => ({ ...r, isWinner: winner ? idx === winner.idx : false }));
-
-    // ---------- merge with previous rows to prevent losing sparkline on partial fetches ----------
-    const prevMap = prevBySymbolRef.current || {};
-    const merged = withWinner.map((r) => {
-      const prev = prevMap[r.symbol];
-      const haveCloses = Array.isArray(r.closes) && r.closes.length >= 2;
-      const haveResults = Array.isArray(r.results) && r.results.length > 0;
-      const haveMetrics = Array.isArray(r.metrics) && r.metrics.length > 0;
-
-      return {
-        ...(prev || {}),
-        ...r,
-        // keep last good data if the new one is missing/empty
-        closes: haveCloses ? r.closes : prev?.closes || [],
-        results: haveResults ? r.results : prev?.results || [],
-        metrics: haveMetrics ? r.metrics : prev?.metrics || [],
-        stats: r.stats || prev?.stats || null,
-        quote: r.quote || prev?.quote || null,
-        recommendation: r.recommendation || prev?.recommendation || null,
-        error: r.error || null,
-      };
-    });
-
-    // update refs & state
-    prevBySymbolRef.current = merged.reduce((acc, r) => ((acc[r.symbol] = r), acc), {});
-    setRows(merged);
+    setRows(withWinner);
   }, [selected, models, winnerStrategy]);
 
   useEffect(() => {
@@ -173,36 +184,37 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   }, [load]);
 
   return (
-    <div style={wrap} className="card">
-      <div style={topbar}>
+    <div className="card" style={{ marginTop: 12 }}>
+      <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
         <h2 style={{ margin: 0 }}>🆚 Compare Tickers (up to {MAX_TICKERS})</h2>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div className="row">
           <button className="btn" onClick={loadFromWatchlist} disabled={!watchlist?.length}>
             Load from Watchlist
           </button>
-          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <label className="row" style={{ marginLeft: 8 }}>
             Strategy:
             <select
               value={winnerStrategy}
               onChange={(e) => setWinnerStrategy(e.target.value)}
+              style={{ marginLeft: 6 }}
             >
               <option value="long">Long (Buy &gt; Hold &gt; Sell)</option>
               <option value="short">Short (Sell &gt; Hold &gt; Buy)</option>
             </select>
           </label>
-          <button className="btn ghost" onClick={onExit}>Close</button>
+          <button className="btn ghost" onClick={onExit} style={{ marginLeft: 8 }}>Close</button>
         </div>
       </div>
 
-      <div style={pickerRow}>
-        <div style={pickerCol}>
+      <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
+        <div style={{ minWidth: 280, flex: "1 1 320px" }}>
           <h4 style={{ margin: "0 0 6px" }}>From Watchlist</h4>
-          <div style={{ maxHeight: 160, overflow: "auto", border: "1px solid #1b2446", borderRadius: 6, padding: 8 }}>
+          <div style={{ maxHeight: 160, overflow: "auto", border: "1px solid var(--border)", borderRadius: 10, padding: 8 }}>
             {watchlist.length === 0 && <div className="muted">Your watchlist is empty.</div>}
             {watchlist.map(({ symbol, tag }) => {
               const active = selected.includes(symbol);
               return (
-                <label key={symbol} style={wlRow}>
+                <label key={symbol} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
                   <input
                     type="checkbox"
                     checked={active}
@@ -217,9 +229,9 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
           </div>
         </div>
 
-        <div style={pickerCol}>
+        <div style={{ minWidth: 280, flex: "1 1 320px" }}>
           <h4 style={{ margin: "0 0 6px" }}>Add Manually</h4>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div className="row" style={{ gap: 8 }}>
             <input
               value={input}
               onChange={(e) => setInput(e.target.value.toUpperCase())}
@@ -230,7 +242,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
             <button className="btn ghost" onClick={clearAll} disabled={selected.length === 0}>Clear</button>
           </div>
 
-          <div style={{ marginTop: 10, fontSize: 12 }} className="muted">
+          <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
             Selected: {selected.join(", ") || "—"}
           </div>
 
@@ -239,7 +251,14 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
         </div>
       </div>
 
-      <div style={grid}>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))",
+          gap: 16,
+          marginTop: 12,
+        }}
+      >
         {rows.map((r) => (
           <CompareColumn key={r.symbol} row={r} />
         ))}
@@ -254,9 +273,9 @@ function ModelPicker({ models, setModels }) {
   const toggle = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
   return (
-    <div>
+    <div className="row" style={{ gap: 12 }}>
       {OPTIONS.map((m) => (
-        <label key={m} style={{ marginRight: 12 }}>
+        <label key={m}>
           <input type="checkbox" checked={models.includes(m)} onChange={() => toggle(m)} /> {m}
         </label>
       ))}
@@ -267,7 +286,6 @@ function ModelPicker({ models, setModels }) {
 function CompareColumn({ row }) {
   const { symbol, quote, results, closes, stats, recommendation, error, isWinner } = row;
 
-  // price blink + % change tween
   const prevPriceRef = useRef(null);
   const [blinkClass, setBlinkClass] = useState("");
   const tweenedChange = useTweenNumber(quote?.change_pct ?? 0, { duration: 450 });
@@ -275,8 +293,7 @@ function CompareColumn({ row }) {
   useEffect(() => {
     const next = Number(quote?.current_price);
     const prev = prevPriceRef.current;
-    if (typeof next === "number" && !Number.isNaN(next) &&
-        typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
+    if (typeof next === "number" && !Number.isNaN(next) && typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
       setBlinkClass(next > prev ? "blink-up" : "blink-down");
       const t = setTimeout(() => setBlinkClass(""), 520);
       return () => clearTimeout(t);
@@ -285,15 +302,15 @@ function CompareColumn({ row }) {
   }, [quote?.current_price]);
 
   return (
-    <div style={col}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <h3 style={{ marginTop: 0, marginBottom: 0 }}>{symbol}</h3>
-        {isWinner && <span className="badge">🏆 Winner</span>}
+    <div className="card" style={{ position: "relative" }}>
+      <div className="row" style={{ alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>{symbol}</h3>
+        {isWinner && <span className="badge" style={{ marginLeft: 8 }}>🏆 Winner</span>}
       </div>
 
-      {error && <p style={{ color: "#ff6b6b" }}>Error: {error}</p>}
+      {error && <p style={{ color: "salmon" }}>Error: {error}</p>}
 
-      <section style={card}>
+      <section className="card" style={{ marginTop: 8 }}>
         <h4 style={{ margin: "0 0 6px" }}>Price</h4>
         {quote ? (
           <>
@@ -303,11 +320,7 @@ function CompareColumn({ row }) {
               {tweenedChange >= 0 ? "🔺" : "🔻"} {Math.abs(Number(tweenedChange)).toFixed(2)}%
             </div>
             <div style={{ marginTop: 8 }}>
-              {Array.isArray(closes) && closes.length >= 2 ? (
-                <Sparkline data={closes} width={180} height={44} />
-              ) : (
-                <div className="muted" style={{ fontSize: 12 }}>no data</div>
-              )}
+              <Sparkline data={closes || []} width={180} height={44} />
             </div>
           </>
         ) : (
@@ -315,21 +328,21 @@ function CompareColumn({ row }) {
         )}
       </section>
 
-      <section style={card}>
+      <section className="card" style={{ marginTop: 8 }}>
         <h4 style={{ margin: "0 0 6px" }}>Quick Stats</h4>
         {stats ? (
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            <li className="kv"><strong>52w High</strong><span>{stats.high_52w != null ? `$${Number(stats.high_52w).toFixed(2)}` : "—"}</span></li>
-            <li className="kv"><strong>52w Low</strong><span>{stats.low_52w != null ? `$${Number(stats.low_52w).toFixed(2)}` : "—"}</span></li>
-            <li className="kv"><strong>Market Cap</strong><span>{stats.market_cap ? stats.market_cap : "—"}</span></li>
-            <li className="kv"><strong>Sector</strong><span>{stats.sector || "—"}</span></li>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0, color: "#cbd5ff" }}>
+            <li className="kv"><span>52w High</span><span>{stats.high_52w != null ? `$${Number(stats.high_52w).toFixed(2)}` : "—"}</span></li>
+            <li className="kv"><span>52w Low</span><span>{stats.low_52w != null ? `$${Number(stats.low_52w).toFixed(2)}` : "—"}</span></li>
+            <li className="kv"><span>Market Cap</span><span>{stats.market_cap ? stats.market_cap : "—"}</span></li>
+            <li className="kv"><span>Sector</span><span>{stats.sector ? stats.sector : "—"}</span></li>
           </ul>
         ) : (
           <div className="muted">N/A</div>
         )}
       </section>
 
-      <section style={card}>
+      <section className="card" style={{ marginTop: 8 }}>
         <h4 style={{ margin: "0 0 6px" }}>Recommendation</h4>
         {recommendation ? (
           <>
@@ -352,9 +365,8 @@ function CompareColumn({ row }) {
       </section>
 
       {results?.length > 0 && (
-        <section style={card}>
-          <h4 style={{ margin: "0 0 6px" }}>Forecasts (next 7d)</h4>
-          <div className="tableWrap">
+        <section className="table-card" style={{ marginTop: 8 }}>
+          <div className="table-wrap">
             <table className="table">
               <thead>
                 <tr>
@@ -386,15 +398,12 @@ function CompareColumn({ row }) {
 function useTweenNumber(target = 0, { duration = 450 } = {}) {
   const [val, setVal] = useState(Number(target) || 0);
   const rafRef = useRef(0);
-  const fromRef = useRef(Number(target) || 0);
-  const toRef = useRef(Number(target) || 0);
   const tStartRef = useRef(0);
+  const prevRef = useRef(Number(target) || 0);
 
   useEffect(() => {
-    const from = val;
+    const from = prevRef.current;
     const to = Number(target) || 0;
-    fromRef.value = from;
-    toRef.value = to;
     tStartRef.current = performance.now();
 
     const tick = (now) => {
@@ -402,22 +411,19 @@ function useTweenNumber(target = 0, { duration = 450 } = {}) {
       const e = 1 - Math.pow(1 - t, 3);
       setVal(from + (to - from) * e);
       if (t < 1) rafRef.current = requestAnimationFrame(tick);
+      else prevRef.current = to;
     };
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [target, duration]); // eslint-disable-line
+  }, [target, duration]);
 
   return val;
 }
 
-/**
- * Tiny SVG sparkline with:
- *  - native tooltips on each point (t-6 … t-0)
- *  - smooth morph animation when data changes
- */
+/** Tiny sparkline with native <title> tooltips + morph animation */
 function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, duration = 450 }) {
-  const pad = 4;
+  const pad = 6;
   const w = width - pad * 2;
   const h = height - pad * 2;
 
@@ -436,27 +442,20 @@ function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, durat
     });
   };
 
-  const [targetPts, labels] = useMemo(() => {
-    const pts = computePoints(data);
-    const lbls = data.map((_, i, arr) => `t-${arr.length - 1 - i}`);
-    return [pts, lbls];
-  }, [data]);
-
   useEffect(() => {
-    if (!targetPts.length) {
+    if (!Array.isArray(data) || data.length < 2) {
       setAnimPts([]);
-      prevDataRef.current = data;
+      prevDataRef.current = data.slice();
       return;
     }
-    const fromArr = prevDataRef.current?.length === data.length ? prevDataRef.current : data;
-    const fromPts = computePoints(fromArr.length === data.length ? fromArr : data);
-
+    const toPts = computePoints(data);
+    const fromPts = computePoints(prevDataRef.current.length === data.length ? prevDataRef.current : data);
     const start = performance.now();
     let raf = 0;
     const tick = (now) => {
       const t = Math.min(1, (now - start) / duration);
       const e = 1 - Math.pow(1 - t, 3);
-      const mixed = targetPts.map((to, i) => {
+      const mixed = toPts.map((to, i) => {
         const fr = fromPts[i] || to;
         return {
           x: fr.x + (to.x - fr.x) * e,
@@ -469,11 +468,13 @@ function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, durat
       if (t < 1) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    prevDataRef.current = data;
+    prevDataRef.current = data.slice();
     return () => cancelAnimationFrame(raf);
-  }, [data, targetPts, duration]);
+  }, [JSON.stringify(data), duration]);
 
-  if (!animPts.length) return <div className="muted" style={{ fontSize: 12 }}>no data</div>;
+  if (!Array.isArray(data) || data.length < 2) {
+    return <div className="muted" style={{ fontSize: 12 }}>no data</div>;
+  }
 
   const pointsAttr = animPts.map(({ x, y }) => `${x},${y}`).join(" ");
   const lastUp = data[data.length - 1] >= data[0];
@@ -485,7 +486,7 @@ function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, durat
     <svg width={width} height={height}>
       <polyline
         fill="none"
-        stroke={lastUp ? "#34c759" : "#ff3b30"}
+        stroke={lastUp ? "#2e7d32" : "#c62828"}
         strokeWidth={strokeWidth}
         points={pointsAttr}
       >
@@ -494,19 +495,10 @@ function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, durat
         </title>
       </polyline>
       {animPts.map(({ x, y, v, i }) => (
-        <circle key={i} cx={x} cy={y} r="2.5" fill="#9aa4c7">
+        <circle key={i} cx={x} cy={y} r="2.5" fill="#a8b2ff">
           <title>{`t-${animPts.length - 1 - i} • $${v.toFixed(2)}`}</title>
         </circle>
       ))}
     </svg>
   );
 }
-
-const wrap = { borderRadius: 12, padding: 12, marginTop: 12 };
-const topbar = { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 };
-const pickerRow = { display: "flex", gap: 16, flexWrap: "wrap" };
-const pickerCol = { minWidth: 280, flex: "1 1 320px" };
-const wlRow = { display: "flex", alignItems: "center", gap: 8, padding: "4px 0" };
-const grid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12, marginTop: 12 };
-const col = { border: "1px solid var(--border)", borderRadius: 12, padding: 12, position: "relative", background: "linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%)" };
-const card = { border: "1px solid #1b2446", borderRadius: 10, padding: 10, marginTop: 8 };

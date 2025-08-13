@@ -10,6 +10,8 @@ from app.services.finance_service import (
     get_quote,
     get_earnings,
     get_market_breadth,
+    get_daily_closes,
+    get_52w_stats,
 )
 
 router = APIRouter()
@@ -79,41 +81,17 @@ async def quote_stream(ticker: str, interval: float = 5.0):
 # ---------- Closes for sparklines ----------
 @router.get("/closes")
 async def closes_endpoint(ticker: str, days: int = 7):
-    from app.services.tech_service import _fetch_series_first, _base_variants
-    days = max(2, min(int(days), 60))
-    series = _fetch_series_first(_base_variants(ticker), max(days, 10))
-    if not series:
-        return {"ticker": str(ticker).upper(), "closes": []}
-    return {"ticker": str(ticker).upper(), "closes": series[-days:]}
+    closes = get_daily_closes(ticker, days)
+    return {"ticker": ticker.upper(), "closes": closes}
 
-# ---------- Quick stats (52w high/low; cap/sector placeholders) ----------
+# ---------- Quick stats (52w H/L) ----------
 @router.get("/stats")
 async def stats_endpoint(ticker: str):
-    """
-    Returns:
-      {
-        "ticker": "AAPL",
-        "high_52w": 229.35,
-        "low_52w": 155.12,
-        "market_cap": null,
-        "sector": null
-      }
-    """
-    from app.services.tech_service import _fetch_series_first, _base_variants
-    # ~52 trading weeks ≈ 252 trading days; grab a bit extra
-    series = _fetch_series_first(_base_variants(ticker), 270)
-    if not series:
-        return {
-            "ticker": str(ticker).upper(),
-            "high_52w": None,
-            "low_52w": None,
-            "market_cap": None,
-            "sector": None,
-        }
+    s = get_52w_stats(ticker)
     return {
-        "ticker": str(ticker).upper(),
-        "high_52w": float(max(series[-252:] if len(series) >= 252 else series)),
-        "low_52w": float(min(series[-252:] if len(series) >= 252 else series)),
-        "market_cap": None,  # TODO: wire to a profile endpoint if you like
-        "sector": None,      # TODO: wire to a profile endpoint if you like
+        "ticker": ticker.upper(),
+        "high_52w": s["high_52w"],
+        "low_52w": s["low_52w"],
+        "market_cap": s["market_cap"],
+        "sector": s["sector"],
     }
