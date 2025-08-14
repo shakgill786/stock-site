@@ -109,7 +109,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
         const results = pred?.results || [];
         const quote = q || null;
         const closes = c7?.closes || [];
-        const dates  = c7?.dates || [];
+        const dates = c7?.dates || [];
         const stats = stat || null;
 
         // metrics + recommendation
@@ -324,7 +324,17 @@ function CompareColumn({ row }) {
             <div>Last Close: ${Number(quote.last_close).toFixed(2)}</div>
             <div style={{ marginTop: 4 }} className={blinkClass}>
               Now: <strong>${Number(quote.current_price).toFixed(2)}</strong>{" "}
-              {tweenedChange >= 0 ? "🔺" : "🔻"} {Math.abs(Number(tweenedChange)).toFixed(2)}%
+              <span
+                style={{
+                  color: tweenedChange >= 0 ? "#2e7d32" : "#c62828",
+                  fontWeight: 600,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4
+                }}
+              >
+                {tweenedChange >= 0 ? "▲" : "▼"} {Math.abs(Number(tweenedChange)).toFixed(2)}%
+              </span>
             </div>
             <div style={{ marginTop: 8 }}>
               <InteractiveChart data={closes || []} labels={dates || []} width={220} height={60} />
@@ -355,7 +365,18 @@ function CompareColumn({ row }) {
               Based on lowest proxy-MAPE: <strong>{recommendation.model}</strong>
             </div>
             <div style={{ fontSize: 18 }}>
-              <strong>{recommendation.action}</strong>{" "}
+              <strong
+                style={{
+                  color:
+                    recommendation.action === "Buy"
+                    ? "#2e7d32" // green
+                    : recommendation.action === "Sell"
+                    ? "#c62828" // red
+                    : "#9aa0a6", // grey for Hold
+                }}
+              >
+                {recommendation.action}
+              </strong>{" "}
               <span className="muted" style={{ fontSize: 12 }}>
                 (avg change {Number(recommendation.avgChangePct).toFixed(2)}%)
               </span>
@@ -456,7 +477,7 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
-  const vEnd   = clamp(view.end,   vStart + 1, data.length - 1);
+  const vEnd = clamp(view.end, vStart + 1, data.length - 1);
   const windowData = data.slice(vStart, vEnd + 1);
 
   const min = Math.min(...windowData);
@@ -470,10 +491,12 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   };
   const yForVal = (v) => pad + h - ((v - min) / range) * h;
 
-  const points = windowData.map((v, k) => {
-    const i = vStart + k;
-    return `${xForIndex(i)},${yForVal(v)}`;
-  }).join(" ");
+  const points = windowData
+    .map((v, k) => {
+      const i = vStart + k;
+      return `${xForIndex(i)},${yForVal(v)}`;
+    })
+    .join(" ");
 
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
@@ -490,8 +513,14 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
       let newStart = drag.startView.start - Math.round(frac * windowSize);
       let newEnd = newStart + windowSize;
       // clamp range
-      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
+      if (newStart < 0) {
+        newStart = 0;
+        newEnd = windowSize;
+      }
+      if (newEnd > data.length - 1) {
+        newEnd = data.length - 1;
+        newStart = newEnd - windowSize;
+      }
       setView({ start: newStart, end: newEnd });
     }
   };
@@ -525,8 +554,14 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
     let newEnd = newStart + newSize;
 
-    if (newStart < 0) { newStart = 0; newEnd = newSize; }
-    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
+    if (newStart < 0) {
+      newStart = 0;
+      newEnd = newSize;
+    }
+    if (newEnd > data.length - 1) {
+      newEnd = data.length - 1;
+      newStart = newEnd - newSize;
+    }
 
     setView({ start: newStart, end: newEnd });
   };
@@ -539,22 +574,22 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   const showY = yForVal(showVal);
 
   // Hover label prefers real date when labels align
-  let label;
+  let hoverLabel;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
     try {
       const dt = new Date(d);
-      label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      hoverLabel = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
     } catch {
-      label = String(d);
+      hoverLabel = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx; // 0 = latest
-    label = rel === 0 ? "latest" : `t-${rel}d`;
+    const rel = data.length - 1 - showIdx; // 0 = latest
+    hoverLabel = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
   // tooltip width depends on label length
-  const textW = Math.min(180, 70 + String(label).length * 6);
+  const textW = Math.min(180, 70 + String(hoverLabel).length * 6);
   const boxX = Math.min(showX + 8, width - (textW + 10));
   const boxY = Math.max(showY - 26, 2);
 
@@ -598,7 +633,7 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
               stroke="rgba(255,255,255,0.25)"
             />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
-              ${Number(showVal).toFixed(2)} • {label}
+              ${Number(showVal).toFixed(2)} • {hoverLabel}
             </text>
           </g>
         </>
