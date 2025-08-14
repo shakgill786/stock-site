@@ -4,9 +4,9 @@ import os
 import requests
 from functools import lru_cache
 from fastapi import HTTPException
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from time import time
-from typing import List
+from typing import List, Tuple, Dict
 from dotenv import load_dotenv
 import random
 
@@ -244,15 +244,20 @@ def get_market_breadth():
 def _seeded_walk(symbol: str, base: float, n: int) -> List[float]:
     """Deterministic, tiny random-walk series per symbol (fallback)."""
     rng = random.Random(symbol.upper())  # seeded by symbol so it’s stable
-    # start within ±1% of base
-    val = base * (1 + rng.uniform(-0.01, 0.01))
+    val = base * (1 + rng.uniform(-0.01, 0.01))  # start within ±1%
     out: List[float] = []
     for _ in range(n):
-        # small day-to-day move ~±0.4%
-        step = rng.uniform(-0.004, 0.004)
+        step = rng.uniform(-0.004, 0.004)  # ~±0.4%
         val *= (1 + step)
         out.append(round(val, 2))
     return out
+
+
+def _seeded_dates(n: int) -> List[str]:
+    """Generate last n calendar-day ISO dates ascending (fallback)."""
+    today = date.today()
+    days = [today - timedelta(days=(n - 1 - i)) for i in range(n)]
+    return [d.isoformat() for d in days]
 
 
 @lru_cache(maxsize=256)
@@ -262,10 +267,10 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
     Falls back to a seeded random-walk around the current price if candles fail.
     """
     sym = symbol.upper()
-    # allow up to ~300 to support 52w stats
-    days = max(2, min(int(days), 300))
+    # allow up to 5 years (~1825 days)
+    days = max(2, min(int(days), 1825))
     now = int(time())
-    frm = now - days * 86400 * 2  # ask for a bit more (weekends/holidays)
+    frm = now - days * 86400 * 2  # ask for extra (weekends/holidays)
 
     # Try Finnhub candles
     try:
@@ -279,7 +284,7 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
                 "token": FINNHUB_API_KEY,
             },
             headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=6,
+            timeout=8,
         )
         r.raise_for_status()
         js = r.json()
@@ -299,12 +304,57 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
         return []
 
 
+@lru_cache(maxsize=256)
+def get_daily_closes_with_dates(symbol: str, days: int) -> Dict[str, List]:
+    """
+    Same as get_daily_closes but also returns aligned ISO dates.
+    """
+    sym = symbol.upper()
+    days = max(2, min(int(days), 1825))
+    now = int(time())
+    frm = now - days * 86400 * 2
+
+    # Finnhub with timestamps -> dates
+    try:
+        r = requests.get(
+            FINNHUB_CANDLE_URL,
+            params={
+                "symbol": sym,
+                "resolution": "D",
+                "from": frm,
+                "to": now,
+                "token": FINNHUB_API_KEY,
+            },
+            headers={"X-Finnhub-Secret": FINNHUB_SECRET},
+            timeout=8,
+        )
+        r.raise_for_status()
+        js = r.json()
+        if js.get("s") == "ok" and isinstance(js.get("c"), list) and isinstance(js.get("t"), list):
+            closes_raw = js["c"]
+            ts_raw = js["t"]
+            # Pair, filter None, then take last `days`
+            pairs = [(t, c) for t, c in zip(ts_raw, closes_raw) if c is not None]
+            if pairs:
+                pairs = pairs[-days:]
+                dates = [datetime.utcfromtimestamp(t).date().isoformat() for t, _ in pairs]
+                closes = [float(c) for _, c in pairs]
+                return {"dates": dates, "closes": closes}
+    except Exception:
+        pass
+
+    # Fallback synthetic with synthetic dates
+    closes = get_daily_closes(sym, days)
+    dates = _seeded_dates(len(closes)) if closes else []
+    return {"dates": dates, "closes": closes}
+
+
 @lru_cache(maxsize=128)
 def get_52w_stats(symbol: str) -> dict:
     """
     Computes 52w high/low from daily closes helper (works even on fallback).
     """
-    closes = get_daily_closes(symbol, 300)  # up to 300 days calendar (~252 trading)
+    closes = get_daily_closes(symbol, 300)  # ~252 trading days in 52 weeks
     window = closes[-252:] if len(closes) >= 252 else closes
     if window:
         return {

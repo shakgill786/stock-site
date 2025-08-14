@@ -10,7 +10,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   const [selected, setSelected] = useState([]);
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
-  const [rows, setRows] = useState([]); // {symbol, quote, results, closes, stats, metrics, recommendation, error, isWinner}
+  const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
   const [winnerStrategy, setWinnerStrategy] = useState("long"); // "long" | "short"
 
   // request versioning to avoid race conditions
@@ -67,26 +67,24 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   /** Clean/validate closes array */
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
-    const cleaned = arr
-      .map(Number)
-      .filter((v) => Number.isFinite(v));
-    // need 2+ points for a line
+    const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  /** Attempt 2: fallback closes fetch (without days param) */
+  /** Pull ~5 years if available; include dates for tooltips */
   const fetchClosesSafe = async (ticker) => {
     try {
-      const a = await fetchCloses(ticker, 7);
+      const a = await fetchCloses(ticker, 1825); // ~5 years
       let c = normalizeCloses(a?.closes);
-      if (c.length >= 2) return c;
-      // retry looser
-      const b = await fetchCloses(ticker); // backend default window
+      if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
+
+      // retry looser (backend default)
+      const b = await fetchCloses(ticker);
       c = normalizeCloses(b?.closes);
-      return c;
+      return { dates: Array.isArray(b?.dates) ? b.dates : [], closes: c };
     } catch (e) {
       console.warn("[closes] failed for", ticker, e);
-      return [];
+      return { dates: [], closes: [] };
     }
   };
 
@@ -110,7 +108,8 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
 
         const results = pred?.results || [];
         const quote = q || null;
-        const closes = c7 || [];
+        const closes = c7?.closes || [];
+        const dates  = c7?.dates || [];
         const stats = stat || null;
 
         // metrics + recommendation
@@ -139,13 +138,14 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
           recommendation = { ...best, action };
         }
 
-        return { symbol: t, quote, results, closes, stats, metrics, recommendation, error: null };
+        return { symbol: t, quote, results, closes, dates, stats, metrics, recommendation, error: null };
       } catch (e) {
         return {
           symbol: t,
           quote: null,
           results: [],
           closes: [],
+          dates: [],
           stats: null,
           metrics: [],
           recommendation: null,
@@ -284,7 +284,7 @@ function ModelPicker({ models, setModels }) {
 }
 
 function CompareColumn({ row }) {
-  const { symbol, quote, results, closes, stats, recommendation, error, isWinner } = row;
+  const { symbol, quote, results, closes, dates, stats, recommendation, error, isWinner } = row;
 
   const prevPriceRef = useRef(null);
   const [blinkClass, setBlinkClass] = useState("");
@@ -301,6 +301,8 @@ function CompareColumn({ row }) {
     prevPriceRef.current = next;
   }, [quote?.current_price]);
 
+  const [showBig, setShowBig] = useState(false);
+
   return (
     <div className="card" style={{ position: "relative" }}>
       <div className="row" style={{ alignItems: "center" }}>
@@ -311,7 +313,12 @@ function CompareColumn({ row }) {
       {error && <p style={{ color: "salmon" }}>Error: {error}</p>}
 
       <section className="card" style={{ marginTop: 8 }}>
-        <h4 style={{ margin: "0 0 6px" }}>Price</h4>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+          <h4 style={{ margin: "0 0 6px" }}>Price</h4>
+          <button className="btn ghost" style={{ padding: "2px 8px", fontSize: 12 }} onClick={() => setShowBig(true)}>
+            🔍 Magnify
+          </button>
+        </div>
         {quote ? (
           <>
             <div>Last Close: ${Number(quote.last_close).toFixed(2)}</div>
@@ -320,7 +327,7 @@ function CompareColumn({ row }) {
               {tweenedChange >= 0 ? "🔺" : "🔻"} {Math.abs(Number(tweenedChange)).toFixed(2)}%
             </div>
             <div style={{ marginTop: 8 }}>
-              <Sparkline data={closes || []} width={180} height={44} />
+              <InteractiveChart data={closes || []} labels={dates || []} width={220} height={60} />
             </div>
           </>
         ) : (
@@ -334,8 +341,6 @@ function CompareColumn({ row }) {
           <ul style={{ listStyle: "none", padding: 0, margin: 0, color: "#cbd5ff" }}>
             <li className="kv"><span>52w High</span><span>{stats.high_52w != null ? `$${Number(stats.high_52w).toFixed(2)}` : "—"}</span></li>
             <li className="kv"><span>52w Low</span><span>{stats.low_52w != null ? `$${Number(stats.low_52w).toFixed(2)}` : "—"}</span></li>
-            <li className="kv"><span>Market Cap</span><span>{stats.market_cap ? stats.market_cap : "—"}</span></li>
-            <li className="kv"><span>Sector</span><span>{stats.sector ? stats.sector : "—"}</span></li>
           </ul>
         ) : (
           <div className="muted">N/A</div>
@@ -390,6 +395,12 @@ function CompareColumn({ row }) {
           </div>
         </section>
       )}
+
+      {showBig && (
+        <MagnifyModal title={`${symbol} • Price`} onClose={() => setShowBig(false)}>
+          <InteractiveChart data={closes || []} labels={dates || []} width={800} height={300} big />
+        </MagnifyModal>
+      )}
     </div>
   );
 }
@@ -421,84 +432,214 @@ function useTweenNumber(target = 0, { duration = 450 } = {}) {
   return val;
 }
 
-/** Tiny sparkline with native <title> tooltips + morph animation */
-function Sparkline({ data = [], width = 180, height = 44, strokeWidth = 2, duration = 450 }) {
-  const pad = 6;
+/** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
+function InteractiveChart({ data = [], labels = [], width = 220, height = 60, big = false }) {
+  const pad = 10;
   const w = width - pad * 2;
   const h = height - pad * 2;
 
-  const prevDataRef = useRef([]);
-  const [animPts, setAnimPts] = useState([]);
+  const [view, setView] = useState({ start: 0, end: Math.max(0, data.length - 1) });
+  const [cursorX, setCursorX] = useState(null);
+  const [hoverIdx, setHoverIdx] = useState(null);
+  const [drag, setDrag] = useState(null); // {startX, startView}
 
-  const computePoints = (arr) => {
-    if (!Array.isArray(arr) || arr.length < 2) return [];
-    const min = Math.min(...arr);
-    const max = Math.max(...arr);
-    const range = max - min || 1;
-    return arr.map((v, i) => {
-      const x = pad + (i * w) / (arr.length - 1);
-      const y = pad + h - ((v - min) / range) * h;
-      return { x, y, v, i };
-    });
-  };
-
+  // reset view if data length changes
   useEffect(() => {
-    if (!Array.isArray(data) || data.length < 2) {
-      setAnimPts([]);
-      prevDataRef.current = data.slice();
-      return;
-    }
-    const toPts = computePoints(data);
-    const fromPts = computePoints(prevDataRef.current.length === data.length ? prevDataRef.current : data);
-    const start = performance.now();
-    let raf = 0;
-    const tick = (now) => {
-      const t = Math.min(1, (now - start) / duration);
-      const e = 1 - Math.pow(1 - t, 3);
-      const mixed = toPts.map((to, i) => {
-        const fr = fromPts[i] || to;
-        return {
-          x: fr.x + (to.x - fr.x) * e,
-          y: fr.y + (to.y - fr.y) * e,
-          v: data[i],
-          i,
-        };
-      });
-      setAnimPts(mixed);
-      if (t < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    prevDataRef.current = data.slice();
-    return () => cancelAnimationFrame(raf);
-  }, [JSON.stringify(data), duration]);
+    setView({ start: 0, end: Math.max(0, data.length - 1) });
+  }, [data.length]);
 
   if (!Array.isArray(data) || data.length < 2) {
     return <div className="muted" style={{ fontSize: 12 }}>no data</div>;
   }
 
-  const pointsAttr = animPts.map(({ x, y }) => `${x},${y}`).join(" ");
-  const lastUp = data[data.length - 1] >= data[0];
-  const minVal = Math.min(...data);
-  const maxVal = Math.max(...data);
-  const lastVal = data[data.length - 1];
+  // clamp helpers
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+  const vStart = clamp(view.start, 0, data.length - 2);
+  const vEnd   = clamp(view.end,   vStart + 1, data.length - 1);
+  const windowData = data.slice(vStart, vEnd + 1);
+
+  const min = Math.min(...windowData);
+  const max = Math.max(...windowData);
+  const range = max - min || 1;
+
+  const xForIndex = (i) => pad + (w * (i - vStart)) / (vEnd - vStart);
+  const idxForX = (x) => {
+    const t = clamp((x - pad) / w, 0, 1);
+    return Math.round(vStart + t * (vEnd - vStart));
+  };
+  const yForVal = (v) => pad + h - ((v - min) / range) * h;
+
+  const points = windowData.map((v, k) => {
+    const i = vStart + k;
+    return `${xForIndex(i)},${yForVal(v)}`;
+  }).join(" ");
+
+  const lastUp = windowData[windowData.length - 1] >= windowData[0];
+
+  const onMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setCursorX(clamp(x, pad, pad + w));
+    setHoverIdx(idxForX(x));
+    // drag-to-pan
+    if (drag) {
+      const dx = x - drag.startX;
+      const frac = dx / w;
+      const windowSize = drag.startView.end - drag.startView.start;
+      let newStart = drag.startView.start - Math.round(frac * windowSize);
+      let newEnd = newStart + windowSize;
+      // clamp range
+      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
+      setView({ start: newStart, end: newEnd });
+    }
+  };
+
+  const onLeave = () => {
+    setCursorX(null);
+    setHoverIdx(null);
+    setDrag(null);
+  };
+
+  const onDown = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setDrag({ startX: x, startView: { ...view } });
+  };
+
+  const onUp = () => setDrag(null);
+
+  const onWheel = (e) => {
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = clamp(e.clientX - rect.left, pad, pad + w);
+    const focusIdx = idxForX(x);
+
+    const windowSize = vEnd - vStart;
+    const delta = Math.sign(e.deltaY); // 1 = zoom out, -1 = zoom in
+    const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
+    let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
+    newSize = clamp(newSize, 5, data.length - 1);
+
+    let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
+    let newEnd = newStart + newSize;
+
+    if (newStart < 0) { newStart = 0; newEnd = newSize; }
+    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
+
+    setView({ start: newStart, end: newEnd });
+  };
+
+  const onDblClick = () => setView({ start: 0, end: data.length - 1 });
+
+  const showIdx = clamp(hoverIdx ?? vEnd, 0, data.length - 1);
+  const showVal = data[showIdx];
+  const showX = xForIndex(showIdx);
+  const showY = yForVal(showVal);
+
+  // Hover label prefers real date when labels align
+  let label;
+  if (Array.isArray(labels) && labels.length === data.length) {
+    const d = labels[showIdx];
+    try {
+      const dt = new Date(d);
+      label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    } catch {
+      label = String(d);
+    }
+  } else {
+    const rel = (data.length - 1) - showIdx; // 0 = latest
+    label = rel === 0 ? "latest" : `t-${rel}d`;
+  }
+
+  // tooltip width depends on label length
+  const textW = Math.min(180, 70 + String(label).length * 6);
+  const boxX = Math.min(showX + 8, width - (textW + 10));
+  const boxY = Math.max(showY - 26, 2);
 
   return (
-    <svg width={width} height={height}>
+    <svg
+      width={width}
+      height={height}
+      style={{ cursor: drag ? "grabbing" : "crosshair", background: "transparent", borderRadius: 8 }}
+      onMouseMove={onMove}
+      onMouseLeave={onLeave}
+      onMouseDown={onDown}
+      onMouseUp={onUp}
+      onWheel={onWheel}
+      onDoubleClick={onDblClick}
+    >
+      {/* background */}
+      <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
+
+      {/* polyline */}
       <polyline
         fill="none"
         stroke={lastUp ? "#2e7d32" : "#c62828"}
-        strokeWidth={strokeWidth}
-        points={pointsAttr}
-      >
-        <title>
-          Sparkline: min ${minVal.toFixed(2)}, max ${maxVal.toFixed(2)}, last ${lastVal.toFixed(2)}
-        </title>
-      </polyline>
-      {animPts.map(({ x, y, v, i }) => (
-        <circle key={i} cx={x} cy={y} r="2.5" fill="#a8b2ff">
-          <title>{`t-${animPts.length - 1 - i} • $${v.toFixed(2)}`}</title>
-        </circle>
-      ))}
+        strokeWidth={big ? 2.5 : 2}
+        points={points}
+      />
+
+      {/* cursor + crosshair */}
+      {cursorX != null && (
+        <>
+          <line x1={showX} x2={showX} y1={pad} y2={pad + h} stroke="#a8b2ff" strokeDasharray="3,3" />
+          <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
+          {/* tooltip bubble */}
+          <g>
+            <rect
+              x={boxX}
+              y={boxY}
+              width={textW}
+              height="22"
+              rx="6"
+              fill="rgba(0,0,0,0.65)"
+              stroke="rgba(255,255,255,0.25)"
+            />
+            <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
+              ${Number(showVal).toFixed(2)} • {label}
+            </text>
+          </g>
+        </>
+      )}
     </svg>
+  );
+}
+
+/** Minimal modal (no deps) */
+function MagnifyModal({ title, children, onClose }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        backdropFilter: "blur(2px)",
+        zIndex: 9999,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card"
+        style={{ width: "min(95vw, 1000px)", padding: 16 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ margin: 0 }}>{title}</h3>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn ghost" onClick={onClose}>Close</button>
+          </div>
+        </div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Tip: drag to pan • mouse wheel to zoom • double-click to reset
+        </div>
+        <div style={{ marginTop: 12 }}>{children}</div>
+      </div>
+    </div>
   );
 }

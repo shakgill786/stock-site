@@ -11,6 +11,7 @@ from app.services.finance_service import (
     get_earnings,
     get_market_breadth,
     get_daily_closes,
+    get_daily_closes_with_dates,
     get_52w_stats,
 )
 
@@ -72,26 +73,35 @@ async def quote_stream(ticker: str, interval: float = 5.0):
                     "change_pct": q.get("change_pct"),
                     "ts": int(time.time()),
                 }
-                yield f"data: {json.dumps(payload)}\n\n"
+                yield f"data: {json.dumps(payload)}n\n"
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ---------- Closes for sparklines ----------
+# ---------- Closes for charts (now supports dates + 5y) ----------
 @router.get("/closes")
-async def closes_endpoint(ticker: str, days: int = 7):
-    closes = get_daily_closes(ticker, days)
-    return {"ticker": ticker.upper(), "closes": closes}
+async def closes_endpoint(ticker: str, days: int = 60):
+    """
+    Returns up to ~5 years of daily closes with aligned ISO dates, most-recent last.
+    {
+      "ticker": "AAPL",
+      "dates": ["2021-08-12", ...],
+      "closes": [145.86, ...]
+    }
+    """
+    symbol = str(ticker).upper()
+    days = max(2, min(int(days), 1825))
+    data = get_daily_closes_with_dates(symbol, days)
+    return {"ticker": symbol, "dates": data["dates"], "closes": data["closes"]}
 
-# ---------- Quick stats (52w H/L) ----------
+# ---------- Quick stats (52w high/low only) ----------
 @router.get("/stats")
 async def stats_endpoint(ticker: str):
-    s = get_52w_stats(ticker)
-    return {
-        "ticker": ticker.upper(),
-        "high_52w": s["high_52w"],
-        "low_52w": s["low_52w"],
-        "market_cap": s["market_cap"],
-        "sector": s["sector"],
-    }
+    """
+    Returns:
+      { "ticker": "AAPL", "high_52w": 229.35, "low_52w": 155.12 }
+    """
+    symbol = str(ticker).upper()
+    stats = get_52w_stats(symbol)
+    return {"ticker": symbol, "high_52w": stats["high_52w"], "low_52w": stats["low_52w"]}
