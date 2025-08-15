@@ -4,7 +4,8 @@ import {
   fetchQuote,
   fetchEarnings,
   fetchMarket,
-  fetchCloses, // ⬅️ added
+  fetchCloses,
+  fetchPredictHistory,
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
@@ -15,6 +16,30 @@ import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import "./App.css";
+
+// ---- Chart.js for Actual vs Predicted chart ----
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+} from "chart.js";
+import { Chart } from "react-chartjs-2";
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+);
+// ------------------------------------------------
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 const API_BASE =
@@ -47,12 +72,15 @@ export default function App() {
   // Compare Mode
   const [compareOpen, setCompareOpen] = useState(false);
 
-  // Price chart data (main card)
+  // Price chart data
   const [closes, setCloses] = useState([]);
   const [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
-  // helpers (mirror CompareMode)
+  // Retrospective history rows from backend
+  const [historyRows, setHistoryRows] = useState([]);
+
+  // helpers
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
     const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
@@ -73,6 +101,23 @@ export default function App() {
       return { dates: [], closes: [] };
     }
   };
+
+  const addBusinessDays = (d, n) => {
+    const dt = new Date(d);
+    let added = 0;
+    while (added < n) {
+      dt.setDate(dt.getDate() + 1);
+      const day = dt.getDay();
+      if (day !== 0 && day !== 6) added++;
+    }
+    return dt;
+  };
+
+  const dkey = (s) => String(s).slice(0, 10);
+  const historyByDate = useMemo(
+    () => Object.fromEntries((historyRows || []).map((r) => [dkey(r.date), r])),
+    [historyRows]
+  );
 
   const loadData = useCallback(async () => {
     setQuoteErr(false);
@@ -108,9 +153,13 @@ export default function App() {
       setMarket(null);
     }
 
-    // 3.5) Closes for the price chart
+    // 4) Closes (use locals so we can align dates synchronously)
+    let datesLocal = [];
+    let closesLocal = [];
     try {
       const { closes: c, dates: d } = await fetchClosesSafe(t);
+      closesLocal = c;
+      datesLocal = d;
       setCloses(c);
       setCloseDates(d);
     } catch {
@@ -118,7 +167,15 @@ export default function App() {
       setCloseDates([]);
     }
 
-    // 4) Predictions
+    // 5) Retrospective history for past days (what models would have predicted)
+    try {
+      const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
+      setHistoryRows(hist?.rows || []);
+    } catch {
+      setHistoryRows([]);
+    }
+
+    // 6) Current forward predictions
     setLoading(true);
     try {
       const { results } = await fetchPredict({ ticker: t, models });
@@ -198,6 +255,133 @@ export default function App() {
     if (best.avgChangePct < -1) action = "Sell";
     return { ...best, action };
   }, [metrics]);
+
+  // ---------- Derived data for "Actual vs. Predicted" ----------
+  const horizon = results?.[0]?.predictions?.length || 0;
+  const actualTail = 60; // show recent 60 trading days
+  const actualData = closes.slice(-actualTail);
+  const actualLabels = closeDates.slice(-actualTail);
+
+  // future labels (+1..+h) based on last known date
+  const lastLabelDate = actualLabels.length
+    ? new Date(actualLabels[actualLabels.length - 1])
+    : null;
+
+  const futureLabels = Array.from({ length: horizon }, (_, i) => {
+    if (!lastLabelDate) return `+${i + 1}d`;
+    const d = addBusinessDays(lastLabelDate, i + 1);
+    return d.toISOString().slice(0, 10);
+  });
+
+  const labelsAll = [...actualLabels, ...futureLabels];
+
+  // Build datasets: Actual, dashed backtest per model (from /predict_history), solid current forecast per model
+  const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
+
+  const avpDatasets = useMemo(() => {
+    if (!labelsAll.length) return [];
+    const actualSeries = [
+      ...actualData,
+      ...Array(horizon).fill(null),
+    ];
+
+    const ds = [
+      {
+        label: "Actual Close",
+        data: actualSeries,
+        borderColor: "rgba(200,200,210,1)",
+        backgroundColor: "rgba(200,200,210,0.15)",
+        pointRadius: 0,
+        borderWidth: 2,
+        tension: 0.2,
+        spanGaps: true,
+      },
+    ];
+
+    results.forEach((r, idx) => {
+      const color = colorPalette[idx % colorPalette.length];
+
+      // dashed backtest predictions (past dates only) from /predict_history
+      const backtestSeries = labelsAll.map((lab) => {
+        const row = historyByDate[dkey(lab)];
+        const v = row?.pred?.[r.model];
+        return Number.isFinite(Number(v)) ? Number(v) : null;
+      });
+
+      ds.push({
+        label: `${r.model} • backtest`,
+        data: backtestSeries,
+        borderColor: color,
+        backgroundColor: "transparent",
+        borderDash: [6, 4],
+        pointRadius: 0,
+        borderWidth: 2,
+        tension: 0.2,
+        spanGaps: true,
+      });
+
+      // solid current forecast starting from the latest actual
+      const start = actualData[actualData.length - 1] ?? null;
+      const currentSeries = [
+        ...Array(Math.max(0, actualData.length - 1)).fill(null),
+        start,
+        ...r.predictions,
+      ];
+
+      ds.push({
+        label: `${r.model} • current forecast`,
+        data: currentSeries,
+        borderColor: color,
+        backgroundColor: "transparent",
+        pointRadius: 0,
+        borderWidth: 2,
+        tension: 0.2,
+        spanGaps: true,
+      });
+    });
+
+    return ds;
+  }, [results, labelsAll.join("|"), actualData, horizon, historyByDate]);
+
+  const avpChartData = { labels: labelsAll, datasets: avpDatasets };
+  const avpChartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: "top", labels: { boxWidth: 18 } },
+      title: { display: false },
+      tooltip: { mode: "index", intersect: false },
+    },
+    interaction: { mode: "index", intersect: false },
+    scales: {
+      x: { ticks: { maxTicksLimit: 10 }, grid: { display: false } },
+      y: { ticks: { callback: (v) => `$${Number(v).toFixed(0)}` } },
+    },
+  };
+
+  // ----- Table rows: last N past days (backtest) + future horizon (current predictions) -----
+  const pastDaysToShow = 10;
+  const pastLabels = actualLabels.slice(-pastDaysToShow); // last N actual days
+
+  const pastRows = pastLabels.map((iso) => {
+    const row = historyByDate[dkey(iso)];
+    const actual = (() => {
+      const idx = closeDates.lastIndexOf(iso);
+      return idx >= 0 ? closes[idx] : (row?.actual ?? null);
+    })();
+    const perModel = results.map((r) => {
+      const v = row?.pred?.[r.model];
+      return Number.isFinite(Number(v)) ? Number(v) : null;
+    });
+    return { date: iso, actual, perModel, kind: "past" };
+  });
+
+  const futureRows = futureLabels.map((d, i) => {
+    const perModel = results.map((r) => r.predictions?.[i] ?? null);
+    return { date: d, actual: null, perModel, kind: "future" };
+  });
+
+  const avpRows = [...pastRows, ...futureRows];
 
   return (
     <div className="app-root">
@@ -300,10 +484,17 @@ export default function App() {
                     )}
                   </p>
 
-                  {/* mini interactive chart */}
+                  {/* mini interactive chart (clipped inside the card) */}
                   <div style={{ marginTop: 8 }}>
                     {closes.length >= 2 ? (
-                      <InteractivePriceChart data={closes} labels={closeDates} width={320} height={80} />
+                      <div style={{ borderRadius: 10, overflow: "hidden" }}>
+                        <InteractivePriceChart
+                          data={closes}
+                          labels={closeDates}
+                          width={320}
+                          height={80}
+                        />
+                      </div>
                     ) : (
                       <div className="muted" style={{ fontSize: 12 }}>no chart data</div>
                     )}
@@ -344,6 +535,56 @@ export default function App() {
             </div>
           )}
 
+          {/* --- Actual vs Predicted (chart + table, with past backtest data) --- */}
+          {results.length > 0 && closes.length >= 2 && (
+            <div className="card" style={{ marginTop: 12 }}>
+              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
+
+              {/* Chart */}
+              <div style={{ height: 260, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.03)", padding: 8 }}>
+                <Chart type="line" data={avpChartData} options={avpChartOptions} />
+              </div>
+
+              {/* Table */}
+              <div className="table-wrap" style={{ marginTop: 12 }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th style={{ whiteSpace: "nowrap" }}>Date</th>
+                      <th>Actual</th>
+                      {results.map((r) => (
+                        <th key={r.model}>
+                          {r.model}
+                          <span className="muted" style={{ fontSize: 11, display: "block" }}>
+                            <em>past: backtest • future: current</em>
+                          </span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {avpRows.map((row, i) => (
+                      <tr key={`${row.kind}-${row.date || i}`}>
+                        <td>
+                          {row.date
+                            ? row.date + (row.kind === "future" ? ` (+${i - pastRows.length + 1}d)` : "")
+                            : ""}
+                        </td>
+                        <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
+                        {row.perModel.map((v, j) => (
+                          <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                Past rows show each model’s “predict the next day” backtest from /predict_history; future rows show the latest forecast.
+              </div>
+            </div>
+          )}
+
           {/* Prediction Error */}
           {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
@@ -361,7 +602,7 @@ export default function App() {
             ))}
           </div>
 
-          {/* Forecast Table (wrapped to ensure no white bleed + proper overflow) */}
+          {/* Forecast Table (original) */}
           {results.length > 0 && (
             <div className="card table-card">
               <div className="table-wrap">
@@ -391,17 +632,19 @@ export default function App() {
         </section>
       </main>
 
-      {/* Big chart modal */}
+      {/* Big chart modal (also clipped) */}
       {showBigPriceChart && (
         <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
-          <InteractivePriceChart data={closes || []} labels={closeDates || []} width={800} height={300} big />
+          <div style={{ borderRadius: 12, overflow: "hidden" }}>
+            <InteractivePriceChart data={closes || []} labels={closeDates || []} width={800} height={300} big />
+          </div>
         </MagnifyModal>
       )}
     </div>
   );
 }
 
-/** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
+/** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels (mini & modal) */
 function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
   const pad = 10;
   const w = width - pad * 2;
@@ -412,7 +655,6 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const [hoverIdx, setHoverIdx] = useState(null);
   const [drag, setDrag] = useState(null); // {startX, startView}
 
-  // reset view if data length changes
   useEffect(() => {
     setView({ start: 0, end: Math.max(0, data.length - 1) });
   }, [data.length]);
@@ -450,7 +692,6 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
-    // drag-to-pan
     if (drag) {
       const dx = x - drag.startX;
       const frac = dx / w;
@@ -499,7 +740,6 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
-  // label prefers real date when provided
   let label;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -510,7 +750,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       label = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx; // 0 = latest
+    const rel = (data.length - 1) - showIdx;
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
@@ -522,7 +762,12 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     <svg
       width={width}
       height={height}
-      style={{ cursor: drag ? "grabbing" : "crosshair", background: "transparent", borderRadius: 8 }}
+      style={{
+        cursor: drag ? "grabbing" : "crosshair",
+        background: "transparent",
+        borderRadius: 8,
+        display: "block",
+      }}
       onMouseMove={onMove}
       onMouseLeave={onLeave}
       onMouseDown={onDown}
@@ -534,7 +779,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
       {cursorX != null && (
         <>
-          <line x1={showX} x2={showX} y1={pad} y2={pad + h} stroke="#a8b2ff" strokeDasharray="3,3" />
+          <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
           <g>
             <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />

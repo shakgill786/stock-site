@@ -4,9 +4,9 @@ import os
 import requests
 from functools import lru_cache
 from fastapi import HTTPException
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta, datetime
 from time import time
-from typing import List, Tuple, Dict
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 import random
 
@@ -37,12 +37,6 @@ if not TD_KEY:
 
 @lru_cache(maxsize=128)
 def get_quote(ticker: str):
-    """
-    Quote:
-      1) Finnhub (tolerant if pc==0 -> uses c as last_close, 0% change)
-      2) Twelve Data fallback (parses single or multi-symbol)
-      3) Alpha Vantage fallback (if key present)
-    """
     symbol = ticker.upper()
 
     # 1) Finnhub
@@ -84,8 +78,6 @@ def get_quote(ticker: str):
         if isinstance(js2, dict) and "message" in js2 and "close" not in js2 and symbol not in js2:
             raise ValueError(js2["message"])
 
-        # single-symbol: {"symbol":"X","close":"...","previous_close":"..."}
-        # multi-symbol:  {"X": {...}, "AAPL": {...}}
         if isinstance(js2, dict) and "close" in js2:
             info = js2
         elif isinstance(js2, dict) and symbol in js2:
@@ -108,7 +100,6 @@ def get_quote(ticker: str):
             "change_pct": pct,
         }
     except Exception as td_err:
-        # 3) Alpha Vantage fallback if available
         if not AV_KEY:
             raise HTTPException(502, f"Error fetching quote fallback (Twelve Data): {td_err}")
 
@@ -150,7 +141,6 @@ def get_quote(ticker: str):
 
 @lru_cache(maxsize=128)
 def get_earnings(ticker: str):
-    """Return 200 with nextEarningsDate=None when not found (UI shows N/A)."""
     symbol = ticker.upper()
     today, to_date = date.today().isoformat(), (date.today() + timedelta(days=90)).isoformat()
     try:
@@ -173,7 +163,6 @@ def get_earnings(ticker: str):
 
 @lru_cache(maxsize=128)
 def get_dividends(ticker: str):
-    """Return 200 with available=False if none/blocked so UI shows N/A."""
     symbol = ticker.upper()
     try:
         r = requests.get(
@@ -205,7 +194,6 @@ def get_dividends(ticker: str):
 
 @lru_cache(maxsize=1)
 def get_market_breadth():
-    """Market breadth via Twelve Data /quote for multiple symbols."""
     symbols = ["VIX", "TNX", "SPY", "XLK", "XLF"]
     r = requests.get(
         TD_QUOTE_URL,
@@ -243,21 +231,14 @@ def get_market_breadth():
 
 def _seeded_walk(symbol: str, base: float, n: int) -> List[float]:
     """Deterministic, tiny random-walk series per symbol (fallback)."""
-    rng = random.Random(symbol.upper())  # seeded by symbol so it’s stable
-    val = base * (1 + rng.uniform(-0.01, 0.01))  # start within ±1%
+    rng = random.Random(symbol.upper())
+    val = base * (1 + rng.uniform(-0.01, 0.01))
     out: List[float] = []
     for _ in range(n):
-        step = rng.uniform(-0.004, 0.004)  # ~±0.4%
+        step = rng.uniform(-0.004, 0.004)
         val *= (1 + step)
         out.append(round(val, 2))
     return out
-
-
-def _seeded_dates(n: int) -> List[str]:
-    """Generate last n calendar-day ISO dates ascending (fallback)."""
-    today = date.today()
-    days = [today - timedelta(days=(n - 1 - i)) for i in range(n)]
-    return [d.isoformat() for d in days]
 
 
 @lru_cache(maxsize=256)
@@ -267,10 +248,9 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
     Falls back to a seeded random-walk around the current price if candles fail.
     """
     sym = symbol.upper()
-    # allow up to 5 years (~1825 days)
-    days = max(2, min(int(days), 1825))
+    days = max(2, min(int(days), 300))
     now = int(time())
-    frm = now - days * 86400 * 2  # ask for extra (weekends/holidays)
+    frm = now - days * 86400 * 2  # ask for a bit more (weekends/holidays)
 
     # Try Finnhub candles
     try:
@@ -284,7 +264,7 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
                 "token": FINNHUB_API_KEY,
             },
             headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=8,
+            timeout=6,
         )
         r.raise_for_status()
         js = r.json()
@@ -305,16 +285,17 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
 
 
 @lru_cache(maxsize=256)
-def get_daily_closes_with_dates(symbol: str, days: int) -> Dict[str, List]:
+def get_daily_closes_with_dates(symbol: str, days: int) -> Dict[str, Any]:
     """
-    Same as get_daily_closes but also returns aligned ISO dates.
+    Like get_daily_closes but also returns ISO date strings aligned to the closes.
+    Dates/closes are most-recent last.
     """
     sym = symbol.upper()
     days = max(2, min(int(days), 1825))
     now = int(time())
-    frm = now - days * 86400 * 2
+    frm = now - days * 86400 * 3  # extra for weekends/holidays
 
-    # Finnhub with timestamps -> dates
+    # Try Finnhub candles with timestamps
     try:
         r = requests.get(
             FINNHUB_CANDLE_URL,
@@ -326,35 +307,38 @@ def get_daily_closes_with_dates(symbol: str, days: int) -> Dict[str, List]:
                 "token": FINNHUB_API_KEY,
             },
             headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=8,
+            timeout=6,
         )
         r.raise_for_status()
         js = r.json()
         if js.get("s") == "ok" and isinstance(js.get("c"), list) and isinstance(js.get("t"), list):
-            closes_raw = js["c"]
-            ts_raw = js["t"]
-            # Pair, filter None, then take last `days`
-            pairs = [(t, c) for t, c in zip(ts_raw, closes_raw) if c is not None]
-            if pairs:
-                pairs = pairs[-days:]
-                dates = [datetime.utcfromtimestamp(t).date().isoformat() for t, _ in pairs]
-                closes = [float(c) for _, c in pairs]
-                return {"dates": dates, "closes": closes}
+            c = [float(x) for x in js["c"] if x is not None]
+            t = [int(x) for x in js["t"] if x is not None]
+            # align lengths
+            n = min(len(c), len(t))
+            c = c[-n:]
+            t = t[-n:]
+            if n:
+                dates = [datetime.utcfromtimestamp(ts).date().isoformat() for ts in t]
+                closes = c
+                # ensure we don't exceed requested window
+                return {"dates": dates[-days:], "closes": closes[-days:]}
     except Exception:
         pass
 
-    # Fallback synthetic with synthetic dates
+    # Fallback: synth dates to match get_daily_closes
     closes = get_daily_closes(sym, days)
-    dates = _seeded_dates(len(closes)) if closes else []
+    n = len(closes)
+    if n == 0:
+        return {"dates": [], "closes": []}
+    start = date.today() - timedelta(days=n - 1)
+    dates = [(start + timedelta(days=i)).isoformat() for i in range(n)]
     return {"dates": dates, "closes": closes}
 
 
 @lru_cache(maxsize=128)
 def get_52w_stats(symbol: str) -> dict:
-    """
-    Computes 52w high/low from daily closes helper (works even on fallback).
-    """
-    closes = get_daily_closes(symbol, 300)  # ~252 trading days in 52 weeks
+    closes = get_daily_closes(symbol, 300)  # up to 300 days calendar (~252 trading)
     window = closes[-252:] if len(closes) >= 252 else closes
     if window:
         return {
