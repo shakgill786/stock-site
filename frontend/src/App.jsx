@@ -6,7 +6,7 @@ import {
   fetchEarnings,
   fetchMarket,
   fetchCloses,
-  fetchPredictHistory, // <- uses for backtest rows
+  fetchPredictHistory,
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
@@ -18,7 +18,6 @@ import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import "./App.css";
 
-// --- Chart.js for Actual vs Predicted chart ---
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -40,7 +39,6 @@ ChartJS.register(
   Tooltip,
   Legend
 );
-// ------------------------------------------------
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 const API_BASE =
@@ -64,6 +62,10 @@ const addBusinessDays = (start, n) => {
   }
   return dt;
 };
+
+// normalize model keys so we don’t miss due to case/whitespace
+const normModel = (s) => String(s || "").trim().toUpperCase();
+const dkey = (s) => String(s).slice(0, 10);
 
 export default function App() {
   const [ticker, setTicker] = useState("AAPL");
@@ -107,7 +109,6 @@ export default function App() {
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  // >>> robust multi-window fetch (prevents one failure from blanking the chart)
   const fetchClosesSafe = async (tkr) => {
     const tryOnce = async (days) => {
       try {
@@ -129,11 +130,23 @@ export default function App() {
     );
   };
 
-  const dkey = (s) => String(s).slice(0, 10);
-  const historyByDate = useMemo(
-    () => Object.fromEntries((historyRows || []).map((r) => [dkey(r.date), r])),
-    [historyRows]
-  );
+  // Build fast lookup maps for backtests:
+  //  - by date -> full row
+  //  - by date+normalized model -> number
+  const { histByDate, histPred } = useMemo(() => {
+    const byDate = {};
+    const byDateModel = {};
+    (historyRows || []).forEach((r) => {
+      const dk = dkey(r.date);
+      byDate[dk] = r;
+      const perModel = {};
+      Object.entries(r.pred || {}).forEach(([m, v]) => {
+        perModel[normModel(m)] = Number(v);
+      });
+      byDateModel[dk] = perModel;
+    });
+    return { histByDate: byDate, histPred: byDateModel };
+  }, [historyRows]);
 
   const loadData = useCallback(async () => {
     setQuoteErr(false);
@@ -245,7 +258,6 @@ export default function App() {
     if (!quote || !results?.length) return [];
     const base = Number(quote.last_close) || 0;
     if (base <= 0) return [];
-
     return results.map((r) => {
       const mapeProxy =
         r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
@@ -317,12 +329,13 @@ export default function App() {
 
     results.forEach((r, idx) => {
       const color = colorPalette[idx % colorPalette.length];
+      const mKey = normModel(r.model);
 
-      // dashed backtest for past window
+      // dashed backtest for past window (read from histPred map)
       const backtestSeries = chartLabels.map((lab) => {
-        const row = historyByDate[dkey(lab)];
-        const v = row?.pred?.[r.model];
-        return Number.isFinite(Number(v)) ? Number(v) : null;
+        const dk = dkey(lab);
+        const val = histPred?.[dk]?.[mKey];
+        return Number.isFinite(Number(val)) ? Number(val) : null;
       });
 
       ds.push({
@@ -360,7 +373,7 @@ export default function App() {
     return ds;
   }, [
     results,
-    historyByDate,
+    histPred,
     pastLabels.join("|"),
     futureLabels.join("|"),
     actualForPastLabels.join("|"),
@@ -384,13 +397,14 @@ export default function App() {
 
   // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
-    const row = historyByDate[dkey(iso)];
+    const dk = dkey(iso);
+    const row = histByDate[dk];
     const actual = (() => {
       const idx = closeDates.lastIndexOf(iso);
       return idx >= 0 ? closes[idx] : (row?.actual ?? null);
     })();
     const perModel = results.map((r) => {
-      const v = row?.pred?.[r.model];
+      const v = histPred?.[dk]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
     return { date: iso, actual, perModel, kind: "past" };

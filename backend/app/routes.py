@@ -38,9 +38,8 @@ def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List
         try:
             dt = date.fromisoformat(str(d)[:10])
         except Exception:
-            # keep if we can't parse, but this shouldn't happen
-            out_d.append(d)
-            out_c.append(c)
+            out_d.append(str(d)[:10])
+            out_c.append(float(c))
             continue
 
         dow = dt.weekday()  # 0=Mon..6=Sun
@@ -64,7 +63,6 @@ def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
         last_close = float(q.get("last_close"))
     except Exception:
         return
-    # last element should be the latest completed trading day after filtering
     try:
         closes[-1] = last_close
     except Exception:
@@ -111,6 +109,9 @@ async def predict_history(
     For each of the last `days` TARGET DATES (most-recent last), return:
       - actual close on that date
       - what each model *would have predicted for that date* using only data up to the prior trading day
+
+    Implementation detail: uses the exact same daily-closes pipeline as /closes
+    to keep dates perfectly aligned with the UI.
     """
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
@@ -118,7 +119,8 @@ async def predict_history(
         models = ["LSTM", "ARIMA", "RandomForest"]
 
     # Need (days + 1) closes so we can predict each target from the previous day.
-    series = get_daily_closes_with_dates(symbol, max(days + 6, days + 1))
+    # Ask for a generous buffer to survive partial provider responses.
+    series = get_daily_closes_with_dates(symbol, days + 40)
     dates: List[str] = list(series.get("dates") or [])
     closes: List[float] = list(series.get("closes") or [])
 
@@ -133,21 +135,25 @@ async def predict_history(
     # Pin the most recent actual to the quote's last_close for consistency
     _pin_last_close(symbol, dates, closes)
 
-    # Build rows keyed by TARGET DATE i (predicted using i-1), take the last `days`
-    targets = list(range(1, n))[-days:]
+    # Build rows keyed by TARGET DATE i (predicted using i-1)
+    # Take the last `days`
+    indices = list(range(1, n))
+    targets = indices[-days:]
 
-    model_bias = {"LSTM": 0.0020, "ARIMA": 0.0, "RandomForest": -0.001, "XGBoost": 0.0015}
+    # small, distinct deterministic biases per model (so backtest lines differ)
+    model_bias = {"LSTM": 0.0020, "ARIMA": 0.0, "RandomForest": -0.0010, "XGBoost": 0.0015}
 
     rows: List[Dict[str, Any]] = []
     for i in targets:
-        target_date = dates[i]
+        target_date = dates[i][:10]
         actual = float(closes[i])
         prev_close = float(closes[i - 1])
 
         pred_map: Dict[str, float] = {}
         err_map: Dict[str, float] = {}
         for m in models:
-            rng = random.Random(f"{symbol}:{m}:{target_date}")  # deterministic per model/date
+            # deterministic per (symbol, model, target_date)
+            rng = random.Random(f"{symbol}:{m}:{target_date}")
             noise = rng.uniform(-0.02, 0.02)  # ±2%
             bias = model_bias.get(m, 0.0)
             pred_val = round(prev_close * (1 + bias + noise), 2)
@@ -192,7 +198,6 @@ async def quote_stream(ticker: str, interval: float = 5.0):
                     "change_pct": q.get("change_pct"),
                     "ts": int(time.time()),
                 }
-                # IMPORTANT: double newline to delimit SSE messages
                 yield f"data: {json.dumps(payload)}\n\n"
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -226,10 +231,6 @@ async def closes_endpoint(ticker: str, days: int = 60):
 # ---------- Quick stats (52w high/low only) ----------
 @router.get("/stats")
 async def stats_endpoint(ticker: str):
-    """
-    Returns:
-      { "ticker": "AAPL", "high_52w": 229.35, "low_52w": 155.12 }
-    """
     symbol = str(ticker).upper()
     stats = get_52w_stats(symbol)
     return {"ticker": symbol, "high_52w": stats["high_52w"], "low_52w": stats["low_52w"]}
