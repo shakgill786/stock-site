@@ -2,8 +2,9 @@
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import random, json, asyncio, time
+from datetime import date, datetime
 from starlette.responses import StreamingResponse
 
 from app.services.finance_service import (
@@ -15,6 +16,61 @@ from app.services.finance_service import (
 )
 
 router = APIRouter()
+
+# ----------------------- helpers -----------------------
+
+def _is_crypto(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    # crude heuristic: most crypto pairs look like BTC-USD, ETH-USD, etc.
+    return "-" in s
+
+def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List[str], List[float]]:
+    """
+    Drop weekends and 'today' for equities so we only keep completed trading days.
+    Assumes dates are ISO strings (YYYY-MM-DD), most-recent last.
+    """
+    if not dates or not closes or len(dates) != len(closes):
+        return dates or [], closes or []
+
+    today_iso = date.today().isoformat()
+    out_d, out_c = [], []
+    for d, c in zip(dates, closes):
+        try:
+            dt = date.fromisoformat(str(d)[:10])
+        except Exception:
+            # keep if we can't parse, but this shouldn't happen
+            out_d.append(d)
+            out_c.append(c)
+            continue
+
+        dow = dt.weekday()  # 0=Mon..6=Sun
+        is_weekend = dow >= 5
+        is_today = (dt.isoformat() == today_iso)
+        if is_weekend or is_today:
+            continue  # skip weekends and today
+        out_d.append(dt.isoformat())
+        out_c.append(float(c))
+    return out_d, out_c
+
+def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
+    """
+    Replace the last close with quote.last_close when appropriate (equities only),
+    so 'actual' for the latest completed trading day matches the quote card.
+    """
+    if not dates or not closes or _is_crypto(symbol):
+        return
+    try:
+        q = get_quote(symbol)
+        last_close = float(q.get("last_close"))
+    except Exception:
+        return
+    # last element should be the latest completed trading day after filtering
+    try:
+        closes[-1] = last_close
+    except Exception:
+        pass
+
+# ----------------------- routes -----------------------
 
 @router.get("/hello")
 async def say_hello():
@@ -37,7 +93,7 @@ class PredictResponse(BaseModel):
 async def predict(req: PredictRequest):
     random.seed(req.ticker.upper())
     base = get_quote(req.ticker)["current_price"]
-    results = []
+    results: List[ModelPrediction] = []
     for m in req.models:
         preds = [round(base * (1 + random.uniform(-0.05, 0.05)), 2) for _ in range(7)]
         confs = [round(random.uniform(0.7, 1.0), 2) for _ in range(7)]
@@ -55,38 +111,30 @@ async def predict_history(
     For each of the last `days` TARGET DATES (most-recent last), return:
       - actual close on that date
       - what each model *would have predicted for that date* using only data up to the prior trading day
-
-    Response:
-    {
-      "ticker": "AAPL",
-      "models": ["LSTM","ARIMA"],
-      "rows": [
-        {
-          "date": "2025-08-04",
-          "close": 231.77,
-          "actual": 231.77,
-          "pred": { "LSTM": 232.11, "ARIMA": 231.98 },
-          "error_pct": { "LSTM": 0.15, "ARIMA": 0.09 }
-        },
-        ...
-      ]
-    }
     """
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
     if not models or not isinstance(models, list):
-        models = ["LSTM", "ARIMA"]
+        models = ["LSTM", "ARIMA", "RandomForest"]
 
     # Need (days + 1) closes so we can predict each target from the previous day.
     series = get_daily_closes_with_dates(symbol, max(days + 6, days + 1))
-    dates: List[str] = series["dates"]          # most-recent last
-    closes: List[float] = series["closes"]
+    dates: List[str] = list(series.get("dates") or [])
+    closes: List[float] = list(series.get("closes") or [])
+
+    # Calendar filtering for equities (skip weekends and today)
+    if not _is_crypto(symbol):
+        dates, closes = _filter_equity_calendar(dates, closes)
 
     n = len(closes)
     if n < 2:
         return {"ticker": symbol, "models": models, "rows": []}
 
-    targets = list(range(1, n))[-days:]  # predict target i using i-1
+    # Pin the most recent actual to the quote's last_close for consistency
+    _pin_last_close(symbol, dates, closes)
+
+    # Build rows keyed by TARGET DATE i (predicted using i-1), take the last `days`
+    targets = list(range(1, n))[-days:]
 
     model_bias = {"LSTM": 0.0020, "ARIMA": 0.0, "RandomForest": -0.001, "XGBoost": 0.0015}
 
@@ -104,10 +152,10 @@ async def predict_history(
             bias = model_bias.get(m, 0.0)
             pred_val = round(prev_close * (1 + bias + noise), 2)
             pred_map[m] = pred_val
-            err_map[m] = round(((pred_val - actual) / actual) * 100.0, 2)
+            err_map[m] = round(((pred_val - actual) / (actual if actual else 1.0)) * 100.0, 2)
 
         rows.append({
-            "date": target_date,            # IMPORTANT: target date key matches /closes
+            "date": target_date,            # ISO YYYY-MM-DD, matches /closes
             "close": round(actual, 2),
             "actual": round(actual, 2),
             "pred": pred_map,
@@ -165,7 +213,15 @@ async def closes_endpoint(ticker: str, days: int = 60):
     symbol = str(ticker).upper()
     days = max(2, min(int(days), 1825))
     data = get_daily_closes_with_dates(symbol, days)
-    return {"ticker": symbol, "dates": data["dates"], "closes": data["closes"]}
+    dates: List[str] = list(data.get("dates") or [])
+    closes: List[float] = list(data.get("closes") or [])
+
+    # For equities, drop weekends and today; keep crypto 7d/week
+    if not _is_crypto(symbol):
+        dates, closes = _filter_equity_calendar(dates, closes)
+        _pin_last_close(symbol, dates, closes)
+
+    return {"ticker": symbol, "dates": dates, "closes": closes}
 
 # ---------- Quick stats (52w high/low only) ----------
 @router.get("/stats")

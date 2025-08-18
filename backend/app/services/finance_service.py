@@ -2,13 +2,20 @@
 
 import os
 import requests
-from functools import lru_cache
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
 from time import time
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
+
+from functools import lru_cache
 from dotenv import load_dotenv
 import random
+
+# Optional: yfinance for accurate historical closes
+try:
+    import yfinance as yf  # type: ignore
+except Exception:  # pragma: no cover
+    yf = None
 
 load_dotenv()  # loads FINNHUB_*, TWELVEDATA_API_KEY, ALPHAVANTAGE_API_KEY
 
@@ -19,10 +26,11 @@ FINNHUB_QUOTE_URL     = "https://finnhub.io/api/v1/quote"
 FINNHUB_EARNINGS_URL  = "https://finnhub.io/api/v1/calendar/earnings"
 FINNHUB_CANDLE_URL    = "https://finnhub.io/api/v1/stock/candle"
 
-# Twelve Data for dividends & market breadth
-TD_KEY            = os.getenv("TWELVEDATA_API_KEY")
-TD_DIVIDENDS_URL  = "https://api.twelvedata.com/dividends"
-TD_QUOTE_URL      = "https://api.twelvedata.com/quote"
+# Twelve Data
+TD_KEY               = os.getenv("TWELVEDATA_API_KEY")
+TD_DIVIDENDS_URL     = "https://api.twelvedata.com/dividends"
+TD_QUOTE_URL         = "https://api.twelvedata.com/quote"
+TD_TIME_SERIES_URL   = "https://api.twelvedata.com/time_series"
 
 # Alpha Vantage (optional) for last-resort quote fallback
 AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
@@ -34,14 +42,38 @@ if not TD_KEY:
     raise RuntimeError("Missing TWELVEDATA_API_KEY in environment")
 # AV_KEY is optional
 
+# -------------------------
+# Utils
+# -------------------------
+
+def _is_crypto(symbol: str) -> bool:
+    return "-" in (symbol or "")
+
+def _drop_today_for_equities(dates: List[str], closes: List[float]) -> Tuple[List[str], List[float]]:
+    if not dates or not closes or len(dates) != len(closes):
+        return dates or [], closes or []
+    today_iso = date.today().isoformat()
+    out_d, out_c = [], []
+    for d, c in zip(dates, closes):
+        dd = str(d)[:10]
+        if dd == today_iso:
+            continue
+        out_d.append(dd)
+        out_c.append(float(c))
+    return out_d, out_c
+
+# -------------------------
+# Quote / Earnings / Market
+# -------------------------
 
 @lru_cache(maxsize=128)
 def get_quote(ticker: str):
     """
     Quote:
-      1) Finnhub (tolerant if pc==0 -> uses c as last_close, 0% change)
-      2) Twelve Data fallback (parses single or multi-symbol)
-      3) Alpha Vantage fallback (if key present)
+      1) Finnhub
+      2) Twelve Data
+      3) Alpha Vantage
+      4) FINAL FALLBACK: use latest daily close so downstream endpoints never break
     """
     symbol = ticker.upper()
 
@@ -51,106 +83,70 @@ def get_quote(ticker: str):
             FINNHUB_QUOTE_URL,
             params={"symbol": symbol, "token": FINNHUB_API_KEY},
             headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=5,
+            timeout=6,
         )
         r1.raise_for_status()
         d = r1.json()
-        c = d.get("c")    # current price
-        pc = d.get("pc")  # previous close
+        c = d.get("c")
+        pc = d.get("pc")
         if c is not None:
             prev_close = pc if (pc not in (None, 0)) else c
             pct = 0.0 if prev_close == 0 or prev_close == c else round(((c - prev_close) / prev_close) * 100, 2)
-            return {
-                "ticker": symbol,
-                "last_close": round(prev_close, 2),
-                "current_price": round(c, 2),
-                "change_pct": pct,
-            }
+            return {"ticker": symbol, "last_close": round(prev_close, 2), "current_price": round(c, 2), "change_pct": pct}
     except Exception:
         pass
 
-    # 2) Twelve Data fallback
+    # 2) Twelve Data
     try:
-        r2 = requests.get(
-            TD_QUOTE_URL,
-            params={"symbol": symbol, "apikey": TD_KEY},
-            timeout=5,
-        )
+        r2 = requests.get(TD_QUOTE_URL, params={"symbol": symbol, "apikey": TD_KEY}, timeout=6)
         r2.raise_for_status()
         js2 = r2.json()
-
         if isinstance(js2, dict) and js2.get("status") == "error":
-            raise ValueError(js2.get("message", "Twelve Data status=error"))
-        if isinstance(js2, dict) and "message" in js2 and "close" not in js2 and symbol not in js2:
-            raise ValueError(js2["message"])
-
-        # single-symbol: {"symbol":"X","close":"...","previous_close":"..."}
-        # multi-symbol:  {"X": {...}, "AAPL": {...}}
+            raise ValueError(js2.get("message", "TD status=error"))
         if isinstance(js2, dict) and "close" in js2:
-            info = js2
+            price = float(js2["close"])
+            prev  = float(js2.get("previous_close", price))
         elif isinstance(js2, dict) and symbol in js2:
-            info = js2.get(symbol) or {}
+            info = js2[symbol]
+            price = float(info.get("close"))
+            prev  = float(info.get("previous_close", price))
         else:
-            raise ValueError("Twelve Data response not recognized")
+            raise ValueError("TD quote response not recognized")
+        pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
+        return {"ticker": symbol, "last_close": round(prev, 2), "current_price": round(price, 2), "change_pct": pct}
+    except Exception:
+        pass
 
-        price_str = info.get("close")
-        prev_str  = info.get("previous_close")
-        if price_str is None:
-            raise ValueError("missing 'close' in Twelve Data response")
-
-        price = float(price_str)
-        prev_close = float(prev_str) if prev_str not in (None, "") else price
-        pct = 0.0 if prev_close == 0 else round(((price - prev_close) / prev_close) * 100, 2)
-        return {
-            "ticker": symbol,
-            "last_close": round(prev_close, 2),
-            "current_price": round(price, 2),
-            "change_pct": pct,
-        }
-    except Exception as td_err:
-        # 3) Alpha Vantage fallback if available
-        if not AV_KEY:
-            raise HTTPException(502, f"Error fetching quote fallback (Twelve Data): {td_err}")
-
+    # 3) Alpha Vantage
+    if AV_KEY:
         try:
-            r3 = requests.get(
-                AV_URL,
-                params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": AV_KEY},
-                timeout=5,
-            )
+            r3 = requests.get(AV_URL, params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": AV_KEY}, timeout=8)
             r3.raise_for_status()
             av = r3.json()
-            if "Note" in av:
-                raise HTTPException(503, f"Alpha Vantage rate limit: {av['Note']}")
-            if "Information" in av:
-                raise HTTPException(503, f"Alpha Vantage: {av['Information']}")
             gq = av.get("Global Quote")
-            if not isinstance(gq, dict):
-                raise HTTPException(404, "Alpha Vantage: no Global Quote")
+            if isinstance(gq, dict):
+                price = float(gq.get("05. price"))
+                prev  = float(gq.get("08. previous close", price))
+                pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
+                return {"ticker": symbol, "last_close": round(prev, 2), "current_price": round(price, 2), "change_pct": pct}
+        except Exception:
+            pass
 
-            price_str = gq.get("05. price")
-            prev_str  = gq.get("08. previous close")
-            if price_str is None:
-                raise HTTPException(404, "Alpha Vantage: price field missing")
+    # 4) Final fallback: derive from latest closes so /predict never dies
+    try:
+        closes = get_daily_closes(symbol, 2)
+        last = closes[-1] if closes else None
+        if last is not None:
+            last_f = float(last)
+            return {"ticker": symbol, "last_close": round(last_f, 2), "current_price": round(last_f, 2), "change_pct": 0.0}
+    except Exception:
+        pass
 
-            price = float(price_str)
-            prev_close = float(prev_str) if prev_str not in (None, "") else price
-            pct = 0.0 if prev_close == 0 else round(((price - prev_close) / prev_close) * 100, 2)
-            return {
-                "ticker": symbol,
-                "last_close": round(prev_close, 2),
-                "current_price": round(price, 2),
-                "change_pct": pct,
-            }
-        except HTTPException:
-            raise
-        except Exception as av_err:
-            raise HTTPException(502, f"Error fetching quote fallback (Alpha Vantage): {av_err}") from av_err
-
+    # If absolutely nothing worked
+    raise HTTPException(502, f"Could not fetch quote for {symbol}")
 
 @lru_cache(maxsize=128)
 def get_earnings(ticker: str):
-    """Return 200 with nextEarningsDate=None when not found (UI shows N/A)."""
     symbol = ticker.upper()
     today, to_date = date.today().isoformat(), (date.today() + timedelta(days=90)).isoformat()
     try:
@@ -158,29 +154,22 @@ def get_earnings(ticker: str):
             FINNHUB_EARNINGS_URL,
             params={"symbol": symbol, "from": today, "to": to_date, "token": FINNHUB_API_KEY},
             headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=5
+            timeout=6
         )
         resp.raise_for_status()
         cal = resp.json().get("earningsCalendar", [])
         next_date = cal[0].get("date") if cal else None
         return {"ticker": symbol, "nextEarningsDate": next_date, "available": next_date is not None}
     except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response else None
-        if code == 429:
+        if e.response is not None and e.response.status_code == 429:
             raise HTTPException(503, "Rate limited by Finnhub earnings API.")
         return {"ticker": symbol, "nextEarningsDate": None, "available": False, "reason": "fetch_error"}
 
-
 @lru_cache(maxsize=128)
 def get_dividends(ticker: str):
-    """Return 200 with available=False if none/blocked so UI shows N/A."""
     symbol = ticker.upper()
     try:
-        r = requests.get(
-            TD_DIVIDENDS_URL,
-            params={"symbol": symbol, "apikey": TD_KEY},
-            timeout=5
-        )
+        r = requests.get(TD_DIVIDENDS_URL, params={"symbol": symbol, "apikey": TD_KEY}, timeout=6)
         r.raise_for_status()
         js = r.json()
         if isinstance(js, dict) and js.get("status") == "error":
@@ -195,32 +184,24 @@ def get_dividends(ticker: str):
             return {"ticker": symbol, "available": False, "reason": "incomplete"}
         return {"ticker": symbol, "available": True, "exDividendDate": exd, "lastDividendAmount": amt}
     except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response else None
-        if code == 429:
+        if e.response is not None and e.response.status_code == 429:
             raise HTTPException(503, "Rate limited by Twelve Data dividends API.")
         return {"ticker": symbol, "available": False, "reason": "fetch_error"}
     except Exception:
         return {"ticker": symbol, "available": False, "reason": "exception"}
 
-
 @lru_cache(maxsize=1)
 def get_market_breadth():
-    """Market breadth via Twelve Data /quote for multiple symbols."""
     symbols = ["VIX", "TNX", "SPY", "XLK", "XLF"]
-    r = requests.get(
-        TD_QUOTE_URL,
-        params={"symbol": ",".join(symbols), "apikey": TD_KEY},
-        timeout=5
-    )
     try:
+        r = requests.get(TD_QUOTE_URL, params={"symbol": ",".join(symbols), "apikey": TD_KEY}, timeout=6)
         r.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response else None
-        if code == 429:
+        if e.response is not None and e.response.status_code == 429:
             raise HTTPException(503, "Rate limited by Twelve Data market API.")
         raise HTTPException(502, f"Error fetching market breadth: {e.response.text if e.response else str(e)}")
 
-    js  = r.json()
+    js = r.json()
     out = {}
     for sym in symbols:
         info = (js.get(sym) or {}) if isinstance(js, dict) else {}
@@ -231,53 +212,94 @@ def get_market_breadth():
             continue
         pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
         out[sym] = {"current_price": price, "last_close": prev, "change_pct": pct}
-
     if not out:
         raise HTTPException(404, "No market breadth data found")
     return out
 
-
 # -------------------------
-# Candle-based helpers
+# Historical closes helpers
 # -------------------------
 
-def _seeded_walk(symbol: str, base: float, n: int) -> List[float]:
-    """Deterministic, tiny random-walk series per symbol (fallback)."""
-    rng = random.Random(symbol.upper())  # seeded by symbol so it’s stable
-    val = base * (1 + rng.uniform(-0.01, 0.01))  # start within ±1%
-    out: List[float] = []
-    for _ in range(n):
-        step = rng.uniform(-0.004, 0.004)  # ~±0.4%
-        val *= (1 + step)
-        out.append(round(val, 2))
-    return out
+def _yf_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
+    if yf is None:
+        return None
+    period_days = max(int(days) + 15, 25)
+    try:
+        df = yf.download(
+            symbol,
+            period=f"{period_days}d",
+            interval="1d",
+            auto_adjust=False,  # we want unadjusted Close to match Yahoo "Close"
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        df = df.dropna(subset=["Close"])
+        closes = [float(v) for v in df["Close"].tolist()]
+        dates: List[str] = []
+        for ts in df.index:
+            try:
+                try:
+                    ts = ts.tz_localize(None)
+                except Exception:
+                    pass
+                dates.append(ts.date().isoformat())
+            except Exception:
+                dates.append(str(ts)[:10])
+        return {"dates": dates[-days:], "closes": closes[-days:]}
+    except Exception:
+        return None
 
+def _twelve_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
+    """Twelve Data daily time series -> unadjusted Close."""
+    try:
+        outsize = max(int(days) + 15, 40)
+        r = requests.get(
+            TD_TIME_SERIES_URL,
+            params={
+                "symbol": symbol,
+                "interval": "1day",
+                "outputsize": outsize,
+                "order": "ASC",
+                "apikey": TD_KEY,
+            },
+            timeout=8,
+        )
+        r.raise_for_status()
+        js = r.json()
+        if isinstance(js, dict) and js.get("status") == "error":
+            return None
+        # format: { "values": [ { "datetime": "2025-08-15", "close": "231.59", ...}, ...] }
+        values = js.get("values")
+        if not isinstance(values, list) or not values:
+            return None
+        ds: List[str] = []
+        cs: List[float] = []
+        for row in values:
+            dt = str(row.get("datetime") or row.get("date") or "")[:10]
+            cl = row.get("close")
+            if not dt or cl is None:
+                continue
+            try:
+                cs.append(float(cl))
+                ds.append(dt)
+            except Exception:
+                continue
+        if not ds or not cs or len(ds) != len(cs):
+            return None
+        return {"dates": ds[-days:], "closes": cs[-days:]}
+    except Exception:
+        return None
 
-def _seeded_dates(n: int) -> List[str]:
-    """Generate last n calendar-day ISO dates ascending (fallback)."""
-    today = date.today()
-    days = [today - timedelta(days=(n - 1 - i)) for i in range(n)]
-    return [d.isoformat() for d in days]
-
-
-@lru_cache(maxsize=256)
-def get_daily_closes(symbol: str, days: int) -> List[float]:
-    """
-    Returns a list of daily close prices (most recent last) for the past `days`.
-    Falls back to a seeded random-walk around the current price if candles fail.
-    """
-    sym = symbol.upper()
-    # allow up to 5 years (~1825 days)
-    days = max(2, min(int(days), 1825))
+def _finnhub_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
     now = int(time())
-    frm = now - days * 86400 * 2  # ask for extra (weekends/holidays)
-
-    # Try Finnhub candles
+    frm = now - days * 86400 * 3
     try:
         r = requests.get(
             FINNHUB_CANDLE_URL,
             params={
-                "symbol": sym,
+                "symbol": symbol,
                 "resolution": "D",
                 "from": frm,
                 "to": now,
@@ -288,79 +310,65 @@ def get_daily_closes(symbol: str, days: int) -> List[float]:
         )
         r.raise_for_status()
         js = r.json()
-        if js.get("s") == "ok" and isinstance(js.get("c"), list):
-            closes = [float(x) for x in js["c"] if x is not None]
-            if closes:
-                return closes[-days:]
+        if js.get("s") != "ok" or not isinstance(js.get("c"), list) or not isinstance(js.get("t"), list):
+            return None
+        closes_raw = js["c"]
+        ts_raw = js["t"]
+        pairs = [(t, c) for t, c in zip(ts_raw, closes_raw) if c is not None]
+        if not pairs:
+            return None
+        dates = [datetime.utcfromtimestamp(t).date().isoformat() for t, _ in pairs]
+        closes = [float(c) for _, c in pairs]
+        return {"dates": dates[-days:], "closes": closes[-days:]}
     except Exception:
-        pass
+        return None
 
-    # Fallback: deterministic synthetic series (per symbol)
-    try:
-        q = get_quote(sym)
-        base = float(q["current_price"])
-        return _seeded_walk(sym, base, days)
-    except Exception:
+# ---- NO CACHE here to avoid stale "Actuals" ----
+def get_daily_closes(symbol: str, days: int) -> List[float]:
+    sym = symbol.upper()
+    days = max(2, min(int(days), 1825))
+
+    # equities: yfinance -> TwelveData -> Finnhub
+    if not _is_crypto(sym):
+        for fn in (_yf_download, _twelve_download, _finnhub_download):
+            data = fn(sym, days)
+            if data and data.get("dates") and data.get("closes"):
+                d, c = _drop_today_for_equities(data["dates"], data["closes"])
+                if c:
+                    return c[-days:]
         return []
 
+    # crypto: TwelveData -> Finnhub (no drop-today)
+    for fn in (_twelve_download, _finnhub_download):
+        data = fn(sym, days)
+        if data and data.get("closes"):
+            return data["closes"][-days:]
+    return []
 
-@lru_cache(maxsize=256)
+# ---- NO CACHE here to avoid stale "Actuals" ----
 def get_daily_closes_with_dates(symbol: str, days: int) -> Dict[str, List]:
-    """
-    Same as get_daily_closes but also returns aligned ISO dates.
-    """
     sym = symbol.upper()
     days = max(2, min(int(days), 1825))
-    now = int(time())
-    frm = now - days * 86400 * 2
 
-    # Finnhub with timestamps -> dates
-    try:
-        r = requests.get(
-            FINNHUB_CANDLE_URL,
-            params={
-                "symbol": sym,
-                "resolution": "D",
-                "from": frm,
-                "to": now,
-                "token": FINNHUB_API_KEY,
-            },
-            headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=8,
-        )
-        r.raise_for_status()
-        js = r.json()
-        if js.get("s") == "ok" and isinstance(js.get("c"), list) and isinstance(js.get("t"), list):
-            closes_raw = js["c"]
-            ts_raw = js["t"]
-            # Pair, filter None, then take last `days`
-            pairs = [(t, c) for t, c in zip(ts_raw, closes_raw) if c is not None]
-            if pairs:
-                pairs = pairs[-days:]
-                dates = [datetime.utcfromtimestamp(t).date().isoformat() for t, _ in pairs]
-                closes = [float(c) for _, c in pairs]
-                return {"dates": dates, "closes": closes}
-    except Exception:
-        pass
+    if not _is_crypto(sym):
+        for fn in (_yf_download, _twelve_download, _finnhub_download):
+            data = fn(sym, days)
+            if data and data.get("dates") and data.get("closes"):
+                d, c = _drop_today_for_equities(data["dates"], data["closes"])
+                if d and c:
+                    return {"dates": d[-days:], "closes": c[-days:]}
+        return {"dates": [], "closes": []}
 
-    # Fallback synthetic with synthetic dates
-    closes = get_daily_closes(sym, days)
-    dates = _seeded_dates(len(closes)) if closes else []
-    return {"dates": dates, "closes": closes}
-
+    for fn in (_twelve_download, _finnhub_download):
+        data = fn(sym, days)
+        if data and data.get("dates") and data.get("closes"):
+            return {"dates": data["dates"][-days:], "closes": data["closes"][-days:]}
+    return {"dates": [], "closes": []}
 
 @lru_cache(maxsize=128)
 def get_52w_stats(symbol: str) -> dict:
-    """
-    Computes 52w high/low from daily closes helper (works even on fallback).
-    """
-    closes = get_daily_closes(symbol, 300)  # ~252 trading days in 52 weeks
+    closes = get_daily_closes(symbol, 300)  # ~252 trading days
     window = closes[-252:] if len(closes) >= 252 else closes
     if window:
-        return {
-            "high_52w": float(max(window)),
-            "low_52w": float(min(window)),
-            "market_cap": None,
-            "sector": None,
-        }
+        return {"high_52w": float(max(window)), "low_52w": float(min(window)), "market_cap": None, "sector": None}
     return {"high_52w": None, "low_52w": None, "market_cap": None, "sector": None}

@@ -6,7 +6,7 @@ import {
   fetchEarnings,
   fetchMarket,
   fetchCloses,
-  fetchPredictHistory, // <- restored
+  fetchPredictHistory, // <- uses for backtest rows
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
@@ -45,6 +45,25 @@ ChartJS.register(
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 const API_BASE =
   (import.meta.env.VITE_API_BASE || import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000");
+
+// ----- Date helpers (timezone-safe) -----
+const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
+const fmtLocalISO = (dt) => {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
+const addBusinessDays = (start, n) => {
+  const dt = start instanceof Date ? new Date(start) : asLocalDate(start);
+  let added = 0;
+  while (added < n) {
+    dt.setDate(dt.getDate() + 1);
+    const day = dt.getDay(); // 0=Sun,6=Sat
+    if (day !== 0 && day !== 6) added++;
+  }
+  return dt;
+};
 
 export default function App() {
   const [ticker, setTicker] = useState("AAPL");
@@ -88,28 +107,26 @@ export default function App() {
     return cleaned.length >= 2 ? cleaned : [];
   };
 
+  // >>> robust multi-window fetch (prevents one failure from blanking the chart)
   const fetchClosesSafe = async (tkr) => {
-    try {
-      const a = await fetchCloses(tkr, 1825); // ~5 years
-      let c = normalizeCloses(a?.closes);
-      if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
-      const b = await fetchCloses(tkr); // retry looser
-      c = normalizeCloses(b?.closes);
-      return { dates: Array.isArray(b?.dates) ? b.dates : [], closes: c };
-    } catch {
-      return { dates: [], closes: [] };
-    }
-  };
-
-  const addBusinessDays = (d, n) => {
-    const dt = new Date(d);
-    let added = 0;
-    while (added < n) {
-      dt.setDate(dt.getDate() + 1);
-      const day = dt.getDay();
-      if (day !== 0 && day !== 6) added++;
-    }
-    return dt;
+    const tryOnce = async (days) => {
+      try {
+        const r = await fetchCloses(tkr, days);
+        const c = normalizeCloses(r?.closes);
+        const d = Array.isArray(r?.dates) ? r.dates : [];
+        if (c.length >= 2 && d.length === c.length) return { dates: d, closes: c };
+        return null;
+      } catch {
+        return null;
+      }
+    };
+    return (
+      (await tryOnce(1825)) ||
+      (await tryOnce(365)) ||
+      (await tryOnce(120)) ||
+      (await tryOnce(60)) ||
+      { dates: [], closes: [] }
+    );
   };
 
   const dkey = (s) => String(s).slice(0, 10);
@@ -228,6 +245,7 @@ export default function App() {
     if (!quote || !results?.length) return [];
     const base = Number(quote.last_close) || 0;
     if (base <= 0) return [];
+
     return results.map((r) => {
       const mapeProxy =
         r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
@@ -252,20 +270,20 @@ export default function App() {
 
   // table past window
   const pastDaysToShow = 10;
-  const pastLabels = closeDates.slice(-pastDaysToShow); // last N actual trading days
+  const pastLabels = closeDates.slice(-pastDaysToShow); // last N actual trading days (ISO)
 
-  // future labels off the last past date
+  // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
-    ? new Date(pastLabels[pastLabels.length - 1])
-    : (closeDates.length ? new Date(closeDates[closeDates.length - 1]) : null);
+    ? asLocalDate(pastLabels[pastLabels.length - 1])
+    : (closeDates.length ? asLocalDate(closeDates[closeDates.length - 1]) : null);
 
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
-    return d.toISOString().slice(0, 10);
+    return fmtLocalISO(d);
   });
 
-  // chart labels = past window + forecast horizon
+  // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
   // actual values aligned to the past window labels
@@ -300,7 +318,7 @@ export default function App() {
     results.forEach((r, idx) => {
       const color = colorPalette[idx % colorPalette.length];
 
-      // dashed backtest for past window (future labels will show null)
+      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const row = historyByDate[dkey(lab)];
         const v = row?.pred?.[r.model];
@@ -743,21 +761,22 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
+  // label prefers real date when provided (timezone-safe)
   let label;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
     try {
-      const dt = new Date(d);
+      const dt = asLocalDate(d);
       label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
     } catch {
       label = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx;
+    const rel = (data.length - 1) - showIdx; // 0 = latest
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
-  const textW = Math.min(180, 70 + String(label).length * 6);
+  const textW = Math.min(200, 72 + String(label).length * 6);
   const boxX = Math.min(showX + 8, width - (textW + 10));
   const boxY = Math.max(showY - 26, 2);
 
