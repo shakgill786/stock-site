@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import random, json, asyncio, time
 from datetime import date, datetime
 from starlette.responses import StreamingResponse
@@ -68,6 +68,41 @@ def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
     except Exception:
         pass
 
+def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
+    """
+    Accepts:
+      - None
+      - ["LSTM","ARIMA"]
+      - ["LSTM,ARIMA"]  (comma string)
+      - case-insensitive; maps RF->RandomForest, XGB->XGBoost
+    """
+    default = ["LSTM", "ARIMA", "RandomForest"]
+    if not models:
+        return default
+    out: List[str] = []
+    for m in models:
+        if m is None:
+            continue
+        for part in str(m).split(","):
+            name = part.strip()
+            if not name:
+                continue
+            up = name.upper()
+            if up in {"LSTM", "ARIMA"}:
+                out.append(up)
+            elif up in {"RF", "RANDOMFOREST"}:
+                out.append("RandomForest")
+            elif up in {"XGB", "XGBOOST"}:
+                out.append("XGBoost")
+            else:
+                out.append(name)
+    # de-dup preserving order
+    seen = set(); dedup: List[str] = []
+    for m in out:
+        if m not in seen:
+            seen.add(m); dedup.append(m)
+    return dedup or default
+
 # ----------------------- routes -----------------------
 
 @router.get("/hello")
@@ -115,8 +150,7 @@ async def predict_history(
     """
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
-    if not models or not isinstance(models, list):
-        models = ["LSTM", "ARIMA", "RandomForest"]
+    models = _normalize_models_param(models)
 
     # Need (days + 1) closes so we can predict each target from the previous day.
     # Ask for a generous buffer to survive partial provider responses.
@@ -136,7 +170,6 @@ async def predict_history(
     _pin_last_close(symbol, dates, closes)
 
     # Build rows keyed by TARGET DATE i (predicted using i-1)
-    # Take the last `days`
     indices = list(range(1, n))
     targets = indices[-days:]
 
@@ -160,13 +193,20 @@ async def predict_history(
             pred_map[m] = pred_val
             err_map[m] = round(((pred_val - actual) / (actual if actual else 1.0)) * 100.0, 2)
 
-        rows.append({
+        # ---- NEW: flattened fields so UI can bind row.LSTM / row.ARIMA etc.
+        flat: Dict[str, Any] = {m: pred_map.get(m, None) for m in models}
+        flat_err: Dict[str, Any] = {f"{m}_err_pct": err_map.get(m, None) for m in models}
+
+        row = {
             "date": target_date,            # ISO YYYY-MM-DD, matches /closes
             "close": round(actual, 2),
             "actual": round(actual, 2),
             "pred": pred_map,
             "error_pct": err_map,
-        })
+        }
+        row.update(flat)
+        row.update(flat_err)
+        rows.append(row)
 
     return {"ticker": symbol, "models": models, "rows": rows}
 
@@ -231,6 +271,45 @@ async def closes_endpoint(ticker: str, days: int = 60):
 # ---------- Quick stats (52w high/low only) ----------
 @router.get("/stats")
 async def stats_endpoint(ticker: str):
+    """
+    Returns 52-week stats. Tries service; if missing/invalid, computes from yfinance.
+    Also provides alias keys: high, low, high52, low52 (for UI compatibility).
+    """
     symbol = str(ticker).upper()
-    stats = get_52w_stats(symbol)
-    return {"ticker": symbol, "high_52w": stats["high_52w"], "low_52w": stats["low_52w"]}
+
+    # Try service first
+    try:
+        stats = get_52w_stats(symbol) or {}
+        hi = stats.get("high_52w")
+        lo = stats.get("low_52w")
+        if isinstance(hi, (int, float)) and isinstance(lo, (int, float)):
+            hi = float(hi); lo = float(lo)
+            return {
+                "ticker": symbol,
+                "high_52w": hi, "low_52w": lo,
+                "high": hi, "low": lo,           # aliases some UIs expect
+                "high52": hi, "low52": lo,       # aliases
+            }
+    except Exception:
+        pass
+
+    # Fallback: compute from yfinance (last ~1y closes, adjusted)
+    try:
+        import yfinance as yf
+        df = yf.download(symbol, period="1y", interval="1d", progress=False, auto_adjust=True)
+        if df is not None and not df.empty and "Close" in df:
+            s = df["Close"].dropna().astype(float)
+            hi = float(s.max()) if len(s) else None
+            lo = float(s.min()) if len(s) else None
+            if hi is not None and lo is not None:
+                return {
+                    "ticker": symbol,
+                    "high_52w": hi, "low_52w": lo,
+                    "high": hi, "low": lo,
+                    "high52": hi, "low52": lo,
+                }
+    except Exception:
+        pass
+
+    # As a last resort, return placeholders (prevents UI crash)
+    return {"ticker": symbol, "high_52w": None, "low_52w": None, "high": None, "low": None, "high52": None, "low52": None}

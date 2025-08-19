@@ -148,6 +148,12 @@ export default function App() {
     return { histByDate: byDate, histPred: byDateModel };
   }, [historyRows]);
 
+  // Prefer the API's backtest dates for the table so keys line up exactly
+  const histDates = useMemo(
+    () => (historyRows || []).map((r) => dkey(r.date)),
+    [historyRows]
+  );
+
   const loadData = useCallback(async () => {
     setQuoteErr(false);
     setEarningsErr(false);
@@ -280,9 +286,9 @@ export default function App() {
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // table past window
+  // table past window (PREFER predict_history dates to keep keys aligned)
   const pastDaysToShow = 10;
-  const pastLabels = closeDates.slice(-pastDaysToShow); // last N actual trading days (ISO)
+  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
   // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
@@ -301,7 +307,7 @@ export default function App() {
   // actual values aligned to the past window labels
   const actualForPastLabels = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : null;
+    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
@@ -601,7 +607,9 @@ export default function App() {
                       <tr key={`${row.kind}-${row.date || i}`}>
                         <td>
                           {row.date
-                            ? row.date + (row.kind === "future" ? ` (+${i - pastRows.length + 1}d)` : "")
+                            ? row.kind === "future"
+                              ? `${row.date} (+${i - pastRows.length + 1}d)`
+                              : row.date
                             : ""}
                         </td>
                         <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
