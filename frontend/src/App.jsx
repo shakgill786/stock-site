@@ -16,6 +16,7 @@ import WatchlistPanel from "./components/WatchlistPanel";
 import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
+import HotAndEarnings from "./components/HotAndEarnings"; // simple add-on section
 import "./App.css";
 
 import {
@@ -42,7 +43,9 @@ ChartJS.register(
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 const API_BASE =
-  (import.meta.env.VITE_API_BASE || import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000");
+  import.meta.env.VITE_API_BASE ||
+  import.meta.env.VITE_API_BASE_URL ||
+  "http://127.0.0.1:8000";
 
 // ----- Date helpers (timezone-safe) -----
 const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
@@ -130,9 +133,7 @@ export default function App() {
     );
   };
 
-  // Build fast lookup maps for backtests:
-  //  - by date -> full row
-  //  - by date+normalized model -> number
+  // Build fast lookup maps for backtests
   const { histByDate, histPred } = useMemo(() => {
     const byDate = {};
     const byDateModel = {};
@@ -198,7 +199,7 @@ export default function App() {
       setCloseDates([]);
     }
 
-    // 4) Past backtest rows (what models would have predicted for recent days)
+    // 4) Past backtest rows
     try {
       const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
       setHistoryRows(hist?.rows || []);
@@ -224,7 +225,9 @@ export default function App() {
   }, [loadData]);
 
   // Live SSE: only updates the quote card smoothly
-  const streamUrl = live ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5` : null;
+  const streamUrl = live
+    ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5`
+    : null;
 
   useEventSource(streamUrl, {
     enabled: !!streamUrl,
@@ -286,14 +289,16 @@ export default function App() {
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // table past window (PREFER predict_history dates to keep keys aligned)
+  // table past window (prefer predict_history dates)
   const pastDaysToShow = 10;
   const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
   // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
-    : (closeDates.length ? asLocalDate(closeDates[closeDates.length - 1]) : null);
+    : closeDates.length
+    ? asLocalDate(closeDates[closeDates.length - 1])
+    : null;
 
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
@@ -307,7 +312,7 @@ export default function App() {
   // actual values aligned to the past window labels
   const actualForPastLabels = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
+    return idx >= 0 ? closes[idx] : histByDate[iso]?.actual ?? null;
   });
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
@@ -357,7 +362,8 @@ export default function App() {
       });
 
       // solid current forecast, anchored to last actual in past window
-      const start = [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
+      const start =
+        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
         start,
@@ -407,7 +413,7 @@ export default function App() {
     const row = histByDate[dk];
     const actual = (() => {
       const idx = closeDates.lastIndexOf(iso);
-      return idx >= 0 ? closes[idx] : (row?.actual ?? null);
+      return idx >= 0 ? closes[idx] : row?.actual ?? null;
     })();
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
@@ -441,7 +447,7 @@ export default function App() {
                 checked={live}
                 onChange={() => setLive((v) => !v)}
               />{" "}
-              Live price updates (SSE)
+                Live price updates (SSE)
             </label>
           </div>
         </aside>
@@ -575,6 +581,9 @@ export default function App() {
             </div>
           )}
 
+          {/* Simple Hot movers + Earnings next 7d */}
+          <HotAndEarnings />
+
           {/* --- Actual vs Predicted (chart + table) --- */}
           {results.length > 0 && closes.length >= 2 && (
             <div className="card" style={{ marginTop: 12 }}>
@@ -645,7 +654,7 @@ export default function App() {
             ))}
           </div>
 
-          {/* Forecast Table (original) */}
+          {/* Forecast Table (original) — shows confidence when present */}
           {results.length > 0 && (
             <div className="card table-card">
               <div className="table-wrap">
@@ -659,11 +668,18 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {results.map(({ model, predictions }) => (
+                    {results.map(({ model, predictions, confidence }) => (
                       <tr key={model}>
                         <td>{model}</td>
                         {predictions.map((val, i) => (
-                          <td key={i}>{Number(val).toFixed(2)}</td>
+                          <td key={i}>
+                            {Number(val).toFixed(2)}
+                            {Array.isArray(confidence) && confidence[i] != null && (
+                              <div className="muted" style={{ fontSize: 11 }}>
+                                conf {Number(confidence[i]).toFixed(2)}
+                              </div>
+                            )}
+                          </td>
                         ))}
                       </tr>
                     ))}
@@ -866,7 +882,7 @@ function MagnifyModal({ title, children, onClose }) {
           </div>
         </div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-          Tip: drag to pan • mouse wheel to zoom • double-click to reset
+          Tip: drag to pan • wheel to zoom • double-click to reset
         </div>
         <div style={{ marginTop: 12 }}>{children}</div>
       </div>
