@@ -3,233 +3,249 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchQuote, fetchEarnings } from "../api";
 import useLocalStorage from "../hooks/useLocalStorage";
 
-// A safe, lightweight default set. You can pass your own `tickers` prop
-// (e.g., the S&P 500 list) without touching this file.
-const DEFAULT_TICKERS = [
-  "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","BRK-B","JPM",
-  "UNH","XOM","LLY","JNJ","V","PG","MA","COST","HD","ADBE",
-  "ORCL","NFLX","CSCO","PEP","KO","ABBV","MRK","CRM","BAC","WMT",
-  "AMD","LIN","ACN","MCD","TXN","TMUS","NKE","AMAT","INTU","PYPL"
+const FALLBACK_TICKERS = [
+  "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","NFLX","AMD",
+  "JPM","V","MA","XOM","CVX","WMT","HD","PG","KO","PEP",
+  "UNH","JNJ","LLY","PFE","BAC","C","GS","MS","CSCO","ORCL",
+  "ADBE","CRM","QCOM","TXN","INTC","T","VZ","DIS","NKE","COST",
+  "MCD","ABT","TMO","UPS","LOW","IBM","CAT","HON","BA","PYPL"
 ];
 
-function withinNextDays(dateStr, days = 7) {
-  if (!dateStr) return false;
-  const today = new Date();
-  const end = new Date();
-  end.setDate(today.getDate() + days);
-  const d = new Date(String(dateStr).slice(0, 10));
-  return d >= new Date(today.toDateString()) && d <= end;
-}
+const fmtPct = (v) =>
+  Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "—";
+const fmtMoney = (v) =>
+  Number.isFinite(v) ? `$${Number(v).toFixed(2)}` : "—";
 
-async function withTimeout(promise, ms = 8000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    const res = await promise(controller.signal);
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-export default function HotAndEarnings({
-  tickers = DEFAULT_TICKERS,
-  useWatchlist = false,
-  topNHot = 8,
-  maxEarnings = 20,
-}) {
+export default function HotAndEarnings() {
   const [watchlist] = useLocalStorage("WATCHLIST_V1", []);
-  const [source, setSource] = useState(useWatchlist ? "watchlist" : "default");
-  const [loading, setLoading] = useState(false);
-  const [rows, setRows] = useState([]); // { symbol, quote, earnings }
-  const [error, setError] = useState("");
-  const verRef = useRef(0);
+  const universe = useMemo(() => {
+    const wl = (watchlist || []).map((w) => String(w.symbol || "").toUpperCase());
+    const dedup = Array.from(new Set([...(wl || []), ...FALLBACK_TICKERS]));
+    return dedup.slice(0, 80);
+  }, [watchlist]);
 
-  const symbols = useMemo(() => {
-    if (source === "watchlist") {
-      const wl = (watchlist || []).map((w) => w.symbol).filter(Boolean);
-      return wl.length ? wl : DEFAULT_TICKERS;
-    }
-    return tickers && tickers.length ? tickers : DEFAULT_TICKERS;
-  }, [source, watchlist, tickers]);
+  const [loading, setLoading] = useState(false);
+  const [gainers, setGainers] = useState([]);
+  const [losers, setLosers] = useState([]);
+  const [earnings, setEarnings] = useState([]);
+  const [err, setErr] = useState("");
+
+  const reqVer = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
-    const myVer = ++verRef.current;
-
     const run = async () => {
-      setError("");
       setLoading(true);
+      setErr("");
+      const myVer = ++reqVer.current;
+
       try {
-        // limit concurrency a bit so we don’t hammer the backend
-        const chunkSize = 10;
-        const out = [];
+        const quotes = await Promise.all(
+          universe.map(async (t) => {
+            try {
+              const q = await fetchQuote(t);
+              const cp = Number(q?.change_pct);
+              return {
+                symbol: String(q?.ticker || t).toUpperCase(),
+                price: Number(q?.current_price),
+                last_close: Number(q?.last_close ?? NaN),
+                change_pct: Number.isFinite(cp) ? cp : null,
+                name: q?.name || undefined,
+              };
+            } catch {
+              return null;
+            }
+          })
+        );
 
-        for (let i = 0; i < symbols.length; i += chunkSize) {
-          const chunk = symbols.slice(i, i + chunkSize);
-          /* eslint-disable no-await-in-loop */
-          const part = await Promise.all(
-            chunk.map(async (s) => {
-              const symbol = String(s).toUpperCase().trim();
-              try {
-                const [q, e] = await Promise.all([
-                  withTimeout(async (signal) => fetchQuote(symbol), 7000),
-                  withTimeout(async (signal) => fetchEarnings(symbol), 7000),
-                ]);
-                return { symbol, quote: q, earnings: e };
-              } catch {
-                return { symbol, quote: null, earnings: null };
-              }
-            })
-          );
-          if (cancelled || verRef.current !== myVer) return;
-          out.push(...part);
-        }
+        const clean = quotes.filter(
+          (q) => q && Number.isFinite(q.price) && Number.isFinite(q.change_pct)
+        );
 
-        if (!cancelled && verRef.current === myVer) setRows(out);
+        const topGainers = [...clean].sort((a, b) => b.change_pct - a.change_pct).slice(0, 25);
+        const topLosers  = [...clean].sort((a, b) => a.change_pct - b.change_pct).slice(0, 25);
+
+        if (reqVer.current !== myVer) return;
+        setGainers(topGainers);
+        setLosers(topLosers);
       } catch (e) {
-        if (!cancelled) setError(e?.message || "Failed to load data");
+        if (reqVer.current !== myVer) return;
+        setErr(e?.message || "Failed to load movers");
+        setGainers([]);
+        setLosers([]);
       } finally {
-        if (!cancelled) setLoading(false);
+        if (reqVer.current === myVer) setLoading(false);
+      }
+
+      // earnings next 7 days for a subset
+      const cutoff = Date.now() + 7 * 24 * 3600 * 1000;
+      try {
+        const pool = universe.slice(0, 80);
+        const rows = await Promise.all(
+          pool.map(async (t) => {
+            try {
+              const e = await fetchEarnings(t);
+              const d = e?.next_earnings ? new Date(`${e.next_earnings}T00:00:00`) : null;
+              if (d && d.getTime() <= cutoff) {
+                return { symbol: t, date: e.next_earnings, name: e?.name, session: e?.session || "" };
+              }
+              return null;
+            } catch {
+              return null;
+            }
+          })
+        );
+        setEarnings(rows.filter(Boolean).slice(0, 60));
+      } catch {
+        /* ignore */
       }
     };
 
     run();
-    return () => {
-      cancelled = true;
-    };
-  }, [symbols]);
-
-  // -------- Views --------
-  const hot = useMemo(() => {
-    const items = rows
-      .map((r) => {
-        const pct = Number(r?.quote?.change_pct);
-        const last = Number(r?.quote?.last_close);
-        const now = Number(r?.quote?.current_price);
-        return {
-          symbol: r.symbol,
-          changePct: Number.isFinite(pct) ? pct : null,
-          lastClose: Number.isFinite(last) ? last : null,
-          current: Number.isFinite(now) ? now : null,
-        };
-      })
-      .filter((x) => x.changePct != null)
-      .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
-      .slice(0, topNHot);
-    return items;
-  }, [rows, topNHot]);
-
-  const earningsSoon = useMemo(() => {
-    const items = rows
-      .map((r) => {
-        const next = r?.earnings?.next_report_date || r?.earnings?.next || r?.earnings?.date;
-        return {
-          symbol: r.symbol,
-          date: next ? String(next).slice(0, 10) : null,
-        };
-      })
-      .filter((x) => withinNextDays(x.date, 7))
-      .sort((a, b) => new Date(a.date) - new Date(b.date))
-      .slice(0, maxEarnings);
-    return items;
-  }, [rows, maxEarnings]);
+  }, [universe]);
 
   return (
     <div className="card" style={{ marginTop: 12 }}>
-      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-        <h2 style={{ margin: 0 }}>🔥 Hot & 🗓️ Earnings (Simple)</h2>
-        <div className="row" style={{ gap: 8 }}>
-          <label className="row" style={{ gap: 6 }}>
-            Source:
-            <select value={source} onChange={(e) => setSource(e.target.value)}>
-              <option value="default">Built-in list</option>
-              <option value="watchlist">Your Watchlist</option>
-            </select>
-          </label>
-        </div>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+        <h3 style={{ margin: 0 }}>🔥 Hot Stocks Today & Earnings This Week</h3>
+        {loading && <span className="muted">loading…</span>}
+      </div>
+      {err && <div style={{ color: "salmon", marginTop: 6 }}>{err}</div>}
+
+      {/* two equal columns that fit page width */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+          gap: 12,
+          marginTop: 12,
+        }}
+      >
+        <MoversTable title="Top 25 Gainers" rows={gainers} />
+        <MoversTable title="Top 25 Losers" rows={losers} />
       </div>
 
-      {error && <div style={{ color: "salmon", marginTop: 8 }}>Error: {error}</div>}
-      {loading && <div className="muted" style={{ marginTop: 8 }}>Loading…</div>}
+      {/* earnings table full width */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <h4 style={{ marginTop: 0 }}>Earnings (This Week)</h4>
+        {earnings.length ? (
+          <div className="table-wrap">
+            <table className="table" style={{ width: "100%", tableLayout: "fixed" }}>
+              <colgroup>
+                <col style={{ width: "28%" }} />
+                <col style={{ width: "18%" }} />
+                <col style={{ width: "36%" }} />
+                <col style={{ width: "18%" }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Ticker</th>
+                  <th>Name</th>
+                  <th>Session</th>
+                </tr>
+              </thead>
+              <tbody>
+                {earnings
+                  .sort((a, b) => (a.date < b.date ? -1 : 1))
+                  .map((r, i) => (
+                    <tr key={`${r.symbol}-${i}`}>
+                      <td>{r.date}</td>
+                      <td>{r.symbol}</td>
+                      <td>{r.name || ""}</td>
+                      <td>{r.session || ""}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="muted">No upcoming earnings within 7 days for the sampled set.</div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-      <div className="row" style={{ gap: 16, marginTop: 12, flexWrap: "wrap" }}>
-        {/* Hot movers */}
-        <section className="card" style={{ minWidth: 320, flex: "1 1 360px" }}>
-          <h3 style={{ marginTop: 0 }}>🔥 Hot Stocks Today</h3>
-          {hot.length ? (
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th style={{ textAlign: "right" }}>Last</th>
-                    <th style={{ textAlign: "right" }}>Now</th>
-                    <th style={{ textAlign: "right" }}>%</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {hot.map((x) => (
-                    <tr key={x.symbol}>
-                      <td>{x.symbol}</td>
-                      <td style={{ textAlign: "right" }}>
-                        {x.lastClose != null ? `$${x.lastClose.toFixed(2)}` : "—"}
-                      </td>
-                      <td style={{ textAlign: "right" }}>
-                        {x.current != null ? `$${x.current.toFixed(2)}` : "—"}
-                      </td>
-                      <td
+function MoversTable({ title, rows = [] }) {
+  return (
+    <div className="card" style={{ padding: 12 }}>
+      <h4 style={{ marginTop: 0 }}>{title}</h4>
+      {rows.length ? (
+        <div className="table-wrap">
+          <table
+            className="table"
+            style={{ width: "100%", tableLayout: "fixed" }}
+          >
+            {/* Columns: Symbol • Price (tight), $ Change, % Change, Name */}
+            <colgroup>
+              <col style={{ width: "36%" }} />
+              <col style={{ width: "22%" }} />
+              <col style={{ width: "22%" }} />
+              <col style={{ width: "20%" }} />
+            </colgroup>
+            <thead>
+              <tr>
+                <th style={{ whiteSpace: "nowrap" }}>Symbol • Price</th>
+                <th>$ Change</th>
+                <th>% Change</th>
+                <th>Name</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => {
+                const price = Number(r.price);
+                const pct = Number(r.change_pct);
+                const lastClose = Number(r.last_close);
+                // Prefer exact $ change when last_close is present; otherwise derive from pct
+                const dollarChange = Number.isFinite(price) && Number.isFinite(lastClose)
+                  ? price - lastClose
+                  : (Number.isFinite(price) && Number.isFinite(pct) ? (pct / 100) * price : NaN);
+                const isUp = Number.isFinite(dollarChange) ? dollarChange >= 0 : pct >= 0;
+
+                return (
+                  <tr key={`${r.symbol}-${i}`}>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      {/* ultra-tight inline row */}
+                      <span
                         style={{
-                          textAlign: "right",
-                          color: x.changePct >= 0 ? "#2e7d32" : "#c62828",
-                          fontWeight: 600,
+                          display: "inline-flex",
+                          alignItems: "baseline",
+                          gap: 6, // keep this small to reduce space between symbol & price
                         }}
                       >
-                        {x.changePct != null ? `${x.changePct.toFixed(2)}%` : "—"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="muted">No movers found.</div>
-          )}
-          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-            Sorted by absolute % change among the selected symbols.
-          </div>
-        </section>
-
-        {/* Earnings this week */}
-        <section className="card" style={{ minWidth: 320, flex: "1 1 360px" }}>
-          <h3 style={{ marginTop: 0 }}>🗓️ Earnings (Next 7 Days)</h3>
-          {earningsSoon.length ? (
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th>Date</th>
+                        <strong>{r.symbol}</strong>
+                        <span>{fmtMoney(price)}</span>
+                      </span>
+                    </td>
+                    <td style={{ color: isUp ? "#2e7d32" : "#c62828" }}>
+                      {Number.isFinite(dollarChange)
+                        ? `${dollarChange >= 0 ? "+" : ""}${fmtMoney(Math.abs(dollarChange)).slice(1)}`
+                        : "—"}
+                    </td>
+                    <td style={{ color: pct >= 0 ? "#2e7d32" : "#c62828" }}>
+                      {fmtPct(pct)}
+                    </td>
+                    <td
+                      className="muted"
+                      style={{
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        fontSize: 12,
+                      }}
+                      title={r.name || ""}
+                    >
+                      {r.name || ""}
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {earningsSoon.map((x) => (
-                    <tr key={`${x.symbol}-${x.date}`}>
-                      <td>{x.symbol}</td>
-                      <td>{x.date}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="muted">No earnings in the next 7 days.</div>
-          )}
-          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-            Uses your API’s per-ticker earnings endpoint; pass a larger ticker list if you want full S&amp;P 500.
-          </div>
-        </section>
-      </div>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="muted">No data.</div>
+      )}
     </div>
   );
 }

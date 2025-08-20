@@ -3,9 +3,10 @@
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
-import random, json, asyncio, time
-from datetime import date, datetime
+import random, json, asyncio, time, os
+from datetime import date, datetime, timedelta
 from starlette.responses import StreamingResponse
+import httpx
 
 from app.services.finance_service import (
     get_quote,
@@ -103,6 +104,41 @@ def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
             seen.add(m); dedup.append(m)
     return dedup or default
 
+def _this_week_range() -> Tuple[str, str]:
+    """Mon..Sun ISO range for the current week (local time)."""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())  # 0=Mon
+    sunday = monday + timedelta(days=6)
+    return monday.isoformat(), sunday.isoformat()
+
+def _to_float(x):
+    try:
+        s = str(x).strip().replace("%", "").replace(",", "")
+        return float(s)
+    except Exception:
+        return None
+
+def _norm_symbol(s: str) -> str:
+    return (s or "").strip().upper()
+
+def _alpha_to_common(item: dict) -> dict:
+    """
+    Alpha Vantage TOP_GAINERS_LOSERS item -> {symbol, price, change, change_pct, name}
+    Keys Alpha returns are strings; we coerce to numbers where possible.
+    """
+    sym = _norm_symbol(item.get("ticker") or item.get("symbol"))
+    price = _to_float(item.get("price"))
+    change = _to_float(item.get("change_amount"))
+    change_pct = _to_float(item.get("change_percentage"))
+    name = item.get("ticker") or sym  # AV doesn’t include company name here
+    return {
+        "symbol": sym,
+        "price": price,
+        "change": change,
+        "change_pct": change_pct,
+        "name": name,
+    }
+
 # ----------------------- routes -----------------------
 
 @router.get("/hello")
@@ -193,7 +229,7 @@ async def predict_history(
             pred_map[m] = pred_val
             err_map[m] = round(((pred_val - actual) / (actual if actual else 1.0)) * 100.0, 2)
 
-        # ---- NEW: flattened fields so UI can bind row.LSTM / row.ARIMA etc.
+        # flattened fields so UI can bind row.LSTM / row.ARIMA etc.
         flat: Dict[str, Any] = {m: pred_map.get(m, None) for m in models}
         flat_err: Dict[str, Any] = {f"{m}_err_pct": err_map.get(m, None) for m in models}
 
@@ -313,3 +349,79 @@ async def stats_endpoint(ticker: str):
 
     # As a last resort, return placeholders (prevents UI crash)
     return {"ticker": symbol, "high_52w": None, "low_52w": None, "high": None, "low": None, "high52": None, "low52": None}
+
+# ---------- Movers (Top gainers/losers) ----------
+@router.get("/movers")
+async def movers():
+    """
+    Returns both gainers and losers:
+    {
+      "gainers": [{symbol, price, change, change_pct, name}, ...],
+      "losers":  [{...}, ...]
+    }
+    """
+    key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not key:
+        return {"gainers": [], "losers": [], "error": "ALPHAVANTAGE_API_KEY missing"}
+
+    url = "https://www.alphavantage.co/query"
+    params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(url, params=params)
+        data = r.json() if r.content else {}
+
+    gainers_raw = data.get("top_gainers") or []
+    losers_raw = data.get("top_losers") or []
+
+    gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
+    losers = [_alpha_to_common(x) for x in losers_raw][:25]
+
+    return {"gainers": gainers, "losers": losers}
+
+@router.get("/top_gainers")
+async def top_gainers():
+    res = await movers()
+    return res.get("gainers", [])
+
+@router.get("/top_losers")
+async def top_losers():
+    res = await movers()
+    return res.get("losers", [])
+
+# ---------- Earnings Calendar (this week) ----------
+@router.get("/earnings_week")
+async def earnings_week():
+    """
+    Returns an array of earnings items for the current week:
+    [{date, symbol, name, session}]
+    """
+    token = os.getenv("FINNHUB_API_KEY")
+    if not token:
+        return {"items": [], "error": "FINNHUB_API_KEY missing"}
+
+    start_iso, end_iso = _this_week_range()
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {"from": start_iso, "to": end_iso, "token": token}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, params=params)
+        data = r.json() if r.content else {}
+
+    rows = data.get("earningsCalendar") or data.get("earnings") or []
+    out: List[Dict[str, Any]] = []
+    for it in rows:
+        dt = (it.get("date") or it.get("reportDate") or "")[:10]
+        sym = _norm_symbol(it.get("symbol") or it.get("ticker"))
+        session = (it.get("hour") or it.get("time") or "").upper()
+        # normalize session to BMO/AMC/UNK
+        if session not in {"BMO", "AMC"}:
+            session = "UNK"
+        # Finnhub doesn’t always include company name here
+        name = it.get("company") or it.get("name") or sym
+        if sym and dt:
+            out.append({"date": dt, "symbol": sym, "name": name, "session": session})
+
+    # sort by date then symbol, and cap to ~500
+    out.sort(key=lambda x: (x["date"], x["symbol"]))
+    return {"items": out[:500]}

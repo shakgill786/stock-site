@@ -133,7 +133,7 @@ export default function App() {
     );
   };
 
-  // Build fast lookup maps for backtests
+  // Build fast lookup maps for backtests:
   const { histByDate, histPred } = useMemo(() => {
     const byDate = {};
     const byDateModel = {};
@@ -149,7 +149,7 @@ export default function App() {
     return { histByDate: byDate, histPred: byDateModel };
   }, [historyRows]);
 
-  // Prefer the API's backtest dates for the table so keys line up exactly
+  // Prefer the API's backtest dates for the table
   const histDates = useMemo(
     () => (historyRows || []).map((r) => dkey(r.date)),
     [historyRows]
@@ -312,7 +312,7 @@ export default function App() {
   // actual values aligned to the past window labels
   const actualForPastLabels = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : histByDate[iso]?.actual ?? null;
+    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
@@ -342,7 +342,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // dashed backtest for past window (read from histPred map)
+      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
@@ -413,7 +413,7 @@ export default function App() {
     const row = histByDate[dk];
     const actual = (() => {
       const idx = closeDates.lastIndexOf(iso);
-      return idx >= 0 ? closes[idx] : row?.actual ?? null;
+      return idx >= 0 ? closes[idx] : (row?.actual ?? null);
     })();
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
@@ -447,7 +447,7 @@ export default function App() {
                 checked={live}
                 onChange={() => setLive((v) => !v)}
               />{" "}
-                Live price updates (SSE)
+              Live price updates (SSE)
             </label>
           </div>
         </aside>
@@ -468,7 +468,10 @@ export default function App() {
             />
           )}
 
-          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16 }}>
+          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
+          <HotAndEarnings />
+
+          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
               value={ticker}
               onChange={(e) => setTicker(e.target.value.toUpperCase())}
@@ -506,8 +509,10 @@ export default function App() {
               ) : quote ? (
                 <>
                   <p style={{ margin: 0 }}>Last Close: ${Number(quote.last_close).toFixed(2)}</p>
-                  <p style={{ margin: 0 }}>
-                    ${tweenPrice.toFixed(2)}{" "}
+                  <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
+                    <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
+                      ${tweenPrice.toFixed(2)}
+                    </span>
                     {Number.isFinite(Number(quote?.change_pct)) && (
                       <span
                         style={{
@@ -516,6 +521,7 @@ export default function App() {
                           display: "inline-flex",
                           alignItems: "center",
                           gap: 4,
+                          fontSize: "0.9em",
                         }}
                         aria-label={`${
                           Number(quote.change_pct) >= 0 ? "Up" : "Down"
@@ -525,13 +531,14 @@ export default function App() {
                         } ${Math.abs(Number(quote.change_pct)).toFixed(2)}%`}
                       >
                         {Number(quote.change_pct) >= 0 ? "▲" : "▼"}{" "}
-                        {Math.abs(Number(quote.change_pct)).toFixed(2)}%
+                        {(Number(quote.current_price) - Number(quote.last_close)).toFixed(2)}{" "}
+                        ({Math.abs(Number(quote.change_pct)).toFixed(2)}%)
                       </span>
                     )}
                   </p>
 
                   {/* mini interactive chart (clipped) */}
-                  <div style={{ marginTop: 8 }}>
+                  <div style={{ marginTop: 6 }}>
                     {closes.length >= 2 ? (
                       <div style={{ borderRadius: 10, overflow: "hidden" }}>
                         <InteractivePriceChart
@@ -546,7 +553,7 @@ export default function App() {
                     )}
                   </div>
                   {closes.length >= 2 && (
-                    <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                    <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
                       drag to pan • wheel to zoom • double-click to reset
                     </div>
                   )}
@@ -580,9 +587,6 @@ export default function App() {
               <MetricsList metrics={metrics} />
             </div>
           )}
-
-          {/* Simple Hot movers + Earnings next 7d */}
-          <HotAndEarnings />
 
           {/* --- Actual vs Predicted (chart + table) --- */}
           {results.length > 0 && closes.length >= 2 && (
