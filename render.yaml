@@ -1,0 +1,52 @@
+# render.yaml — deploys FastAPI backend + Vite/React frontend
+
+services:
+  # ------------------------- BACKEND (FastAPI) -------------------------
+  - type: web
+    name: stock-backend
+    env: python
+    rootDir: backend
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      # Pin Python if you want
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+      # API keys (add real values in Render dashboard after first deploy)
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: FINNHUB_SECRET
+        sync: false
+      - key: TWELVEDATA_API_KEY
+        sync: false
+      - key: ALPHAVANTAGE_API_KEY
+        sync: false
+
+      # If you need CORS to be explicit (optional; only if your backend enforces it)
+      # - key: CORS_ORIGINS
+      #   value: "*"
+
+  # ------------------------- FRONTEND (Vite/React) -------------------------
+  - type: static
+    name: stock-frontend
+    rootDir: frontend
+    buildCommand: |
+      npm ci
+      npm run build
+    publishPath: dist
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=60
+    envVars:
+      # Point the frontend to the backend's live URL automatically:
+      - key: VITE_API_BASE
+        fromService:
+          type: web
+          name: stock-backend
+          envVarKey: RENDER_EXTERNAL_URL
