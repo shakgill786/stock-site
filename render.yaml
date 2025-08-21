@@ -1,4 +1,4 @@
-# render.yaml — FastAPI backend + Vite/React frontend (static)
+# render.yaml — FastAPI backend + Vite/React frontend (served by Node web)
 
 services:
   # ------------------------- BACKEND (FastAPI) -------------------------
@@ -15,8 +15,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-
-      # Add your real keys in the Render UI after the first deploy
+      # Fill real values in the Render UI after first deploy
       - key: FINNHUB_API_KEY
         sync: false
       - key: FINNHUB_SECRET
@@ -27,30 +26,28 @@ services:
         sync: false
 
   # ------------------------- FRONTEND (Vite/React) -------------------------
-  - type: static
+  - type: web
     name: stock-frontend
+    env: node
     rootDir: frontend
+    plan: free
     buildCommand: |
       npm ci
       npm run build
-    staticPublishPath: dist
-
-    # SPA fallback so client-side routes work
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
-
-    # Optional: small cache for all assets
-    headers:
-      - path: /*
-        name: Cache-Control
-        value: public, max-age=60
-
-    # Make Vite talk to the backend’s public URL at build time
+    startCommand: npx serve -s dist -l $PORT
+    autoDeploy: true
     envVars:
+      - key: NODE_VERSION
+        value: 20
+      # Wire frontend -> backend URL at build/runtime
       - key: VITE_API_BASE
         fromService:
           type: web
           name: stock-backend
           envVarKey: RENDER_EXTERNAL_URL
+
+    # SPA fallback rule so client-side routes work
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
