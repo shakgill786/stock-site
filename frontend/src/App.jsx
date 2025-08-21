@@ -16,7 +16,7 @@ import WatchlistPanel from "./components/WatchlistPanel";
 import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
-import HotAndEarnings from "./components/HotAndEarnings"; // simple add-on section
+import HotAndEarnings from "./components/HotAndEarnings";
 import "./App.css";
 
 import {
@@ -158,7 +158,7 @@ export default function App() {
   const loadData = useCallback(async () => {
     setQuoteErr(false);
     setEarningsErr(false);
-    setError("");
+       setError("");
 
     const t = String(ticker || "").toUpperCase().trim();
 
@@ -478,6 +478,7 @@ export default function App() {
               placeholder="Ticker (e.g. AAPL or BTC-USD)"
               required
               type="text"
+              style={{ flex: "1 1 180px" }}
             />
             <button className="btn" disabled={loading}>
               {loading ? "Loading…" : "Load Data"}
@@ -487,7 +488,7 @@ export default function App() {
           {/* Top info row */}
           <div className="row" style={{ gap: 16, marginBottom: 12 }}>
             {/* Quote Card */}
-            <div className={`card ${blinkClass}`} style={{ minWidth: 300, flex: "0 1 320px" }}>
+            <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
                 {closes.length > 0 && (
@@ -564,12 +565,12 @@ export default function App() {
             </div>
 
             {/* Earnings */}
-            <div className="card" style={{ minWidth: 300, flex: "0 1 320px" }}>
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <EarningsCard earnings={earnings} />
             </div>
 
             {/* Recommendation */}
-            <div className="card" style={{ minWidth: 300, flex: "0 1 320px" }}>
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <RecommendationCard recommendation={recommendation} />
             </div>
           </div>
@@ -831,6 +832,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
         background: "transparent",
         borderRadius: 8,
         display: "block",
+        maxWidth: "100%",
       }}
       onMouseMove={onMove}
       onMouseLeave={onLeave}
