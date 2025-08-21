@@ -15,7 +15,6 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # Fill real values in the Render UI after first deploy
       - key: FINNHUB_API_KEY
         sync: false
       - key: FINNHUB_SECRET
@@ -38,16 +37,9 @@ services:
     autoDeploy: true
     envVars:
       - key: NODE_VERSION
-        value: 20
-      # Wire frontend -> backend URL at build/runtime
+        value: "20"
       - key: VITE_API_BASE
         fromService:
           type: web
           name: stock-backend
           envVarKey: RENDER_EXTERNAL_URL
-
-    # SPA fallback rule so client-side routes work
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
