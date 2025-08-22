@@ -81,14 +81,15 @@ export default function App() {
   const [earnings, setEarnings] = useState(null);
   const [market, setMarket] = useState(null);
 
-  // Errors
+  // Errors / diagnostics
   const [quoteErr, setQuoteErr] = useState(false);
   const [earningsErr, setEarningsErr] = useState(false);
+  const [error, setError] = useState("");
+  const [diagnostic, setDiagnostic] = useState("");
 
   // Predictions
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
 
   // Live stream
   const [live, setLive] = useState(true);
@@ -106,6 +107,9 @@ export default function App() {
 
   // Retrospective history rows from backend (for past backtest lines)
   const [historyRows, setHistoryRows] = useState([]);
+
+  // Protect against out-of-order async writes
+  const reqVer = useRef(0);
 
   // Helpers
   const normalizeCloses = (arr) => {
@@ -158,66 +162,108 @@ export default function App() {
   );
 
   const loadData = useCallback(async () => {
+    const myVer = ++reqVer.current; // this run's token
+
+    // Reset errors (keep existing data visible during refresh)
+    setError("");
+    setDiagnostic("");
     setQuoteErr(false);
     setEarningsErr(false);
-       setError("");
+    setLoading(true);
 
     const t = String(ticker || "").toUpperCase().trim();
 
     // 1) Quote
-    try {
-      const q = await fetchQuote(t);
-      setQuote(q);
-      prevPriceRef.current = q.current_price;
-    } catch {
-      setQuoteErr(true);
-      setQuote(null);
-    }
+    (async () => {
+      try {
+        const q = await fetchQuote(t);
+        if (reqVer.current !== myVer) return;
+        setQuote(q);
+        prevPriceRef.current = q.current_price;
+      } catch {
+        if (reqVer.current !== myVer) return;
+        setQuoteErr(true);
+        // keep old quote; just note it
+        setDiagnostic((d) => d || `Quote fetch failed for ${t}.`);
+      }
+    })();
 
     // 2) Earnings
-    try {
-      const e = await fetchEarnings(t);
-      setEarnings(e);
-    } catch {
-      setEarningsErr(true);
-      setEarnings(null);
-    }
+    (async () => {
+      try {
+        const e = await fetchEarnings(t);
+        if (reqVer.current !== myVer) return;
+        setEarnings(e);
+      } catch {
+        if (reqVer.current !== myVer) return;
+        setEarningsErr(true);
+      }
+    })();
 
     // 3) Market
-    try {
-      const m = await fetchMarket();
-      setMarket(m);
-    } catch {
-      setMarket(null);
-    }
+    (async () => {
+      try {
+        const m = await fetchMarket();
+        if (reqVer.current !== myVer) return;
+        setMarket(m);
+      } catch {
+        /* ignore */
+      }
+    })();
 
     // 3.5) Closes for the price chart
-    try {
-      const { closes: c, dates: d } = await fetchClosesSafe(t);
-      setCloses(c);
-      setCloseDates(d);
-    } catch {
-      setCloses([]);
-      setCloseDates([]);
-    }
+    const pCloses = (async () => {
+      try {
+        const { closes: c, dates: d } = await fetchClosesSafe(t);
+        if (reqVer.current !== myVer) return;
+        if (!c?.length) {
+          setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
+        }
+        setCloses(c);
+        setCloseDates(d);
+      } catch {
+        if (reqVer.current !== myVer) return;
+        // keep previous closes to avoid flicker
+        setDiagnostic((dMsg) => dMsg || `Failed to load historical prices for ${t}.`);
+      }
+    })();
 
     // 4) Past backtest rows
-    try {
-      const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
-      setHistoryRows(hist?.rows || []);
-    } catch {
-      setHistoryRows([]);
-    }
+    const pHist = (async () => {
+      try {
+        const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
+        if (reqVer.current !== myVer) return;
+        setHistoryRows(hist?.rows || []);
+      } catch {
+        if (reqVer.current !== myVer) return;
+        setHistoryRows([]);
+      }
+    })();
 
     // 5) Current forward predictions
-    setLoading(true);
-    try {
-      const { results } = await fetchPredict({ ticker: t, models });
-      setResults(results);
-    } catch (e) {
-      setError(e.message || "Prediction fetch failed");
-      setResults([]);
-    } finally {
+    const pPredict = (async () => {
+      try {
+        const res = await fetchPredict({ ticker: t, models });
+        if (reqVer.current !== myVer) return;
+        const got = Array.isArray(res?.results) ? res.results : [];
+        setResults(got);
+        if (!got.length) {
+          const msg = res?.message || res?.detail || "No predictions returned.";
+          setDiagnostic((d) => d || `${msg} (${t})`);
+        }
+      } catch (e) {
+        if (reqVer.current !== myVer) return;
+        const msg = e?.message || "Prediction fetch failed";
+        setError(msg);
+        // KEEP previous results to prevent disappearing chart
+        setDiagnostic((d) => d || `${msg} (${t})`);
+      }
+    })();
+
+    // Wait for the parts that affect the big chart/table before clearing loading
+    await Promise.all([pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
+
+    if (reqVer.current === myVer) {
       setLoading(false);
     }
   }, [ticker, models]);
@@ -638,9 +684,11 @@ export default function App() {
                 </table>
               </div>
 
-              <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-                Past rows show each model’s “predict the next day” backtest from /predict_history; future rows show the latest forecast.
-              </div>
+              {!!diagnostic && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                  Note: {diagnostic}
+                </div>
+              )}
             </div>
           )}
 
@@ -693,6 +741,11 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+              {!!diagnostic && (
+                <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
+                  Note: {diagnostic}
+                </div>
+              )}
             </div>
           )}
         </section>
