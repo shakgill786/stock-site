@@ -1,5 +1,4 @@
 # backend/app/routes.py
-
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
@@ -19,11 +18,9 @@ from app.services.finance_service import (
 router = APIRouter()
 
 # ----------------------- helpers -----------------------
-
 def _is_crypto(symbol: str) -> bool:
     s = (symbol or "").upper()
-    # crude heuristic: most crypto pairs look like BTC-USD, ETH-USD, etc.
-    return "-" in s
+    return "-" in s  # crude heuristic: BTC-USD, ETH-USD, etc.
 
 def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List[str], List[float]]:
     """
@@ -44,38 +41,27 @@ def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List
             continue
 
         dow = dt.weekday()  # 0=Mon..6=Sun
-        is_weekend = dow >= 5
-        is_today = (dt.isoformat() == today_iso)
-        if is_weekend or is_today:
-            continue  # skip weekends and today
+        if dow >= 5 or dt.isoformat() == today_iso:  # weekend or today
+            continue
         out_d.append(dt.isoformat())
         out_c.append(float(c))
     return out_d, out_c
 
 def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
-    """
-    Replace the last close with quote.last_close when appropriate (equities only),
-    so 'actual' for the latest completed trading day matches the quote card.
-    """
+    """For equities, replace the last close with quote.last_close for consistency."""
     if not dates or not closes or _is_crypto(symbol):
         return
     try:
         q = get_quote(symbol)
         last_close = float(q.get("last_close"))
-    except Exception:
-        return
-    try:
         closes[-1] = last_close
     except Exception:
         pass
 
 def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
     """
-    Accepts:
-      - None
-      - ["LSTM","ARIMA"]
-      - ["LSTM,ARIMA"]  (comma string)
-      - case-insensitive; maps RF->RandomForest, XGB->XGBoost
+    Accepts: None, ["LSTM","ARIMA"], ["LSTM,ARIMA"] (comma string)
+    Case-insensitive; maps RF->RandomForest, XGB->XGBoost.
     """
     default = ["LSTM", "ARIMA", "RandomForest"]
     if not models:
@@ -97,7 +83,6 @@ def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
                 out.append("XGBoost")
             else:
                 out.append(name)
-    # de-dup preserving order
     seen = set(); dedup: List[str] = []
     for m in out:
         if m not in seen:
@@ -122,25 +107,15 @@ def _norm_symbol(s: str) -> str:
     return (s or "").strip().upper()
 
 def _alpha_to_common(item: dict) -> dict:
-    """
-    Alpha Vantage TOP_GAINERS_LOSERS item -> {symbol, price, change, change_pct, name}
-    Keys Alpha returns are strings; we coerce to numbers where possible.
-    """
+    """Alpha Vantage TOP_GAINERS_LOSERS -> {symbol, price, change, change_pct, name}"""
     sym = _norm_symbol(item.get("ticker") or item.get("symbol"))
     price = _to_float(item.get("price"))
     change = _to_float(item.get("change_amount"))
     change_pct = _to_float(item.get("change_percentage"))
     name = item.get("ticker") or sym  # AV doesn’t include company name here
-    return {
-        "symbol": sym,
-        "price": price,
-        "change": change,
-        "change_pct": change_pct,
-        "name": name,
-    }
+    return {"symbol": sym, "price": price, "change": change, "change_pct": change_pct, "name": name}
 
 # ----------------------- routes -----------------------
-
 @router.get("/hello")
 async def say_hello():
     return {"message": "Hello from FastAPI!"}
@@ -160,8 +135,9 @@ class PredictResponse(BaseModel):
 
 @router.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest):
+    # simple deterministic demo predictions based on current price
     random.seed(req.ticker.upper())
-    base = get_quote(req.ticker)["current_price"]
+    base = float(get_quote(req.ticker)["current_price"])
     results: List[ModelPrediction] = []
     for m in req.models:
         preds = [round(base * (1 + random.uniform(-0.05, 0.05)), 2) for _ in range(7)]
@@ -180,16 +156,12 @@ async def predict_history(
     For each of the last `days` TARGET DATES (most-recent last), return:
       - actual close on that date
       - what each model *would have predicted for that date* using only data up to the prior trading day
-
-    Implementation detail: uses the exact same daily-closes pipeline as /closes
-    to keep dates perfectly aligned with the UI.
     """
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
     models = _normalize_models_param(models)
 
     # Need (days + 1) closes so we can predict each target from the previous day.
-    # Ask for a generous buffer to survive partial provider responses.
     series = get_daily_closes_with_dates(symbol, days + 40)
     dates: List[str] = list(series.get("dates") or [])
     closes: List[float] = list(series.get("closes") or [])
@@ -209,7 +181,7 @@ async def predict_history(
     indices = list(range(1, n))
     targets = indices[-days:]
 
-    # small, distinct deterministic biases per model (so backtest lines differ)
+    # deterministic biases per model so backtest lines differ a bit
     model_bias = {"LSTM": 0.0020, "ARIMA": 0.0, "RandomForest": -0.0010, "XGBoost": 0.0015}
 
     rows: List[Dict[str, Any]] = []
@@ -221,7 +193,6 @@ async def predict_history(
         pred_map: Dict[str, float] = {}
         err_map: Dict[str, float] = {}
         for m in models:
-            # deterministic per (symbol, model, target_date)
             rng = random.Random(f"{symbol}:{m}:{target_date}")
             noise = rng.uniform(-0.02, 0.02)  # ±2%
             bias = model_bias.get(m, 0.0)
@@ -229,12 +200,11 @@ async def predict_history(
             pred_map[m] = pred_val
             err_map[m] = round(((pred_val - actual) / (actual if actual else 1.0)) * 100.0, 2)
 
-        # flattened fields so UI can bind row.LSTM / row.ARIMA etc.
         flat: Dict[str, Any] = {m: pred_map.get(m, None) for m in models}
         flat_err: Dict[str, Any] = {f"{m}_err_pct": err_map.get(m, None) for m in models}
 
         row = {
-            "date": target_date,            # ISO YYYY-MM-DD, matches /closes
+            "date": target_date,
             "close": round(actual, 2),
             "actual": round(actual, 2),
             "pred": pred_map,
@@ -263,6 +233,7 @@ async def market_endpoint():
 @router.get("/quote_stream")
 async def quote_stream(ticker: str, interval: float = 5.0):
     interval = max(1.0, min(float(interval), 60.0))
+
     async def event_gen():
         try:
             while True:
@@ -278,6 +249,7 @@ async def quote_stream(ticker: str, interval: float = 5.0):
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
+
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 # ---------- Closes for charts (dates + up to 5y) ----------
@@ -285,11 +257,7 @@ async def quote_stream(ticker: str, interval: float = 5.0):
 async def closes_endpoint(ticker: str, days: int = 60):
     """
     Returns up to ~5 years of daily closes with aligned ISO dates, most-recent last.
-    {
-      "ticker": "AAPL",
-      "dates": ["2021-08-12", ...],
-      "closes": [145.86, ...]
-    }
+    { "ticker": "AAPL", "dates": [...], "closes": [...] }
     """
     symbol = str(ticker).upper()
     days = max(2, min(int(days), 1825))
@@ -297,7 +265,6 @@ async def closes_endpoint(ticker: str, days: int = 60):
     dates: List[str] = list(data.get("dates") or [])
     closes: List[float] = list(data.get("closes") or [])
 
-    # For equities, drop weekends and today; keep crypto 7d/week
     if not _is_crypto(symbol):
         dates, closes = _filter_equity_calendar(dates, closes)
         _pin_last_close(symbol, dates, closes)
@@ -323,8 +290,8 @@ async def stats_endpoint(ticker: str):
             return {
                 "ticker": symbol,
                 "high_52w": hi, "low_52w": lo,
-                "high": hi, "low": lo,           # aliases some UIs expect
-                "high52": hi, "low52": lo,       # aliases
+                "high": hi, "low": lo,
+                "high52": hi, "low52": lo,
             }
     except Exception:
         pass
@@ -348,17 +315,19 @@ async def stats_endpoint(ticker: str):
         pass
 
     # As a last resort, return placeholders (prevents UI crash)
-    return {"ticker": symbol, "high_52w": None, "low_52w": None, "high": None, "low": None, "high52": None, "low52": None}
+    return {
+        "ticker": symbol,
+        "high_52w": None, "low_52w": None,
+        "high": None, "low": None,
+        "high52": None, "low52": None,
+    }
 
 # ---------- Movers (Top gainers/losers) ----------
 @router.get("/movers")
 async def movers():
     """
     Returns both gainers and losers:
-    {
-      "gainers": [{symbol, price, change, change_pct, name}, ...],
-      "losers":  [{...}, ...]
-    }
+    { "gainers": [...], "losers": [...] }
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
     if not key:
@@ -393,8 +362,7 @@ async def top_losers():
 @router.get("/earnings_week")
 async def earnings_week():
     """
-    Returns an array of earnings items for the current week:
-    [{date, symbol, name, session}]
+    Returns an array of earnings items for the current week: [{date, symbol, name, session}]
     """
     token = os.getenv("FINNHUB_API_KEY")
     if not token:
@@ -414,14 +382,11 @@ async def earnings_week():
         dt = (it.get("date") or it.get("reportDate") or "")[:10]
         sym = _norm_symbol(it.get("symbol") or it.get("ticker"))
         session = (it.get("hour") or it.get("time") or "").upper()
-        # normalize session to BMO/AMC/UNK
         if session not in {"BMO", "AMC"}:
             session = "UNK"
-        # Finnhub doesn’t always include company name here
         name = it.get("company") or it.get("name") or sym
         if sym and dt:
             out.append({"date": dt, "symbol": sym, "name": name, "session": session})
 
-    # sort by date then symbol, and cap to ~500
     out.sort(key=lambda x: (x["date"], x["symbol"]))
     return {"items": out[:500]}
