@@ -1,4 +1,3 @@
-// frontend/src/App.jsx
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   fetchPredict,
@@ -62,7 +61,7 @@ const addBusinessDays = (start, n) => {
   let added = 0;
   while (added < n) {
     dt.setDate(dt.getDate() + 1);
-    const day = dt.getDay();
+    const day = dt.getDay(); // 0=Sun,6=Sat
     if (day !== 0 && day !== 6) added++;
   }
   return dt;
@@ -110,6 +109,9 @@ export default function App() {
 
   // Protect against out-of-order async writes
   const reqVer = useRef(0);
+
+  // Where to scroll when a symbol is chosen from the movers table
+  const mainSectionRef = useRef(null);
 
   // Helpers
   const normalizeCloses = (arr) => {
@@ -162,8 +164,9 @@ export default function App() {
   );
 
   const loadData = useCallback(async () => {
-    const myVer = ++reqVer.current;
+    const myVer = ++reqVer.current; // this run's token
 
+    // Reset errors (keep existing data visible during refresh)
     setError("");
     setDiagnostic("");
     setQuoteErr(false);
@@ -172,6 +175,7 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
+    // 1) Quote
     (async () => {
       try {
         const q = await fetchQuote(t);
@@ -185,6 +189,7 @@ export default function App() {
       }
     })();
 
+    // 2) Earnings
     (async () => {
       try {
         const e = await fetchEarnings(t);
@@ -196,6 +201,7 @@ export default function App() {
       }
     })();
 
+    // 3) Market
     (async () => {
       try {
         const m = await fetchMarket();
@@ -206,6 +212,7 @@ export default function App() {
       }
     })();
 
+    // 3.5) Closes for the price chart
     const pCloses = (async () => {
       try {
         const { closes: c, dates: d } = await fetchClosesSafe(t);
@@ -221,6 +228,7 @@ export default function App() {
       }
     })();
 
+    // 4) Past backtest rows
     const pHist = (async () => {
       try {
         const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
@@ -232,6 +240,7 @@ export default function App() {
       }
     })();
 
+    // 5) Current forward predictions
     const pPredict = (async () => {
       try {
         const res = await fetchPredict({ ticker: t, models });
@@ -251,14 +260,17 @@ export default function App() {
     })();
 
     await Promise.all([pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
-    if (reqVer.current === myVer) setLoading(false);
+
+    if (reqVer.current === myVer) {
+      setLoading(false);
+    }
   }, [ticker, models]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Live SSE
+  // Live SSE: only updates the quote card smoothly
   const streamUrl = live
     ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5`
     : null;
@@ -296,6 +308,17 @@ export default function App() {
   const toggleModel = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
 
+  // When user clicks a symbol in movers table:
+  const handleSelectTicker = (sym) => {
+    const t = String(sym || "").toUpperCase().trim();
+    if (!t) return;
+    setTicker(t);
+    // Smooth scroll to the main section (no page jump)
+    requestAnimationFrame(() => {
+      mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
   // Client-side metrics & recommendation
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
@@ -320,11 +343,14 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Actual vs. Predicted ----------
+  // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
-  const pastDaysToShow = 10;
-  const pastLabels = (historyRows.length ? histDates : closeDates).slice(-pastDaysToShow);
 
+  // table past window (prefer predict_history dates)
+  const pastDaysToShow = 10;
+  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
+
+  // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : closeDates.length
@@ -337,8 +363,10 @@ export default function App() {
     return fmtLocalISO(d);
   });
 
+  // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
+  // actual values aligned to the past window labels
   const actualForPastLabels = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
     return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
@@ -371,6 +399,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
+      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
@@ -389,6 +418,7 @@ export default function App() {
         spanGaps: true,
       });
 
+      // solid current forecast, anchored to last actual in past window
       const start =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
@@ -434,6 +464,7 @@ export default function App() {
     },
   };
 
+  // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
     const dk = dkey(iso);
     const row = histByDate[dk];
@@ -455,22 +486,15 @@ export default function App() {
 
   const avpRows = [...pastRows, ...futureRows];
 
-  // Handler to use when user clicks a mover symbol
-  const handleSelectTicker = (sym) => {
-    const t = String(sym || "").toUpperCase().trim();
-    if (!t) return;
-    setTicker(t);
-    // optional: scroll to the quote card for immediate feedback
-    try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch {}
-  };
-
   return (
     <div className="app-root">
+      {/* Top header (sticky at top, no overlap) */}
       <header className="app-header">
         <h1>Real-Time Stock & Crypto Dashboard</h1>
       </header>
 
       <main className="container grid-2col">
+        {/* LEFT: Watchlist */}
         <aside className="left-rail">
           <WatchlistPanel current={ticker} onLoad={(s) => setTicker(s)} />
           <div style={{ marginTop: 12 }}>
@@ -485,7 +509,9 @@ export default function App() {
           </div>
         </aside>
 
+        {/* RIGHT: Main content */}
         <section>
+          {/* Compare Mode Toggle */}
           <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
             <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
               {compareOpen ? "Close Compare" : "Open Compare"}
@@ -499,8 +525,11 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings — now clickable to load a ticker */}
+          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
+
+          {/* Anchor for smooth-scroll target */}
+          <div ref={mainSectionRef} />
 
           <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
@@ -516,7 +545,9 @@ export default function App() {
             </button>
           </form>
 
+          {/* Top info row */}
           <div className="row" style={{ gap: 16, marginBottom: 12 }}>
+            {/* Quote Card */}
             <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
@@ -567,6 +598,7 @@ export default function App() {
                     )}
                   </p>
 
+                  {/* mini interactive chart (clipped) */}
                   <div style={{ marginTop: 6 }}>
                     {closes.length >= 2 ? (
                       <div style={{ borderRadius: 10, overflow: "hidden" }}>
@@ -592,35 +624,42 @@ export default function App() {
               )}
             </div>
 
+            {/* Earnings */}
             <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <EarningsCard earnings={earnings} />
             </div>
 
+            {/* Recommendation */}
             <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <RecommendationCard recommendation={recommendation} />
             </div>
           </div>
 
+          {/* Market Breadth */}
           {market && (
             <div className="card">
               <MarketCard market={market} />
             </div>
           )}
 
+          {/* Metrics list */}
           {!!metrics.length && (
             <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
               <MetricsList metrics={metrics} />
             </div>
           )}
 
+          {/* --- Actual vs Predicted (chart + table) --- */}
           {results.length > 0 && closes.length >= 2 && (
             <div className="card" style={{ marginTop: 12 }}>
               <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
 
+              {/* Chart */}
               <div style={{ height: 260, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.03)", padding: 8 }}>
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
+              {/* Table */}
               <div className="table-wrap" style={{ marginTop: 12 }}>
                 <table className="table">
                   <thead>
@@ -665,8 +704,10 @@ export default function App() {
             </div>
           )}
 
+          {/* Prediction Error */}
           {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
+          {/* Model selector */}
           <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
             {MODEL_OPTIONS.map((m) => (
               <label key={m} style={{ marginRight: 12 }}>
@@ -680,6 +721,7 @@ export default function App() {
             ))}
           </div>
 
+          {/* Forecast Table (original) — shows confidence when present */}
           {results.length > 0 && (
             <div className="card table-card">
               <div className="table-wrap">
@@ -721,6 +763,7 @@ export default function App() {
         </section>
       </main>
 
+      {/* Big chart modal */}
       {showBigPriceChart && (
         <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
           <div style={{ borderRadius: 12, overflow: "hidden" }}>
@@ -732,6 +775,7 @@ export default function App() {
   );
 }
 
+/** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
 function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
   const pad = 10;
   const w = width - pad * 2;
@@ -740,7 +784,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const [view, setView] = useState({ start: 0, end: Math.max(0, data.length - 1) });
   const [cursorX, setCursorX] = useState(null);
   const [hoverIdx, setHoverIdx] = useState(null);
-  const [drag, setDrag] = useState(null);
+  const [drag, setDrag] = useState(null); // {startX, startView}
 
   useEffect(() => {
     setView({ start: 0, end: Math.max(0, data.length - 1) });
@@ -767,10 +811,12 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   };
   const yForVal = (v) => pad + h - ((v - min) / range) * h;
 
-  const points = windowData.map((v, k) => {
-    const i = vStart + k;
-    return `${xForIndex(i)},${yForVal(v)}`;
-  }).join(" ");
+  const points = windowData
+    .map((v, k) => {
+      const i = vStart + k;
+      return `${xForIndex(i)},${yForVal(v)}`;
+    })
+    .join(" ");
 
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
@@ -806,7 +852,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     const focusIdx = idxForX(x);
 
     const windowSize = vEnd - vStart;
-    const delta = Math.sign(e.deltaY);
+    const delta = Math.sign(e.deltaY); // 1 = out, -1 = in
     const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = clamp(newSize, 5, data.length - 1);
@@ -827,6 +873,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
+  // label prefers real date when provided (timezone-safe)
   let label;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -837,7 +884,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       label = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx;
+    const rel = (data.length - 1) - showIdx; // 0 = latest
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
@@ -881,6 +928,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   );
 }
 
+/** Minimal modal (no deps) */
 function MagnifyModal({ title, children, onClose }) {
   return (
     <div
