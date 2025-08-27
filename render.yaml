@@ -6,13 +6,15 @@ services:
     env: python
     rootDir: backend
     plan: free
+    autoDeploy: true
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: "3.11.9"
       - key: FINNHUB_API_KEY
         sync: false
       - key: ALPHAVANTAGE_API_KEY
@@ -23,15 +25,22 @@ services:
 staticSites:
   - name: stock-frontend
     rootDir: frontend
+    autoDeploy: true
     buildCommand: |
       npm ci
       npm run build
     publishPath: dist
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=60
     routes:
       - type: rewrite
         source: /*
         destination: /index.html
     envVars:
+      - key: NODE_VERSION
+        value: "20"
       - key: VITE_API_BASE
         fromService:
           type: web
