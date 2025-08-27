@@ -1,7 +1,6 @@
-# render.yaml — FastAPI backend + Vite/React frontend (served by Node web)
+# render.yaml — FastAPI backend (web) + Vite/React frontend (static)
 
 services:
-  # ------------------------- BACKEND (FastAPI) -------------------------
   - type: web
     name: stock-backend
     env: python
@@ -11,33 +10,28 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: FINNHUB_API_KEY
         sync: false
-      - key: FINNHUB_SECRET
+      - key: ALPHAVANTAGE_API_KEY
         sync: false
       - key: TWELVEDATA_API_KEY
         sync: false
-      - key: ALPHAVANTAGE_API_KEY
-        sync: false
 
-  # ------------------------- FRONTEND (Vite/React) -------------------------
-  - type: web
-    name: stock-frontend
-    env: node
+staticSites:
+  - name: stock-frontend
     rootDir: frontend
-    plan: free
     buildCommand: |
       npm ci
       npm run build
-    startCommand: npx serve -s dist -l $PORT
-    autoDeploy: true
+    publishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
     envVars:
-      - key: NODE_VERSION
-        value: "20"
       - key: VITE_API_BASE
         fromService:
           type: web
