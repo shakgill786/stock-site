@@ -1,6 +1,7 @@
-# render.yaml — FastAPI backend (web) + Vite/React frontend (static)
+# render.yaml — FastAPI backend (web) + Vite/React frontend (web serving static)
 
 services:
+  # ------------------------- BACKEND (FastAPI) -------------------------
   - type: web
     name: stock-backend
     env: python
@@ -22,22 +23,18 @@ services:
       - key: TWELVEDATA_API_KEY
         sync: false
 
-staticSites:
-  - name: stock-frontend
+  # ------------------------- FRONTEND (Vite build served by Node) -------------------------
+  - type: web
+    name: stock-frontend
+    env: node
     rootDir: frontend
+    plan: free
     autoDeploy: true
     buildCommand: |
       npm ci
       npm run build
-    publishPath: dist
-    headers:
-      - path: /*
-        name: Cache-Control
-        value: public, max-age=60
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+    # `serve -s` provides SPA history fallback, so client routes work
+    startCommand: npx serve -s dist -l $PORT
     envVars:
       - key: NODE_VERSION
         value: "20"
