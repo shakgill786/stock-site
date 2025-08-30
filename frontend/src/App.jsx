@@ -67,7 +67,7 @@ const addBusinessDays = (start, n) => {
   return dt;
 };
 
-// normalize model keys
+// normalize model keys so we don’t miss due to case/whitespace
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
@@ -308,73 +308,67 @@ export default function App() {
   const toggleModel = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
 
-  // When user clicks a symbol in movers/earnings:
+  // When user clicks a symbol in movers table:
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
+    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   };
 
-  // Client-side metrics & recommendation
-  const metrics = useMemo(() => {
-    if (!quote || !results?.length) return [];
-    const base = Number(quote.last_close) || 0;
-    if (base <= 0) return [];
-    return results.map((r) => {
-      const mapeProxy =
-        r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
-        r.predictions.length;
-      const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
-      const avgChangePct = ((meanPred - base) / base) * 100;
-      return { model: r.model, mapeProxy, avgChangePct };
-    });
-  }, [quote, results]);
+  // --------- TRIM today's placeholder close (pre-close vendor echo) ----------
+  const todayISO = fmtLocalISO(new Date());
+  const { tDates, tCloses } = useMemo(() => {
+    if (!closeDates?.length || closeDates.length !== closes.length) {
+      return { tDates: closeDates, tCloses: closes };
+    }
+    const lastISO = dkey(closeDates[closeDates.length - 1]);
+    if (lastISO === todayISO && closes.length >= 2) {
+      // drop the trailing "today" point (often equals yesterday’s close)
+      return {
+        tDates: closeDates.slice(0, -1),
+        tCloses: closes.slice(0, -1),
+      };
+    }
+    return { tDates: closeDates, tCloses: closes };
+  }, [closeDates, closes, todayISO]);
 
-  const recommendation = useMemo(() => {
-    if (!metrics.length) return null;
-    const best = [...metrics].sort((a, b) => a.mapeProxy - b.mapeProxy)[0];
-    let action = "Hold";
-    if (best.avgChangePct > 1) action = "Buy";
-    if (best.avgChangePct < -1) action = "Sell";
-    return { ...best, action };
-  }, [metrics]);
-
-  // ---------- Build a date->close map ----------
+  // ---------- Build a date->close map using TRIMMED series ----------
   const closeByDate = useMemo(() => {
     const m = Object.create(null);
-    for (let i = 0; i < Math.min(closeDates.length, closes.length); i++) {
-      const k = dkey(closeDates[i]);
-      const v = Number(closes[i]);
+    for (let i = 0; i < Math.min(tDates.length, tCloses.length); i++) {
+      const k = dkey(tDates[i]);
+      const v = Number(tCloses[i]);
       if (Number.isFinite(v)) m[k] = v;
     }
     return m;
-  }, [closeDates, closes]);
+  }, [tDates, tCloses]);
 
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // Choose the base labels for "past", preferring predict_history dates
+  // choose the base labels for "past", preferring predict_history dates
   const pastDaysToShow = 10;
-  const lastCloseISO = closeDates.length ? dkey(closeDates[closeDates.length - 1]) : null;
+  const lastCloseISO = tDates.length ? dkey(tDates[tDates.length - 1]) : null;
 
   const basePastLabels = useMemo(() => {
     if (histDates.length && lastCloseISO) {
-      // Clip history dates to those that have a real close available
+      // include only history dates that have a real close
       return histDates.filter((iso) => dkey(iso) <= lastCloseISO);
     }
-    return histDates.length ? histDates : closeDates;
-  }, [histDates, closeDates, lastCloseISO]);
+    return histDates.length ? histDates : tDates;
+  }, [histDates, tDates, lastCloseISO]);
 
   const pastLabels = basePastLabels.slice(-pastDaysToShow);
 
   // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
-    : closeDates.length
-    ? asLocalDate(closeDates[closeDates.length - 1])
+    : tDates.length
+    ? asLocalDate(tDates[tDates.length - 1])
     : null;
 
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
@@ -386,7 +380,7 @@ export default function App() {
   // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // actual values aligned to the past window labels (prefer closes; fallback to historyRows.actual)
+  // actual values aligned to the past window labels (prefer trimmed closes; fallback to historyRows.actual)
   const actualForPastLabels = pastLabels.map((iso) => {
     const k = dkey(iso);
     if (closeByDate[k] != null) return Number(closeByDate[k]);
@@ -553,7 +547,7 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings this week */}
+          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* Anchor for smooth-scroll target */}
@@ -579,7 +573,7 @@ export default function App() {
             <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
-                {closes.length > 0 && (
+                {tCloses.length > 0 && (
                   <button
                     className="btn ghost"
                     onClick={() => setShowBigPriceChart(true)}
@@ -628,11 +622,11 @@ export default function App() {
 
                   {/* mini interactive chart (clipped) */}
                   <div style={{ marginTop: 6 }}>
-                    {closes.length >= 2 ? (
+                    {tCloses.length >= 2 ? (
                       <div style={{ borderRadius: 10, overflow: "hidden" }}>
                         <InteractivePriceChart
-                          data={closes}
-                          labels={closeDates}
+                          data={tCloses}
+                          labels={tDates}
                           width={320}
                           height={80}
                         />
@@ -641,7 +635,7 @@ export default function App() {
                       <div className="muted" style={{ fontSize: 12 }}>no chart data</div>
                     )}
                   </div>
-                  {closes.length >= 2 && (
+                  {tCloses.length >= 2 && (
                     <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
                       drag to pan • wheel to zoom • double-click to reset
                     </div>
@@ -678,7 +672,7 @@ export default function App() {
           )}
 
           {/* --- Actual vs Predicted (chart + table) --- */}
-          {results.length > 0 && closes.length >= 2 && (
+          {results.length > 0 && tCloses.length >= 2 && (
             <div className="card" style={{ marginTop: 12 }}>
               <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
 
@@ -795,7 +789,7 @@ export default function App() {
       {showBigPriceChart && (
         <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
           <div style={{ borderRadius: 12, overflow: "hidden" }}>
-            <InteractivePriceChart data={closes || []} labels={closeDates || []} width={800} height={300} big />
+            <InteractivePriceChart data={tCloses || []} labels={tDates || []} width={800} height={300} big />
           </div>
         </MagnifyModal>
       )}
