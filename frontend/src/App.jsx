@@ -313,33 +313,36 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   };
 
-  // --------- TRIM today's placeholder close (pre-close vendor echo) ----------
-  const todayISO = fmtLocalISO(new Date());
+  // --------- TRIM a trailing “today” point (vendors echo yesterday’s close pre-close) ----------
   const { tDates, tCloses } = useMemo(() => {
-    if (!closeDates?.length || closeDates.length !== closes.length) {
+    if (!Array.isArray(closeDates) || !Array.isArray(closes)) {
+      return { tDates: [], tCloses: [] };
+    }
+    if (closeDates.length !== closes.length || closeDates.length < 2) {
       return { tDates: closeDates, tCloses: closes };
     }
     const lastISO = dkey(closeDates[closeDates.length - 1]);
-    if (lastISO === todayISO && closes.length >= 2) {
-      // drop the trailing "today" point (often equals yesterday’s close)
+    const todayISO = fmtLocalISO(new Date());
+    if (lastISO === todayISO) {
+      // drop the trailing "today" point
       return {
         tDates: closeDates.slice(0, -1),
         tCloses: closes.slice(0, -1),
       };
     }
     return { tDates: closeDates, tCloses: closes };
-  }, [closeDates, closes, todayISO]);
+  }, [closeDates, closes]);
 
   // ---------- Build a date->close map using TRIMMED series ----------
   const closeByDate = useMemo(() => {
     const m = Object.create(null);
-    for (let i = 0; i < Math.min(tDates.length, tCloses.length); i++) {
+    const n = Math.min(tDates.length, tCloses.length);
+    for (let i = 0; i < n; i++) {
       const k = dkey(tDates[i]);
       const v = Number(tCloses[i]);
       if (Number.isFinite(v)) m[k] = v;
@@ -350,13 +353,13 @@ export default function App() {
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // choose the base labels for "past", preferring predict_history dates
+  // Choose the base labels for "past", preferring predict_history dates but
+  // never going past the last *real* close in tDates (trimmed).
   const pastDaysToShow = 10;
   const lastCloseISO = tDates.length ? dkey(tDates[tDates.length - 1]) : null;
 
   const basePastLabels = useMemo(() => {
     if (histDates.length && lastCloseISO) {
-      // include only history dates that have a real close
       return histDates.filter((iso) => dkey(iso) <= lastCloseISO);
     }
     return histDates.length ? histDates : tDates;
@@ -417,8 +420,8 @@ export default function App() {
 
       // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
-        const dk = dkey(lab);
-        const val = histPred?.[dk]?.[mKey];
+        const dkIso = dkey(lab);
+        const val = histPred?.[dkIso]?.[mKey];
         return Number.isFinite(Number(val)) ? Number(val) : null;
       });
 
@@ -459,6 +462,7 @@ export default function App() {
   }, [
     results,
     histPred,
+    chartLabels.join("|"),
     pastLabels.join("|"),
     futureLabels.join("|"),
     actualForPastLabels.join("|"),
@@ -480,7 +484,7 @@ export default function App() {
     },
   };
 
-  // Table rows: last N past days (backtest) + future horizon (current predictions)
+  // Table rows
   const pastRows = pastLabels.map((iso) => {
     const dkIso = dkey(iso);
     const row = histByDate[dkIso];
@@ -547,7 +551,7 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
+          {/* Hot movers + Earnings next 7d */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* Anchor for smooth-scroll target */}
@@ -738,7 +742,7 @@ export default function App() {
                   checked={models.includes(m)}
                   onChange={() => toggleModel(m)}
                 />{" "}
-                {m}
+                  {m}
               </label>
             ))}
           </div>
@@ -799,6 +803,7 @@ export default function App() {
 
 /** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
 function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
+  const { useState, useEffect } = require("react"); // keep local to avoid top-level reordering
   const pad = 10;
   const w = width - pad * 2;
   const h = height - pad * 2;
