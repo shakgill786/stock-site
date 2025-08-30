@@ -212,11 +212,34 @@ export default function App() {
       }
     })();
 
-    // 3.5) Closes for the price chart
+    // 3.5) Closes for the price chart (+ sanitize last point)
     const pCloses = (async () => {
       try {
-        const { closes: c, dates: d } = await fetchClosesSafe(t);
+        let { closes: c, dates: d } = await fetchClosesSafe(t);
         if (reqVer.current !== myVer) return;
+
+        // --- SANITIZE: drop a bogus "today" close or duplicate-last-close placeholder ---
+        if (Array.isArray(d) && Array.isArray(c) && d.length === c.length && d.length >= 2) {
+          const todayISO = fmtLocalISO(new Date());
+          const lastISO = dkey(d[d.length - 1]);
+          const prevISO = dkey(d[d.length - 2]);
+          const lastVal = Number(c[c.length - 1]);
+          const prevVal = Number(c[c.length - 2]);
+
+          const isToday = lastISO >= todayISO; // provider labeled point as today
+          const dupLast =
+            Number.isFinite(lastVal) &&
+            Number.isFinite(prevVal) &&
+            lastISO !== prevISO &&
+            Math.abs(lastVal - prevVal) < 1e-9;
+
+          if (isToday || dupLast) {
+            d = d.slice(0, -1);
+            c = c.slice(0, -1);
+          }
+        }
+        // -------------------------------------------------------------------------------
+
         if (!c?.length) {
           setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
         }
@@ -343,10 +366,10 @@ export default function App() {
   }, [metrics]);
 
   /* =======================
-     Actual vs. Predicted FIX
+     Actual vs. Predicted (with sanitized closes)
      ======================= */
 
-  // Map closeDates -> closes for exact date lookup (YYYY-MM-DD)
+  // Build a fast map of close dates -> close value
   const closeMap = useMemo(() => {
     const m = new Map();
     const n = Math.min(closeDates.length, closes.length);
@@ -380,10 +403,9 @@ export default function App() {
     return fmtLocalISO(d);
   });
 
-  // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // Actuals aligned to pastLabels (from closeMap only)
+  // Actuals strictly from the sanitized closeMap
   const actualForPastLabels = pastLabels.map((iso) => closeMap.get(dkey(iso)) ?? null);
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
@@ -413,7 +435,6 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
@@ -432,7 +453,6 @@ export default function App() {
         spanGaps: true,
       });
 
-      // solid current forecast, anchored to last actual in past window
       const start =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
@@ -478,10 +498,8 @@ export default function App() {
     },
   };
 
-  // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
     const dk = dkey(iso);
-    // actual strictly from closeMap to avoid off-by-one/UTC issues
     const actual = closeMap.get(dk) ?? (histByDate[dk]?.actual ?? null);
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
@@ -727,7 +745,7 @@ export default function App() {
                   checked={models.includes(m)}
                   onChange={() => toggleModel(m)}
                 />{" "}
-                  {m}
+                {m}
               </label>
             ))}
           </div>
@@ -833,7 +851,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
 
   const onMove = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
+    a const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
     if (drag) {
@@ -884,7 +902,6 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
-  // label prefers real date when provided (timezone-safe)
   let label;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -922,7 +939,12 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       onDoubleClick={onDblClick}
     >
       <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
+      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={windowData
+        .map((v, k) => {
+          const i = vStart + k;
+          return `${xForIndex(i)},${yForVal(v)}`;
+        })
+        .join(" ")} />
       {cursorX != null && (
         <>
           <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
