@@ -97,7 +97,7 @@ export default function App() {
   const [blinkClass, setBlinkClass] = useState("");
 
   // Compare Mode
-  const [compareOpen, setCompareOpen] = useState(false);
+  the const [compareOpen, setCompareOpen] = useState(false);
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
@@ -350,11 +350,34 @@ export default function App() {
     return m;
   }, [tDates, tCloses]);
 
-  // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
+  // Client-side metrics & recommendation
+  const metrics = useMemo(() => {
+    if (!quote || !results?.length) return [];
+    const base = Number(quote.last_close) || 0;
+    if (base <= 0) return [];
+    return results.map((r) => {
+      const mapeProxy =
+        r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
+        r.predictions.length;
+      const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+      const avgChangePct = ((meanPred - base) / base) * 100;
+      return { model: r.model, mapeProxy, avgChangePct };
+    });
+  }, [quote, results]);
+
+  const recommendationState = useMemo(() => {
+    if (!metrics.length) return null;
+    const best = [...metrics].sort((a, b) => a.mapeProxy - b.mapeProxy)[0];
+    let action = "Hold";
+    if (best.avgChangePct > 1) action = "Buy";
+    if (best.avgChangePct < -1) action = "Sell";
+    return { ...best, action };
+  }, [metrics]);
+
+  // ---------- Actual vs. Predicted ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // Choose the base labels for "past", preferring predict_history dates but
-  // never going past the last *real* close in tDates (trimmed).
+  // Choose base past labels, never beyond the last *real* close in tDates
   const pastDaysToShow = 10;
   const lastCloseISO = tDates.length ? dkey(tDates[tDates.length - 1]) : null;
 
@@ -624,7 +647,7 @@ export default function App() {
                     )}
                   </p>
 
-                  {/* mini interactive chart (clipped) */}
+                  {/* mini interactive chart */}
                   <div style={{ marginTop: 6 }}>
                     {tCloses.length >= 2 ? (
                       <div style={{ borderRadius: 10, overflow: "hidden" }}>
@@ -657,7 +680,7 @@ export default function App() {
 
             {/* Recommendation */}
             <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <RecommendationCard recommendation={recommendation} />
+              <RecommendationCard recommendation={recommendationState} />
             </div>
           </div>
 
@@ -742,7 +765,7 @@ export default function App() {
                   checked={models.includes(m)}
                   onChange={() => toggleModel(m)}
                 />{" "}
-                  {m}
+                {m}
               </label>
             ))}
           </div>
@@ -803,7 +826,6 @@ export default function App() {
 
 /** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
 function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
-  const { useState, useEffect } = require("react"); // keep local to avoid top-level reordering
   const pad = 10;
   const w = width - pad * 2;
   const h = height - pad * 2;
