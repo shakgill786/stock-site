@@ -308,12 +308,11 @@ export default function App() {
   const toggleModel = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
 
-  // When user clicks a symbol in movers table:
+  // When user clicks a symbol in movers/earnings:
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -343,14 +342,32 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
+  /* =======================
+     Actual vs. Predicted FIX
+     ======================= */
+
+  // Map closeDates -> closes for exact date lookup (YYYY-MM-DD)
+  const closeMap = useMemo(() => {
+    const m = new Map();
+    const n = Math.min(closeDates.length, closes.length);
+    for (let i = 0; i < n; i++) {
+      const k = dkey(closeDates[i]);
+      const v = Number(closes[i]);
+      if (Number.isFinite(v)) m.set(k, v);
+    }
+    return m;
+  }, [closeDates, closes]);
+
   const horizon = results?.[0]?.predictions?.length || 0;
-
-  // table past window (prefer predict_history dates)
   const pastDaysToShow = 10;
-  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
-  // future labels off the last past date (timezone-safe + skip weekends)
+  // Prefer predict_history dates; otherwise closeDates — then filter to only dates we have closes for
+  const sourcePastDates = (histDates.length ? histDates : closeDates.map(dkey));
+  const pastLabels = sourcePastDates
+    .filter((iso) => closeMap.has(dkey(iso)))
+    .slice(-pastDaysToShow);
+
+  // Future labels off the last *actual close* date
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : closeDates.length
@@ -366,11 +383,8 @@ export default function App() {
   // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // actual values aligned to the past window labels
-  const actualForPastLabels = pastLabels.map((iso) => {
-    const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
-  });
+  // Actuals aligned to pastLabels (from closeMap only)
+  const actualForPastLabels = pastLabels.map((iso) => closeMap.get(dkey(iso)) ?? null);
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
@@ -467,11 +481,8 @@ export default function App() {
   // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
     const dk = dkey(iso);
-    const row = histByDate[dk];
-    const actual = (() => {
-      const idx = closeDates.lastIndexOf(iso);
-      return idx >= 0 ? closes[idx] : (row?.actual ?? null);
-    })();
+    // actual strictly from closeMap to avoid off-by-one/UTC issues
+    const actual = closeMap.get(dk) ?? (histByDate[dk]?.actual ?? null);
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
@@ -716,7 +727,7 @@ export default function App() {
                   checked={models.includes(m)}
                   onChange={() => toggleModel(m)}
                 />{" "}
-                {m}
+                  {m}
               </label>
             ))}
           </div>
