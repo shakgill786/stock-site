@@ -212,34 +212,11 @@ export default function App() {
       }
     })();
 
-    // 3.5) Closes for the price chart (+ sanitize last point)
+    // 3.5) Closes for the price chart
     const pCloses = (async () => {
       try {
-        let { closes: c, dates: d } = await fetchClosesSafe(t);
+        const { closes: c, dates: d } = await fetchClosesSafe(t);
         if (reqVer.current !== myVer) return;
-
-        // --- SANITIZE: drop a bogus "today" close or duplicate-last-close placeholder ---
-        if (Array.isArray(d) && Array.isArray(c) && d.length === c.length && d.length >= 2) {
-          const todayISO = fmtLocalISO(new Date());
-          const lastISO = dkey(d[d.length - 1]);
-          const prevISO = dkey(d[d.length - 2]);
-          const lastVal = Number(c[c.length - 1]);
-          const prevVal = Number(c[c.length - 2]);
-
-          const isToday = lastISO >= todayISO; // provider labeled point as today
-          const dupLast =
-            Number.isFinite(lastVal) &&
-            Number.isFinite(prevVal) &&
-            lastISO !== prevISO &&
-            Math.abs(lastVal - prevVal) < 1e-9;
-
-          if (isToday || dupLast) {
-            d = d.slice(0, -1);
-            c = c.slice(0, -1);
-          }
-        }
-        // -------------------------------------------------------------------------------
-
         if (!c?.length) {
           setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
         }
@@ -336,6 +313,7 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
+    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -365,32 +343,25 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  /* =======================
-     Actual vs. Predicted (with sanitized closes)
-     ======================= */
-
-  // Build a fast map of close dates -> close value
-  const closeMap = useMemo(() => {
-    const m = new Map();
-    const n = Math.min(closeDates.length, closes.length);
-    for (let i = 0; i < n; i++) {
+  // ---------- Build a date->close map to align "Actual" correctly ----------
+  const closeByDate = useMemo(() => {
+    const m = Object.create(null);
+    for (let i = 0; i < Math.min(closeDates.length, closes.length); i++) {
       const k = dkey(closeDates[i]);
       const v = Number(closes[i]);
-      if (Number.isFinite(v)) m.set(k, v);
+      if (Number.isFinite(v)) m[k] = v;
     }
     return m;
   }, [closeDates, closes]);
 
+  // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
+
+  // table past window (prefer predict_history dates)
   const pastDaysToShow = 10;
+  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
-  // Prefer predict_history dates; otherwise closeDates — then filter to only dates we have closes for
-  const sourcePastDates = (histDates.length ? histDates : closeDates.map(dkey));
-  const pastLabels = sourcePastDates
-    .filter((iso) => closeMap.has(dkey(iso)))
-    .slice(-pastDaysToShow);
-
-  // Future labels off the last *actual close* date
+  // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : closeDates.length
@@ -403,10 +374,16 @@ export default function App() {
     return fmtLocalISO(d);
   });
 
+  // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // Actuals strictly from the sanitized closeMap
-  const actualForPastLabels = pastLabels.map((iso) => closeMap.get(dkey(iso)) ?? null);
+  // actual values aligned to the past window labels (prefer closes; fallback to historyRows.actual)
+  const actualForPastLabels = pastLabels.map((iso) => {
+    const k = dkey(iso);
+    if (closeByDate[k] != null) return closeByDate[k];
+    const v = histByDate[k]?.actual;
+    return Number.isFinite(Number(v)) ? Number(v) : null;
+  });
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
@@ -435,6 +412,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
+      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
@@ -453,6 +431,7 @@ export default function App() {
         spanGaps: true,
       });
 
+      // solid current forecast, anchored to last actual in past window
       const start =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
@@ -498,9 +477,19 @@ export default function App() {
     },
   };
 
+  // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
     const dk = dkey(iso);
-    const actual = closeMap.get(dk) ?? (histByDate[dk]?.actual ?? null);
+    const row = histByDate[dk];
+    const actualFromCloses =
+      closeByDate[dk] != null ? Number(closeByDate[dk]) : null;
+    const actual =
+      actualFromCloses != null
+        ? actualFromCloses
+        : Number.isFinite(Number(row?.actual))
+        ? Number(row.actual)
+        : null;
+
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
@@ -851,7 +840,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
 
   const onMove = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    a const x = e.clientX - rect.left;
+    const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
     if (drag) {
@@ -902,6 +891,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
+  // label prefers real date when provided (timezone-safe)
   let label;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -939,12 +929,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       onDoubleClick={onDblClick}
     >
       <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={windowData
-        .map((v, k) => {
-          const i = vStart + k;
-          return `${xForIndex(i)},${yForVal(v)}`;
-        })
-        .join(" ")} />
+      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
       {cursorX != null && (
         <>
           <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
@@ -983,10 +968,15 @@ function MagnifyModal({ title, children, onClose }) {
         style={{ width: "min(95vw, 1000px)", padding: 16 }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+        <div
+          className="row"
+          style={{ justifyContent: "space-between", alignItems: "center" }}
+        >
           <h3 style={{ margin: 0 }}>{title}</h3>
           <div className="row" style={{ gap: 8 }}>
-            <button className="btn ghost" onClick={onClose}>Close</button>
+            <button className="btn ghost" onClick={onClose}>
+              Close
+            </button>
           </div>
         </div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
