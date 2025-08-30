@@ -67,7 +67,7 @@ const addBusinessDays = (start, n) => {
   return dt;
 };
 
-// normalize model keys so we don’t miss due to case/whitespace
+// normalize model keys
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
@@ -313,7 +313,6 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -343,7 +342,7 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Build a date->close map to align "Actual" correctly ----------
+  // ---------- Build a date->close map ----------
   const closeByDate = useMemo(() => {
     const m = Object.create(null);
     for (let i = 0; i < Math.min(closeDates.length, closes.length); i++) {
@@ -357,9 +356,19 @@ export default function App() {
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // table past window (prefer predict_history dates)
+  // Choose the base labels for "past", preferring predict_history dates
   const pastDaysToShow = 10;
-  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
+  const lastCloseISO = closeDates.length ? dkey(closeDates[closeDates.length - 1]) : null;
+
+  const basePastLabels = useMemo(() => {
+    if (histDates.length && lastCloseISO) {
+      // Clip history dates to those that have a real close available
+      return histDates.filter((iso) => dkey(iso) <= lastCloseISO);
+    }
+    return histDates.length ? histDates : closeDates;
+  }, [histDates, closeDates, lastCloseISO]);
+
+  const pastLabels = basePastLabels.slice(-pastDaysToShow);
 
   // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
@@ -380,7 +389,7 @@ export default function App() {
   // actual values aligned to the past window labels (prefer closes; fallback to historyRows.actual)
   const actualForPastLabels = pastLabels.map((iso) => {
     const k = dkey(iso);
-    if (closeByDate[k] != null) return closeByDate[k];
+    if (closeByDate[k] != null) return Number(closeByDate[k]);
     const v = histByDate[k]?.actual;
     return Number.isFinite(Number(v)) ? Number(v) : null;
   });
@@ -479,10 +488,11 @@ export default function App() {
 
   // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso) => {
-    const dk = dkey(iso);
-    const row = histByDate[dk];
+    const dkIso = dkey(iso);
+    const row = histByDate[dkIso];
+
     const actualFromCloses =
-      closeByDate[dk] != null ? Number(closeByDate[dk]) : null;
+      closeByDate[dkIso] != null ? Number(closeByDate[dkIso]) : null;
     const actual =
       actualFromCloses != null
         ? actualFromCloses
@@ -491,10 +501,10 @@ export default function App() {
         : null;
 
     const perModel = results.map((r) => {
-      const v = histPred?.[dk]?.[normModel(r.model)];
+      const v = histPred?.[dkIso]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
-    return { date: iso, actual, perModel, kind: "past" };
+    return { date: dkIso, actual, perModel, kind: "past" };
   });
 
   const futureRows = futureLabels.map((d, i) => {
@@ -543,7 +553,7 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
+          {/* Hot movers + Earnings this week */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* Anchor for smooth-scroll target */}
@@ -968,15 +978,10 @@ function MagnifyModal({ title, children, onClose }) {
         style={{ width: "min(95vw, 1000px)", padding: 16 }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div
-          className="row"
-          style={{ justifyContent: "space-between", alignItems: "center" }}
-        >
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>{title}</h3>
           <div className="row" style={{ gap: 8 }}>
-            <button className="btn ghost" onClick={onClose}>
-              Close
-            </button>
+            <button className="btn ghost" onClick={onClose}>Close</button>
           </div>
         </div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
