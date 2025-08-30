@@ -97,7 +97,7 @@ export default function App() {
   const [blinkClass, setBlinkClass] = useState("");
 
   // Compare Mode
-  the const [compareOpen, setCompareOpen] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
