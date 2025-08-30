@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+// frontend/src/components/HotAndEarnings.jsx
+// Gainers/Losers/Earnings with clickable ticker "links".
+// Clicking a ticker calls onSelectTicker (if provided) and falls back to a window event.
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { fetchQuote, fetchEarnings } from "../api";
 import useLocalStorage from "../hooks/useLocalStorage";
 
 /** ======== Universe ======== */
 const FALLBACK_TICKERS = [
-  // Big caps + tech + banks + staples (expanded a bit)
   "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","NFLX","AMD",
   "JPM","V","MA","XOM","CVX","WMT","HD","PG","KO","PEP",
   "UNH","JNJ","LLY","PFE","BAC","C","GS","MS","CSCO","ORCL",
@@ -14,22 +17,16 @@ const FALLBACK_TICKERS = [
   "SNOW","ZS","CRWD","PANW","SMCI","DE","GM","F","FDX","LMT",
   "GE","MMM","MDLZ","MO","PM","BKNG","AXP","ADP","SPGI","ICE"
 ];
-const MAX_UNIVERSE = 150; // raise to scan more tickers (watchlist takes priority)
+const MAX_UNIVERSE = 150;
 
 /** ======== Formatters ======== */
-const fmtPct = (v) =>
-  Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "—";
-const fmtMoney = (v) =>
-  Number.isFinite(v) ? `$${Number(v).toFixed(2)}` : "—";
+const fmtPct = (v) => (Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "—");
+const fmtMoney = (v) => (Number.isFinite(v) ? `$${Number(v).toFixed(2)}` : "—");
 const fmtDateHuman = (iso) => {
   if (!iso) return "—";
   try {
     const d = new Date(`${String(iso).slice(0,10)}T00:00:00`);
-    return d.toLocaleDateString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-    });
+    return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
   } catch { return iso; }
 };
 
@@ -71,7 +68,7 @@ const sessionBadge = (session) => {
   return { text: s, bg: "rgba(255,255,255,0.08)", fg: "#bbb", border: "rgba(255,255,255,0.12)" };
 };
 
-export default function HotAndEarnings() {
+export default function HotAndEarnings({ onSelectTicker }) {
   const [watchlist] = useLocalStorage("WATCHLIST_V1", []);
   const [weekOffset, setWeekOffset] = useState(0); // 0=this week, -1=prev, +1=next
 
@@ -87,8 +84,15 @@ export default function HotAndEarnings() {
   const [losers, setLosers] = useState([]);
   const [earnings, setEarnings] = useState([]);
   const [err, setErr] = useState("");
-
   const reqVer = useRef(0);
+
+  // 🔗 pick helper: use prop if provided; otherwise emit a global event App can listen for
+  const pick = useCallback((sym) => {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return;
+    if (typeof onSelectTicker === "function") onSelectTicker(s);
+    else window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
+  }, [onSelectTicker]);
 
   // Compute the active week window
   const { weekStart, weekEnd } = useMemo(() => {
@@ -130,9 +134,8 @@ export default function HotAndEarnings() {
         setErr(e?.message || "Failed to load movers");
       }
 
-      /** ---- Earnings in ACTIVE WEEK (Mon→Sun) ---- */
+      /** ---- Earnings (Mon→Sun) ---- */
       try {
-        // Batch in chunks to be gentle on the API
         const CHUNK = 30;
         const picked = [];
         for (let i = 0; i < universe.length; i += CHUNK) {
@@ -141,12 +144,10 @@ export default function HotAndEarnings() {
           const rows = await Promise.all(slice.map(async (t) => {
             try {
               const e = await fetchEarnings(t);
-              const dateStr = e?.nextEarningsDate; // yyyy-mm-dd (assumed)
+              const dateStr = e?.nextEarningsDate;
               if (!dateStr) return null;
-              // interpret as local date (00:00 local)
               const d = new Date(`${dateStr}T00:00:00`);
               if (isNaN(d.getTime())) return null;
-
               if (d >= weekStart && d <= weekEnd) {
                 return { symbol: t, date: dateStr, when: d, session: e?.session || "" };
               }
@@ -156,11 +157,8 @@ export default function HotAndEarnings() {
           picked.push(...rows.filter(Boolean));
         }
 
-        // Dedupe by symbol+date just in case; sort by date then symbol
         const dedupMap = new Map();
-        for (const r of picked) {
-          dedupMap.set(`${r.symbol}_${r.date}`, r);
-        }
+        for (const r of picked) dedupMap.set(`${r.symbol}_${r.date}`, r);
         const list = Array.from(dedupMap.values()).sort((a,b) =>
           a.when.getTime() - b.when.getTime() || a.symbol.localeCompare(b.symbol)
         );
@@ -177,7 +175,7 @@ export default function HotAndEarnings() {
     run();
   }, [universe, weekStart, weekEnd]);
 
-  const earningsSorted = earnings; // already sorted
+  const earningsSorted = earnings;
 
   return (
     <div className="card" style={{ marginTop: 12 }}>
@@ -189,11 +187,11 @@ export default function HotAndEarnings() {
 
       {/* responsive grid: single col on small screens, 2 cols on larger */}
       <div className="hot-grid" style={{ marginTop: 12 }}>
-        <MoversTable title="Top 25 Gainers" rows={gainers} />
-        <MoversTable title="Top 25 Losers" rows={losers} />
+        <MoversTable title="Top 25 Gainers" rows={gainers} onPick={pick} />
+        <MoversTable title="Top 25 Losers" rows={losers} onPick={pick} />
       </div>
 
-      {/* earnings: table on desktop, styled stacked cards on mobile */}
+      {/* earnings: table on desktop, stacked cards on mobile */}
       <div className="card" style={{ marginTop: 16, overflow: "hidden" }}>
         <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
           <h4 style={{ marginTop: 0 }}>
@@ -235,7 +233,16 @@ export default function HotAndEarnings() {
                     return (
                       <tr key={`${r.symbol}-${r.date}-${i}`}>
                         <td>{fmtDateHuman(r.date)}</td>
-                        <td style={{ textAlign: "center", fontWeight: 700, letterSpacing: .2 }}>{r.symbol}</td>
+                        <td style={{ textAlign: "center", fontWeight: 700, letterSpacing: .2 }}>
+                          <button
+                            type="button"
+                            className="ticker-link"
+                            onClick={() => pick(r.symbol)}
+                            title={`Load ${r.symbol}`}
+                          >
+                            {r.symbol}
+                          </button>
+                        </td>
                         <td style={{ textAlign: "center" }}>
                           <span
                             style={{
@@ -281,7 +288,15 @@ export default function HotAndEarnings() {
                   >
                     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontWeight: 800, letterSpacing: 0.2, fontSize: 16 }}>{r.symbol}</span>
+                        <button
+                          type="button"
+                          className="ticker-link"
+                          onClick={() => pick(r.symbol)}
+                          style={{ fontWeight: 800, letterSpacing: 0.2, fontSize: 16 }}
+                          title={`Load ${r.symbol}`}
+                        >
+                          {r.symbol}
+                        </button>
                         <span
                           style={{
                             display: "inline-block",
@@ -310,53 +325,47 @@ export default function HotAndEarnings() {
           <div className="muted" style={{ paddingTop: 6 }}>
             No earnings found in this week window for your current universe.
             <div style={{ fontSize: 12, opacity: .8, marginTop: 4 }}>
-              Tip: add more tickers to your Watchlist or raise <code>MAX_UNIVERSE</code> to scan more symbols.
+              Tip: add more tickers to your Watchlist or raise <code>MAX_UNIVERSE</code>.
             </div>
           </div>
         )}
       </div>
 
-      {/* responsive CSS specific to this component */}
+      {/* responsive + link styling */}
       <style>{`
-        /* Grid that adapts smoothly */
-        .hot-grid {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 12px;
-          width: 100%;
-        }
-        @media (min-width: 740px) {
-          .hot-grid { grid-template-columns: repeat(2, 1fr); }
-        }
+        .hot-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; }
+        @media (min-width: 740px) { .hot-grid { grid-template-columns: repeat(2,1fr); } }
 
-        /* Earnings: show table on desktop, stacked cards on mobile */
         .earnings-table-wrap { display: none; }
         .earnings-list { display: block; }
-
         @media (min-width: 768px) {
           .earnings-table-wrap { display: block; }
           .earnings-list { display: none; }
         }
 
-        /* Tighten tables on small screens to prevent overflow */
-        @media (max-width: 680px) {
-          .table th, .table td {
-            padding: 6px 8px;
-            font-size: 12px;
-          }
+        .ticker-link{
+          background: transparent;
+          border: none;
+          padding: 0;
+          margin: 0;
+          cursor: pointer;
+          color: #a2c4ff;
+          text-decoration: underline;
+          text-underline-offset: 2px;
+          font: inherit;
         }
-        @media (max-width: 480px) {
-          .table th, .table td {
-            padding: 5px 6px;
-            font-size: 11.5px;
-          }
+        .ticker-link:hover{
+          color: #d6e3ff;
+          text-shadow: 0 0 6px rgba(110,168,255,.45);
+          text-decoration-thickness: 2px;
         }
+        .ticker-link:active{ opacity:.9; }
       `}</style>
     </div>
   );
 }
 
-function MoversTable({ title, rows = [] }) {
+function MoversTable({ title, rows = [], onPick }) {
   return (
     <div className="card" style={{ padding: 12, overflow: "hidden" }}>
       <h4 style={{ marginTop: 0 }}>{title}</h4>
@@ -398,11 +407,21 @@ function MoversTable({ title, rows = [] }) {
 
                 return (
                   <tr key={`${r.symbol}-${i}`}>
-                    <td><strong>{r.symbol}</strong></td>
+                    <td>
+                      <button
+                        type="button"
+                        className="ticker-link"
+                        onClick={() => onPick?.(r.symbol)}
+                        title={`Load ${r.symbol}`}
+                        style={{ fontWeight: 700 }}
+                      >
+                        {r.symbol}
+                      </button>
+                    </td>
                     <td style={{ textAlign: "center" }}>{fmtMoney(price)}</td>
                     <td style={{ textAlign: "center", color: isUp ? "#2e7d32" : "#c62828" }}>
                       {Number.isFinite(dollarChange)
-                        ? `${dollarChange >= 0 ? "+" : ""}${fmtMoney(Math.abs(dollarChange)).slice(1)}`
+                        ? `${dollarChange >= 0 ? "+" : ""}$${Math.abs(dollarChange).toFixed(2)}`
                         : "—"}
                     </td>
                     <td style={{ textAlign: "center", color: pct >= 0 ? "#2e7d32" : "#c62828" }}>
