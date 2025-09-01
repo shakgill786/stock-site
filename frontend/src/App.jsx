@@ -67,9 +67,42 @@ const addBusinessDays = (start, n) => {
   return dt;
 };
 
-// normalize model keys
+// normalize model keys so we don’t miss due to case/whitespace
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
+
+// ---------- sanitize helper for closes ----------
+function sanitizeClosesWithQuote({ dates, closes, quote }) {
+  let outDates = Array.isArray(dates) ? [...dates] : [];
+  let outCloses = Array.isArray(closes) ? [...closes] : [];
+  if (!outDates.length || outDates.length !== outCloses.length) {
+    return { dates: [], closes: [] };
+  }
+
+  const lastIdx = outCloses.length - 1;
+
+  // If we have a quote, force the last daily close to match the official last_close
+  if (
+    lastIdx >= 0 &&
+    quote &&
+    Number.isFinite(Number(quote.last_close))
+  ) {
+    outCloses[lastIdx] = Number(quote.last_close);
+  }
+
+  // If last two closes are identical, the last one is likely a duplicate "today" stub -> drop tail
+  if (
+    outCloses.length >= 2 &&
+    Number.isFinite(outCloses[lastIdx]) &&
+    Number.isFinite(outCloses[lastIdx - 1]) &&
+    Math.abs(outCloses[lastIdx] - outCloses[lastIdx - 1]) < 1e-8
+  ) {
+    outCloses = outCloses.slice(0, -1);
+    outDates = outDates.slice(0, -1);
+  }
+
+  return { dates: outDates, closes: outCloses };
+}
 
 export default function App() {
   const [ticker, setTicker] = useState("AAPL");
@@ -175,22 +208,24 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // 1) Quote
-    (async () => {
+    // 1) Quote (make this a promise we can await from closes)
+    const pQuote = (async () => {
       try {
         const q = await fetchQuote(t);
-        if (reqVer.current !== myVer) return;
+        if (reqVer.current !== myVer) return null;
         setQuote(q);
         prevPriceRef.current = q.current_price;
+        return q;
       } catch {
-        if (reqVer.current !== myVer) return;
+        if (reqVer.current !== myVer) return null;
         setQuoteErr(true);
         setDiagnostic((d) => d || `Quote fetch failed for ${t}.`);
+        return null;
       }
     })();
 
     // 2) Earnings
-    (async () => {
+    const pEarn = (async () => {
       try {
         const e = await fetchEarnings(t);
         if (reqVer.current !== myVer) return;
@@ -202,7 +237,7 @@ export default function App() {
     })();
 
     // 3) Market
-    (async () => {
+    const pMkt = (async () => {
       try {
         const m = await fetchMarket();
         if (reqVer.current !== myVer) return;
@@ -212,16 +247,25 @@ export default function App() {
       }
     })();
 
-    // 3.5) Closes for the price chart
+    // 3.5) Closes for the price chart (align with quote.last_close + dedupe tail)
     const pCloses = (async () => {
       try {
-        const { closes: c, dates: d } = await fetchClosesSafe(t);
+        const raw = await fetchClosesSafe(t);
         if (reqVer.current !== myVer) return;
-        if (!c?.length) {
+
+        const q = await pQuote.catch(() => null);
+        const { dates, closes } = sanitizeClosesWithQuote({
+          dates: raw?.dates || [],
+          closes: raw?.closes || [],
+          quote: q,
+        });
+
+        if (!closes?.length) {
           setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
         }
-        setCloses(c);
-        setCloseDates(d);
+
+        setCloses(closes || []);
+        setCloseDates(dates || []);
       } catch {
         if (reqVer.current !== myVer) return;
         setDiagnostic((dMsg) => dMsg || `Failed to load historical prices for ${t}.`);
@@ -259,7 +303,7 @@ export default function App() {
       }
     })();
 
-    await Promise.all([pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
+    await Promise.all([pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
 
     if (reqVer.current === myVer) {
       setLoading(false);
@@ -308,11 +352,12 @@ export default function App() {
   const toggleModel = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
 
-  // When user clicks a symbol in movers/earnings:
+  // When user clicks a symbol in movers table:
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
+    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -342,33 +387,12 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Build a date->close map ----------
-  const closeByDate = useMemo(() => {
-    const m = Object.create(null);
-    for (let i = 0; i < Math.min(closeDates.length, closes.length); i++) {
-      const k = dkey(closeDates[i]);
-      const v = Number(closes[i]);
-      if (Number.isFinite(v)) m[k] = v;
-    }
-    return m;
-  }, [closeDates, closes]);
-
   // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // Choose the base labels for "past", preferring predict_history dates
+  // table past window (prefer predict_history dates)
   const pastDaysToShow = 10;
-  const lastCloseISO = closeDates.length ? dkey(closeDates[closeDates.length - 1]) : null;
-
-  const basePastLabels = useMemo(() => {
-    if (histDates.length && lastCloseISO) {
-      // Clip history dates to those that have a real close available
-      return histDates.filter((iso) => dkey(iso) <= lastCloseISO);
-    }
-    return histDates.length ? histDates : closeDates;
-  }, [histDates, closeDates, lastCloseISO]);
-
-  const pastLabels = basePastLabels.slice(-pastDaysToShow);
+  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
   // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
@@ -386,13 +410,21 @@ export default function App() {
   // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // actual values aligned to the past window labels (prefer closes; fallback to historyRows.actual)
-  const actualForPastLabels = pastLabels.map((iso) => {
-    const k = dkey(iso);
-    if (closeByDate[k] != null) return Number(closeByDate[k]);
-    const v = histByDate[k]?.actual;
-    return Number.isFinite(Number(v)) ? Number(v) : null;
+  // actual values aligned to the past window labels
+  const actualForPastLabelsRaw = pastLabels.map((iso) => {
+    const idx = closeDates.lastIndexOf(iso);
+    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
+
+  // --- CRITICAL FIX: force the latest past day's "Actual" to equal quote.last_close ---
+  const actualForPastLabels = (() => {
+    const arr = [...actualForPastLabelsRaw];
+    const lastIdx = arr.length - 1;
+    if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
+      arr[lastIdx] = Number(quote.last_close);
+    }
+    return arr;
+  })();
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
@@ -487,24 +519,22 @@ export default function App() {
   };
 
   // Table rows: last N past days (backtest) + future horizon (current predictions)
-  const pastRows = pastLabels.map((iso) => {
-    const dkIso = dkey(iso);
-    const row = histByDate[dkIso];
+  const pastRows = pastLabels.map((iso, i, arr) => {
+    const dk = dkey(iso);
+    const row = histByDate[dk];
+    const idx = closeDates.lastIndexOf(iso);
+    let actual = idx >= 0 ? closes[idx] : (row?.actual ?? null);
 
-    const actualFromCloses =
-      closeByDate[dkIso] != null ? Number(closeByDate[dkIso]) : null;
-    const actual =
-      actualFromCloses != null
-        ? actualFromCloses
-        : Number.isFinite(Number(row?.actual))
-        ? Number(row.actual)
-        : null;
+    // --- CRITICAL FIX mirrored for the table: last past row uses quote.last_close ---
+    if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
+      actual = Number(quote.last_close);
+    }
 
     const perModel = results.map((r) => {
-      const v = histPred?.[dkIso]?.[normModel(r.model)];
+      const v = histPred?.[dk]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
-    return { date: dkIso, actual, perModel, kind: "past" };
+    return { date: iso, actual, perModel, kind: "past" };
   });
 
   const futureRows = futureLabels.map((d, i) => {
@@ -553,7 +583,7 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings this week */}
+          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* Anchor for smooth-scroll target */}
