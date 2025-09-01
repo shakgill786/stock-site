@@ -71,7 +71,38 @@ const addBusinessDays = (start, n) => {
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
-// ---------- sanitize helper for closes ----------
+/** ===== Tail de-dupe helpers (fix duplicate final day) ===== */
+const dropDupTailSeries = (dates = [], closes = []) => {
+  const n = Math.min(dates.length, closes.length);
+  if (n >= 2) {
+    const sameVal = Number(closes[n - 1]) === Number(closes[n - 2]);
+    const diffDate = String(dates[n - 1]) !== String(dates[n - 2]);
+    if (sameVal && diffDate) {
+      return {
+        dates: dates.slice(0, n - 1),
+        closes: closes.slice(0, n - 1),
+        dropped: true,
+      };
+    }
+  }
+  return { dates, closes, dropped: false };
+};
+
+const dropDupTailHistory = (rows = []) => {
+  const n = rows.length;
+  if (n >= 2) {
+    const a = Number(rows[n - 1]?.actual);
+    const b = Number(rows[n - 2]?.actual);
+    const dA = String(rows[n - 1]?.date || "");
+    const dB = String(rows[n - 2]?.date || "");
+    if (dA !== dB && Number.isFinite(a) && Number.isFinite(b) && a === b) {
+      return rows.slice(0, n - 1);
+    }
+  }
+  return rows;
+};
+
+// If we have a quote, force the last daily close to match the official last_close
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
   let outCloses = Array.isArray(closes) ? [...closes] : [];
@@ -80,28 +111,13 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   }
 
   const lastIdx = outCloses.length - 1;
-
-  // If we have a quote, force the last daily close to match the official last_close
-  if (
-    lastIdx >= 0 &&
-    quote &&
-    Number.isFinite(Number(quote.last_close))
-  ) {
+  if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
     outCloses[lastIdx] = Number(quote.last_close);
   }
 
-  // If last two closes are identical, the last one is likely a duplicate "today" stub -> drop tail
-  if (
-    outCloses.length >= 2 &&
-    Number.isFinite(outCloses[lastIdx]) &&
-    Number.isFinite(outCloses[lastIdx - 1]) &&
-    Math.abs(outCloses[lastIdx] - outCloses[lastIdx - 1]) < 1e-8
-  ) {
-    outCloses = outCloses.slice(0, -1);
-    outDates = outDates.slice(0, -1);
-  }
-
-  return { dates: outDates, closes: outCloses };
+  // Then drop obvious duplicated tail (different dates, identical closes)
+  const dropped = dropDupTailSeries(outDates, outCloses);
+  return { dates: dropped.dates, closes: dropped.closes };
 }
 
 export default function App() {
@@ -208,7 +224,7 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // 1) Quote (make this a promise we can await from closes)
+    // 1) Quote — awaitable
     const pQuote = (async () => {
       try {
         const q = await fetchQuote(t);
@@ -247,13 +263,13 @@ export default function App() {
       }
     })();
 
-    // 3.5) Closes for the price chart (align with quote.last_close + dedupe tail)
+    // 3.5) Closes (align with quote + drop duplicate tail)
     const pCloses = (async () => {
       try {
         const raw = await fetchClosesSafe(t);
         if (reqVer.current !== myVer) return;
-
         const q = await pQuote.catch(() => null);
+
         const { dates, closes } = sanitizeClosesWithQuote({
           dates: raw?.dates || [],
           closes: raw?.closes || [],
@@ -272,12 +288,13 @@ export default function App() {
       }
     })();
 
-    // 4) Past backtest rows
+    // 4) Past backtest rows (drop duplicate tail if backend repeats it)
     const pHist = (async () => {
       try {
         const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
         if (reqVer.current !== myVer) return;
-        setHistoryRows(hist?.rows || []);
+        const safeRows = dropDupTailHistory(hist?.rows || []);
+        setHistoryRows(safeRows);
       } catch {
         if (reqVer.current !== myVer) return;
         setHistoryRows([]);
@@ -416,7 +433,7 @@ export default function App() {
     return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
 
-  // --- CRITICAL FIX: force the latest past day's "Actual" to equal quote.last_close ---
+  // Force the last past day's Actual to the official last_close
   const actualForPastLabels = (() => {
     const arr = [...actualForPastLabelsRaw];
     const lastIdx = arr.length - 1;
@@ -525,7 +542,7 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : (row?.actual ?? null);
 
-    // --- CRITICAL FIX mirrored for the table: last past row uses quote.last_close ---
+    // last past row uses quote.last_close
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
