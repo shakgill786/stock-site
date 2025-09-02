@@ -779,6 +779,13 @@ export default function App() {
             </div>
           )}
 
+          {diagnostic && (
+          <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
+              <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
+          </div>
+          )}
+
           {/* Prediction Error */}
           {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 

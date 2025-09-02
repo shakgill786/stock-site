@@ -1,386 +1,66 @@
 // frontend/src/components/HotAndEarnings.jsx
-// Gainers/Losers/Earnings with clickable ticker "links".
-// Clicking a ticker calls onSelectTicker (if provided) and falls back to a window event.
+// Uses backend /movers (Top gainers/losers) and /earnings_week in a single fetch each.
+// No placeholders; shows proper loading/empty/error states. Tickers are clickable.
 
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import { fetchQuote, fetchEarnings } from "../api";
-import useLocalStorage from "../hooks/useLocalStorage";
+import { useEffect, useMemo, useState } from "react";
+import { fetchMovers, fetchEarningsWeek } from "../api";
 
-/** ======== Universe ======== */
-const FALLBACK_TICKERS = [
-  "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","NFLX","AMD",
-  "JPM","V","MA","XOM","CVX","WMT","HD","PG","KO","PEP",
-  "UNH","JNJ","LLY","PFE","BAC","C","GS","MS","CSCO","ORCL",
-  "ADBE","CRM","QCOM","TXN","INTC","T","VZ","DIS","NKE","COST",
-  "MCD","ABT","TMO","UPS","LOW","IBM","CAT","HON","BA","PYPL",
-  "AMAT","MU","NOW","SHOP","PLTR","UBER","ABNB","MRNA","SQ","ROKU",
-  "SNOW","ZS","CRWD","PANW","SMCI","DE","GM","F","FDX","LMT",
-  "GE","MMM","MDLZ","MO","PM","BKNG","AXP","ADP","SPGI","ICE"
-];
-const MAX_UNIVERSE = 150;
-
-/** ======== Formatters ======== */
-const fmtPct = (v) => (Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "—");
-const fmtMoney = (v) => (Number.isFinite(v) ? `$${Number(v).toFixed(2)}` : "—");
+// -------- formatters --------
+const fmtMoney = (v) =>
+  Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : "—";
+const fmtSignMoney = (v) =>
+  Number.isFinite(Number(v))
+    ? `${v >= 0 ? "+" : ""}$${Math.abs(Number(v)).toFixed(2)}`
+    : "—";
+const fmtPct = (v) =>
+  Number.isFinite(Number(v))
+    ? `${v >= 0 ? "+" : ""}${Number(v).toFixed(2)}%`
+    : "—";
 const fmtDateHuman = (iso) => {
   if (!iso) return "—";
   try {
-    const d = new Date(`${String(iso).slice(0,10)}T00:00:00`);
-    return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-  } catch { return iso; }
+    const d = new Date(`${String(iso).slice(0, 10)}T00:00:00`);
+    return d.toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return iso;
+  }
 };
 
-/** ======== Week helpers (local tz, Monday->Sunday) ======== */
-function startOfISOWeek(d) {
-  const dt = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const day = (dt.getDay() + 6) % 7; // Mon=0..Sun=6
-  dt.setDate(dt.getDate() - day);
-  dt.setHours(0,0,0,0);
-  return dt;
-}
-function endOfISOWeek(d) {
-  const start = startOfISOWeek(d);
-  const end = new Date(start);
-  end.setDate(start.getDate() + 6);
-  end.setHours(23,59,59,999);
-  return end;
-}
-function shiftWeeks(d, offset) {
-  const copy = new Date(d);
-  copy.setDate(copy.getDate() + offset*7);
-  return copy;
-}
-function fmtRange(a, b) {
-  const opts = { month: "short", day: "numeric" };
-  const left = a.toLocaleDateString(undefined, opts);
-  const right = b.toLocaleDateString(undefined, opts);
-  return `${left} – ${right}`;
-}
-
-/** ======== Chips for session badge ======== */
-const sessionBadge = (session) => {
-  const s = String(session || "").toUpperCase();
-  if (!s) return { text: "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", border: "rgba(255,255,255,0.12)" };
-  if (s.includes("BEFORE") || s.includes("BMO") || s === "AM")
-    return { text: "BMO", bg: "rgba(25,118,210,0.15)", fg: "#64b5f6", border: "rgba(100,181,246,0.35)" };
-  if (s.includes("AFTER") || s.includes("AMC") || s === "PM")
-    return { text: "AMC", bg: "rgba(244,67,54,0.15)", fg: "#ef9a9a", border: "rgba(239,154,154,0.35)" };
-  return { text: s, bg: "rgba(255,255,255,0.08)", fg: "#bbb", border: "rgba(255,255,255,0.12)" };
-};
-
-export default function HotAndEarnings({ onSelectTicker }) {
-  const [watchlist] = useLocalStorage("WATCHLIST_V1", []);
-  const [weekOffset, setWeekOffset] = useState(0); // 0=this week, -1=prev, +1=next
-
-  // Build universe (watchlist first, then fallbacks), dedup, cap
-  const universe = useMemo(() => {
-    const wl = (watchlist || []).map(w => String(w.symbol || "").toUpperCase());
-    const dedup = Array.from(new Set([...(wl || []), ...FALLBACK_TICKERS]));
-    return dedup.slice(0, MAX_UNIVERSE);
-  }, [watchlist]);
-
-  const [loading, setLoading] = useState(false);
-  const [gainers, setGainers] = useState([]);
-  const [losers, setLosers] = useState([]);
-  const [earnings, setEarnings] = useState([]);
-  const [err, setErr] = useState("");
-  const reqVer = useRef(0);
-
-  // 🔗 pick helper: use prop if provided; otherwise emit a global event App can listen for
-  const pick = useCallback((sym) => {
-    const s = String(sym || "").toUpperCase().trim();
-    if (!s) return;
-    if (typeof onSelectTicker === "function") onSelectTicker(s);
-    else window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
-  }, [onSelectTicker]);
-
-  // Compute the active week window
-  const { weekStart, weekEnd } = useMemo(() => {
-    const base = shiftWeeks(new Date(), weekOffset);
-    return { weekStart: startOfISOWeek(base), weekEnd: endOfISOWeek(base) };
-  }, [weekOffset]);
-
-  useEffect(() => {
-    const run = async () => {
-      const myVer = ++reqVer.current;
-      setLoading(true);
-      setErr("");
-      setGainers([]); setLosers([]); setEarnings([]);
-
-      /** ---- Movers (quotes) ---- */
-      try {
-        const quotes = await Promise.all(
-          universe.map(async (t) => {
-            try {
-              const q = await fetchQuote(t);
-              const cp = Number(q?.change_pct);
-              return {
-                symbol: String(q?.ticker || t).toUpperCase(),
-                price: Number(q?.current_price),
-                last_close: Number(q?.last_close ?? NaN),
-                change_pct: Number.isFinite(cp) ? cp : null,
-              };
-            } catch { return null; }
-          })
-        );
-        const clean = quotes.filter(q => q && Number.isFinite(q.price) && Number.isFinite(q.change_pct));
-        const topGainers = [...clean].sort((a,b)=> b.change_pct - a.change_pct).slice(0, 25);
-        const topLosers  = [...clean].sort((a,b)=> a.change_pct - b.change_pct).slice(0, 25);
-        if (reqVer.current !== myVer) return;
-        setGainers(topGainers);
-        setLosers(topLosers);
-      } catch (e) {
-        if (reqVer.current !== myVer) return;
-        setErr(e?.message || "Failed to load movers");
-      }
-
-      /** ---- Earnings (Mon→Sun) ---- */
-      try {
-        const CHUNK = 30;
-        const picked = [];
-        for (let i = 0; i < universe.length; i += CHUNK) {
-          /* eslint-disable no-await-in-loop */
-          const slice = universe.slice(i, i + CHUNK);
-          const rows = await Promise.all(slice.map(async (t) => {
-            try {
-              const e = await fetchEarnings(t);
-              const dateStr = e?.nextEarningsDate;
-              if (!dateStr) return null;
-              const d = new Date(`${dateStr}T00:00:00`);
-              if (isNaN(d.getTime())) return null;
-              if (d >= weekStart && d <= weekEnd) {
-                return { symbol: t, date: dateStr, when: d, session: e?.session || "" };
-              }
-              return null;
-            } catch { return null; }
-          }));
-          picked.push(...rows.filter(Boolean));
-        }
-
-        const dedupMap = new Map();
-        for (const r of picked) dedupMap.set(`${r.symbol}_${r.date}`, r);
-        const list = Array.from(dedupMap.values()).sort((a,b) =>
-          a.when.getTime() - b.when.getTime() || a.symbol.localeCompare(b.symbol)
-        );
-
-        if (reqVer.current !== myVer) return;
-        setEarnings(list);
-      } catch {
-        /* ignore earnings errors so card still renders */
-      } finally {
-        if (reqVer.current === myVer) setLoading(false);
-      }
-    };
-
-    run();
-  }, [universe, weekStart, weekEnd]);
-
-  const earningsSorted = earnings;
-
+// -------- UI bits --------
+function SectionCard({ title, right, children }) {
   return (
-    <div className="card" style={{ marginTop: 12 }}>
+    <div className="card" style={{ padding: 12, overflow: "hidden" }}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-        <h3 style={{ margin: 0 }}>🔥 Hot Stocks Today & Earnings This Week</h3>
-        {loading && <span className="muted">loading…</span>}
+        <h3 style={{ marginTop: 0 }}>{title}</h3>
+        {right}
       </div>
-      {err && <div style={{ color: "salmon", marginTop: 6 }}>{err}</div>}
-
-      {/* responsive grid: single col on small screens, 2 cols on larger */}
-      <div className="hot-grid" style={{ marginTop: 12 }}>
-        <MoversTable title="Top 25 Gainers" rows={gainers} onPick={pick} />
-        <MoversTable title="Top 25 Losers" rows={losers} onPick={pick} />
-      </div>
-
-      {/* earnings: table on desktop, stacked cards on mobile */}
-      <div className="card" style={{ marginTop: 16, overflow: "hidden" }}>
-        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-          <h4 style={{ marginTop: 0 }}>
-            Earnings (This Week{weekOffset !== 0 ? (weekOffset > 0 ? ` +${weekOffset}` : ` ${weekOffset}`) : ""})
-            <span className="muted" style={{ marginLeft: 8, fontWeight: 400 }}>
-              {fmtRange(weekStart, weekEnd)}
-            </span>
-            {!!earningsSorted.length && (
-              <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>• {earningsSorted.length} companies</span>
-            )}
-          </h4>
-          <div className="row">
-            <button className="btn ghost" onClick={() => setWeekOffset(o => o - 1)} title="Previous week">‹ Prev</button>
-            <button className="btn ghost" onClick={() => setWeekOffset(0)} title="This week">This</button>
-            <button className="btn ghost" onClick={() => setWeekOffset(o => o + 1)} title="Next week">Next ›</button>
-          </div>
-        </div>
-
-        {earningsSorted.length ? (
-          <>
-            {/* Desktop table */}
-            <div className="earnings-table-wrap">
-              <table className="table" style={{ width: "100%", tableLayout: "fixed", fontSize: 13 }}>
-                <colgroup>
-                  <col style={{ width: "50%" }} />
-                  <col style={{ width: "25%" }} />
-                  <col style={{ width: "25%" }} />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: "left" }}>Date</th>
-                    <th style={{ textAlign: "center" }}>Ticker</th>
-                    <th style={{ textAlign: "center" }}>Session</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {earningsSorted.map((r, i) => {
-                    const badge = sessionBadge(r.session);
-                    return (
-                      <tr key={`${r.symbol}-${r.date}-${i}`}>
-                        <td>{fmtDateHuman(r.date)}</td>
-                        <td style={{ textAlign: "center", fontWeight: 700, letterSpacing: .2 }}>
-                          <button
-                            type="button"
-                            className="ticker-link"
-                            onClick={() => pick(r.symbol)}
-                            title={`Load ${r.symbol}`}
-                          >
-                            {r.symbol}
-                          </button>
-                        </td>
-                        <td style={{ textAlign: "center" }}>
-                          <span
-                            style={{
-                              display: "inline-block",
-                              padding: "2px 8px",
-                              borderRadius: 999,
-                              background: badge.bg,
-                              border: `1px solid ${badge.border}`,
-                              color: badge.fg,
-                              fontSize: 12,
-                              lineHeight: 1.3,
-                            }}
-                          >
-                            {badge.text}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Mobile stylish stacked list */}
-            <div className="earnings-list">
-              {earningsSorted.map((r, i) => {
-                const badge = sessionBadge(r.session);
-                return (
-                  <div
-                    key={`${r.symbol}-m-${r.date}-${i}`}
-                    className="earnings-item"
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "1fr auto",
-                      gap: 6,
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                      background: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.08)",
-                      marginBottom: 10,
-                      alignItems: "center",
-                    }}
-                  >
-                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <button
-                          type="button"
-                          className="ticker-link"
-                          onClick={() => pick(r.symbol)}
-                          style={{ fontWeight: 800, letterSpacing: 0.2, fontSize: 16 }}
-                          title={`Load ${r.symbol}`}
-                        >
-                          {r.symbol}
-                        </button>
-                        <span
-                          style={{
-                            display: "inline-block",
-                            padding: "2px 8px",
-                            borderRadius: 999,
-                            background: badge.bg,
-                            border: `1px solid ${badge.border}`,
-                            color: badge.fg,
-                            fontSize: 11,
-                            lineHeight: 1.3,
-                          }}
-                          title="Session"
-                        >
-                          {badge.text}
-                        </span>
-                      </div>
-                      <div className="muted" style={{ fontSize: 12 }}>📅 {fmtDateHuman(r.date)}</div>
-                    </div>
-                    <div style={{ textAlign: "right", opacity: 0.7, fontSize: 18 }}>›</div>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        ) : (
-          <div className="muted" style={{ paddingTop: 6 }}>
-            No earnings found in this week window for your current universe.
-            <div style={{ fontSize: 12, opacity: .8, marginTop: 4 }}>
-              Tip: add more tickers to your Watchlist or raise <code>MAX_UNIVERSE</code>.
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* responsive + link styling */}
-      <style>{`
-        .hot-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; }
-        @media (min-width: 740px) { .hot-grid { grid-template-columns: repeat(2,1fr); } }
-
-        .earnings-table-wrap { display: none; }
-        .earnings-list { display: block; }
-        @media (min-width: 768px) {
-          .earnings-table-wrap { display: block; }
-          .earnings-list { display: none; }
-        }
-
-        .ticker-link{
-          background: transparent;
-          border: none;
-          padding: 0;
-          margin: 0;
-          cursor: pointer;
-          color: #a2c4ff;
-          text-decoration: underline;
-          text-underline-offset: 2px;
-          font: inherit;
-        }
-        .ticker-link:hover{
-          color: #d6e3ff;
-          text-shadow: 0 0 6px rgba(110,168,255,.45);
-          text-decoration-thickness: 2px;
-        }
-        .ticker-link:active{ opacity:.9; }
-      `}</style>
+      {children}
     </div>
   );
 }
 
-function MoversTable({ title, rows = [], onPick }) {
+function MoversTable({ title, rows = [], loading, error, onPick }) {
   return (
-    <div className="card" style={{ padding: 12, overflow: "hidden" }}>
-      <h4 style={{ marginTop: 0 }}>{title}</h4>
-
-      {rows.length ? (
-        <div className="table-wrap" style={{ overflowX: "hidden" }}>
-          <table
-            className="table"
-            style={{ width: "100%", tableLayout: "fixed", fontSize: 13 }}
-          >
+    <SectionCard
+      title={title}
+      right={loading ? <span className="muted">Loading…</span> : null}
+    >
+      {error ? (
+        <div className="muted" style={{ color: "#ff6b6b" }}>{error}</div>
+      ) : !rows?.length ? (
+        <div className="muted">No data.</div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table" style={{ width: "100%", tableLayout: "fixed", fontSize: 13 }}>
             <colgroup>
-              <col style={{ width: "25%" }} />
-              <col style={{ width: "25%" }} />
-              <col style={{ width: "25%" }} />
-              <col style={{ width: "25%" }} />
+              <col style={{ width: "28%" }} />
+              <col style={{ width: "24%" }} />
+              <col style={{ width: "24%" }} />
+              <col style={{ width: "24%" }} />
             </colgroup>
             <thead>
               <tr>
@@ -392,37 +72,27 @@ function MoversTable({ title, rows = [], onPick }) {
             </thead>
             <tbody>
               {rows.map((r, i) => {
-                const price = Number(r.price);
-                const pct = Number(r.change_pct);
-                const lastClose = Number(r.last_close);
-
-                const dollarChange =
-                  Number.isFinite(price) && Number.isFinite(lastClose)
-                    ? price - lastClose
-                    : Number.isFinite(price) && Number.isFinite(pct)
-                    ? (pct / 100) * price
-                    : NaN;
-
-                const isUp = Number.isFinite(dollarChange) ? dollarChange >= 0 : pct >= 0;
-
+                const sym = String(r?.symbol || r?.ticker || `#${i}`).toUpperCase();
+                const price = Number(r?.price);
+                const chg = Number(r?.change);
+                const pct = Number(r?.change_pct);
+                const up = Number.isFinite(chg) ? chg >= 0 : pct >= 0;
                 return (
-                  <tr key={`${r.symbol}-${i}`}>
+                  <tr key={`${sym}-${i}`}>
                     <td>
                       <button
                         type="button"
                         className="ticker-link"
-                        onClick={() => onPick?.(r.symbol)}
-                        title={`Load ${r.symbol}`}
+                        onClick={() => onPick?.(sym)}
+                        title={`Load ${sym}`}
                         style={{ fontWeight: 700 }}
                       >
-                        {r.symbol}
+                        {sym}
                       </button>
                     </td>
                     <td style={{ textAlign: "center" }}>{fmtMoney(price)}</td>
-                    <td style={{ textAlign: "center", color: isUp ? "#2e7d32" : "#c62828" }}>
-                      {Number.isFinite(dollarChange)
-                        ? `${dollarChange >= 0 ? "+" : ""}$${Math.abs(dollarChange).toFixed(2)}`
-                        : "—"}
+                    <td style={{ textAlign: "center", color: up ? "#2e7d32" : "#c62828" }}>
+                      {fmtSignMoney(chg)}
                     </td>
                     <td style={{ textAlign: "center", color: pct >= 0 ? "#2e7d32" : "#c62828" }}>
                       {fmtPct(pct)}
@@ -433,9 +103,174 @@ function MoversTable({ title, rows = [], onPick }) {
             </tbody>
           </table>
         </div>
-      ) : (
-        <div className="muted">No data.</div>
       )}
+
+      <style>{`
+        .ticker-link{
+          background: transparent; border: none; padding: 0; margin: 0;
+          cursor: pointer; color: #a2c4ff; text-decoration: underline; text-underline-offset: 2px; font: inherit;
+        }
+        .ticker-link:hover{
+          color: #d6e3ff; text-shadow: 0 0 6px rgba(110,168,255,.45); text-decoration-thickness: 2px;
+        }
+      `}</style>
+    </SectionCard>
+  );
+}
+
+export default function HotAndEarnings({ onSelectTicker }) {
+  const [loadingMovers, setLoadingMovers] = useState(true);
+  const [loadingEarnings, setLoadingEarnings] = useState(true);
+  const [errMovers, setErrMovers] = useState("");
+  const [errEarnings, setErrEarnings] = useState("");
+  const [gainers, setGainers] = useState([]);
+  const [losers, setLosers] = useState([]);
+  const [earnings, setEarnings] = useState([]);
+
+  // single click handler
+  const pick = (sym) => {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return;
+    if (typeof onSelectTicker === "function") onSelectTicker(s);
+    else window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      // Movers
+      setLoadingMovers(true);
+      setErrMovers("");
+      try {
+        const mv = await fetchMovers();
+        if (cancelled) return;
+
+        // sanitize arrays
+        const g = (Array.isArray(mv?.gainers) ? mv.gainers : []).filter(
+          (x) => Number.isFinite(Number(x?.price)) && Number.isFinite(Number(x?.change_pct))
+        );
+        const l = (Array.isArray(mv?.losers) ? mv.losers : []).filter(
+          (x) => Number.isFinite(Number(x?.price)) && Number.isFinite(Number(x?.change_pct))
+        );
+
+        setGainers(g.slice(0, 25));
+        setLosers(l.slice(0, 25));
+
+        if (!g.length && !l.length && mv?.error) {
+          setErrMovers(mv.error || "No movers returned.");
+        }
+      } catch (e) {
+        setErrMovers(e?.message || "Failed to load movers.");
+        setGainers([]);
+        setLosers([]);
+      } finally {
+        if (!cancelled) setLoadingMovers(false);
+      }
+
+      // Earnings week
+      setLoadingEarnings(true);
+      setErrEarnings("");
+      try {
+        const wk = await fetchEarningsWeek();
+        if (cancelled) return;
+        const items = Array.isArray(wk?.items) ? wk.items : [];
+        // basic shape: {date, symbol, name, session}
+        setEarnings(items.slice(0, 400));
+        if (!items.length && wk?.error) {
+          setErrEarnings(wk.error);
+        }
+      } catch (e) {
+        setErrEarnings(e?.message || "Failed to load earnings.");
+        setEarnings([]);
+      } finally {
+        if (!cancelled) setLoadingEarnings(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, []);
+
+  const earningsByDate = useMemo(() => {
+    const m = new Map();
+    for (const row of earnings) {
+      const k = row?.date || "";
+      if (!k) continue;
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(row);
+    }
+    return Array.from(m.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, rows]) => ({ date, rows: rows.sort((a, b) => (a.symbol || "").localeCompare(b.symbol || "")) }));
+  }, [earnings]);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 8, marginBottom: 8 }}>
+      <SectionCard title="🔥 Hot Stocks Today" />
+      <MoversTable
+        title="Top 25 Gainers"
+        rows={gainers}
+        loading={loadingMovers}
+        error={errMovers}
+        onPick={pick}
+      />
+      <MoversTable
+        title="Top 25 Losers"
+        rows={losers}
+        loading={loadingMovers}
+        error={errMovers}
+        onPick={pick}
+      />
+
+      <SectionCard
+        title="Earnings (This Week)"
+        right={loadingEarnings ? <span className="muted">Loading…</span> : null}
+      >
+        {errEarnings ? (
+          <div className="muted" style={{ color: "#ff6b6b" }}>{errEarnings}</div>
+        ) : !earningsByDate.length ? (
+          <div className="muted">No earnings found (check FINNHUB_API_KEY on the backend).</div>
+        ) : (
+          <div className="table-wrap">
+            <table className="table" style={{ width: "100%", tableLayout: "fixed", fontSize: 13 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left" }}>Date</th>
+                  <th style={{ textAlign: "center" }}>Ticker</th>
+                  <th style={{ textAlign: "center" }}>Session</th>
+                </tr>
+              </thead>
+              <tbody>
+                {earningsByDate.map(({ date, rows }) => (
+                  <tr key={date}>
+                    <td colSpan={3} style={{ padding: "10px 0 6px", fontWeight: 700 }}>
+                      {fmtDateHuman(date)}
+                    </td>
+                  </tr>
+                )).length ? null : null}
+                {earningsByDate.flatMap(({ date, rows }) =>
+                  rows.map((r, i) => (
+                    <tr key={`${date}-${r.symbol}-${i}`}>
+                      <td>{fmtDateHuman(date)}</td>
+                      <td style={{ textAlign: "center", fontWeight: 700 }}>
+                        <button
+                          type="button"
+                          className="ticker-link"
+                          onClick={() => pick(r.symbol)}
+                          title={`Load ${r.symbol}`}
+                        >
+                          {r.symbol}
+                        </button>
+                      </td>
+                      <td style={{ textAlign: "center" }}>{(r.session || "—").toUpperCase()}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </SectionCard>
     </div>
   );
 }

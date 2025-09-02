@@ -248,3 +248,19 @@ export async function fetchEarningsWeek() {
   const url = buildURL("/earnings_week");
   return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
 }
+
+export async function fetchMovers() {
+  const url = new URL(`${API_BASE}/movers`);
+  url.searchParams.set("_ts", Date.now().toString());
+  const res = await fetch(url, { headers: { Accept: "application/json", "Cache-Control": "no-cache", Pragma: "no-cache" }, cache: "no-store" });
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+export async function fetchEarningsWeek() {
+  const url = new URL(`${API_BASE}/earnings_week`);
+  url.searchParams.set("_ts", Date.now().toString());
+  const res = await fetch(url, { headers: { Accept: "application/json", "Cache-Control": "no-cache", Pragma: "no-cache" }, cache: "no-store" });
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
