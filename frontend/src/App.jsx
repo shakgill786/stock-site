@@ -71,38 +71,9 @@ const addBusinessDays = (start, n) => {
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
-/** ===== Tail de-dupe helpers (fix duplicate final day) ===== */
-const dropDupTailSeries = (dates = [], closes = []) => {
-  const n = Math.min(dates.length, closes.length);
-  if (n >= 2) {
-    const sameVal = Number(closes[n - 1]) === Number(closes[n - 2]);
-    const diffDate = String(dates[n - 1]) !== String(dates[n - 2]);
-    if (sameVal && diffDate) {
-      return {
-        dates: dates.slice(0, n - 1),
-        closes: closes.slice(0, n - 1),
-        dropped: true,
-      };
-    }
-  }
-  return { dates, closes, dropped: false };
-};
-
-const dropDupTailHistory = (rows = []) => {
-  const n = rows.length;
-  if (n >= 2) {
-    const a = Number(rows[n - 1]?.actual);
-    const b = Number(rows[n - 2]?.actual);
-    const dA = String(rows[n - 1]?.date || "");
-    const dB = String(rows[n - 2]?.date || "");
-    if (dA !== dB && Number.isFinite(a) && Number.isFinite(b) && a === b) {
-      return rows.slice(0, n - 1);
-    }
-  }
-  return rows;
-};
-
-// If we have a quote, force the last daily close to match the official last_close
+// ---------- sanitize helper for closes ----------
+// Do NOT drop the last row just because the last two prices are equal;
+// only pin last close (from quote) and trust backend to exclude "today".
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
   let outCloses = Array.isArray(closes) ? [...closes] : [];
@@ -111,13 +82,17 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   }
 
   const lastIdx = outCloses.length - 1;
-  if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
+
+  // If we have a quote, force the last daily close to match the official last_close
+  if (
+    lastIdx >= 0 &&
+    quote &&
+    Number.isFinite(Number(quote.last_close))
+  ) {
     outCloses[lastIdx] = Number(quote.last_close);
   }
 
-  // Then drop obvious duplicated tail (different dates, identical closes)
-  const dropped = dropDupTailSeries(outDates, outCloses);
-  return { dates: dropped.dates, closes: dropped.closes };
+  return { dates: outDates, closes: outCloses };
 }
 
 export default function App() {
@@ -212,10 +187,10 @@ export default function App() {
     [historyRows]
   );
 
+  // ---------- Atomic data load (prevents flicker & racing) ----------
   const loadData = useCallback(async () => {
-    const myVer = ++reqVer.current; // this run's token
+    const myVer = ++reqVer.current;
 
-    // Reset errors (keep existing data visible during refresh)
     setError("");
     setDiagnostic("");
     setQuoteErr(false);
@@ -224,117 +199,119 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // 1) Quote — awaitable
-    const pQuote = (async () => {
-      try {
-        const q = await fetchQuote(t);
-        if (reqVer.current !== myVer) return null;
-        setQuote(q);
-        prevPriceRef.current = q.current_price;
-        return q;
-      } catch {
-        if (reqVer.current !== myVer) return null;
-        setQuoteErr(true);
-        setDiagnostic((d) => d || `Quote fetch failed for ${t}.`);
-        return null;
-      }
-    })();
+    // retain previous good state in case a request returns empty
+    const prev = { quote, earnings, market, closes, closeDates, historyRows, results };
 
-    // 2) Earnings
-    const pEarn = (async () => {
-      try {
-        const e = await fetchEarnings(t);
-        if (reqVer.current !== myVer) return;
-        setEarnings(e);
-      } catch {
-        if (reqVer.current !== myVer) return;
-        setEarningsErr(true);
-      }
-    })();
+    // next state containers
+    let nextQuote = null;
+    let nextEarnings = prev.earnings;
+    let nextMarket = prev.market;
+    let nextCloses = prev.closes;
+    let nextCloseDates = prev.closeDates;
+    let nextHistoryRows = prev.historyRows;
+    let nextResults = prev.results;
+    let nextDiagnostic = "";
 
-    // 3) Market
-    const pMkt = (async () => {
-      try {
-        const m = await fetchMarket();
-        if (reqVer.current !== myVer) return;
-        setMarket(m);
-      } catch {
-        /* ignore */
-      }
-    })();
-
-    // 3.5) Closes (align with quote + drop duplicate tail)
-    const pCloses = (async () => {
-      try {
-        const raw = await fetchClosesSafe(t);
-        if (reqVer.current !== myVer) return;
-        const q = await pQuote.catch(() => null);
-
-        const { dates, closes } = sanitizeClosesWithQuote({
-          dates: raw?.dates || [],
-          closes: raw?.closes || [],
-          quote: q,
-        });
-
-        if (!closes?.length) {
-          setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
-        }
-
-        setCloses(closes || []);
-        setCloseDates(dates || []);
-      } catch {
-        if (reqVer.current !== myVer) return;
-        setDiagnostic((dMsg) => dMsg || `Failed to load historical prices for ${t}.`);
-      }
-    })();
-
-    // 4) Past backtest rows (drop duplicate tail if backend repeats it)
-    const pHist = (async () => {
-      try {
-        const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
-        if (reqVer.current !== myVer) return;
-        const safeRows = dropDupTailHistory(hist?.rows || []);
-        setHistoryRows(safeRows);
-      } catch {
-        if (reqVer.current !== myVer) return;
-        setHistoryRows([]);
-      }
-    })();
-
-    // 5) Current forward predictions
-    const pPredict = (async () => {
-      try {
-        const res = await fetchPredict({ ticker: t, models });
-        if (reqVer.current !== myVer) return;
-        const got = Array.isArray(res?.results) ? res.results : [];
-        setResults(got);
-        if (!got.length) {
-          const msg = res?.message || res?.detail || "No predictions returned.";
-          setDiagnostic((d) => d || `${msg} (${t})`);
-        }
-      } catch (e) {
-        if (reqVer.current !== myVer) return;
-        const msg = e?.message || "Prediction fetch failed";
-        setError(msg);
-        setDiagnostic((d) => d || `${msg} (${t})`);
-      }
-    })();
-
-    await Promise.all([pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
-
-    if (reqVer.current === myVer) {
-      setLoading(false);
+    // 1) Quote
+    try {
+      const q = await fetchQuote(t);
+      if (reqVer.current !== myVer) return;
+      nextQuote = q;
+      prevPriceRef.current = q.current_price;
+    } catch {
+      if (reqVer.current !== myVer) return;
+      setQuoteErr(true);
+      nextDiagnostic ||= `Quote fetch failed for ${t}.`;
     }
-  }, [ticker, models]);
+
+    // 2) Closes
+    try {
+      const raw = await fetchClosesSafe(t);
+      if (reqVer.current !== myVer) return;
+
+      const { dates, closes } = sanitizeClosesWithQuote({
+        dates: raw?.dates || [],
+        closes: raw?.closes || [],
+        quote: nextQuote,
+      });
+
+      if (Array.isArray(closes) && closes.length >= 2 && dates.length === closes.length) {
+        nextCloses = closes;
+        nextCloseDates = dates;
+      } else {
+        nextDiagnostic ||= `No historical price series available for ${t}.`;
+      }
+    } catch {
+      if (reqVer.current !== myVer) return;
+      nextDiagnostic ||= `Failed to load historical prices for ${t}.`;
+    }
+
+    // 3) Predict history
+    try {
+      const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
+      if (reqVer.current !== myVer) return;
+      nextHistoryRows = Array.isArray(hist?.rows) ? hist.rows : [];
+    } catch {
+      if (reqVer.current !== myVer) return;
+    }
+
+    // 4) Predictions
+    try {
+      const res = await fetchPredict({ ticker: t, models });
+      if (reqVer.current !== myVer) return;
+      const got = Array.isArray(res?.results) ? res.results : [];
+      if (got.length) {
+        nextResults = got;
+      } else {
+        nextDiagnostic ||= `No predictions returned. (${t})`;
+      }
+    } catch (e) {
+      if (reqVer.current !== myVer) return;
+      const msg = e?.message || "Prediction fetch failed";
+      setError(msg);
+      nextDiagnostic ||= `${msg} (${t})`;
+    }
+
+    // 5) Earnings & Market (best-effort)
+    try {
+      const e = await fetchEarnings(t);
+      if (reqVer.current !== myVer) return;
+      nextEarnings = e;
+    } catch {
+      if (reqVer.current !== myVer) return;
+      setEarningsErr(true);
+    }
+
+    try {
+      const m = await fetchMarket();
+      if (reqVer.current !== myVer) return;
+      nextMarket = m;
+    } catch {
+      /* ignore */
+    }
+
+    // Commit atomically
+    if (reqVer.current !== myVer) return;
+    setQuote(nextQuote || prev.quote);
+    setCloses(nextCloses);
+    setCloseDates(nextCloseDates);
+    setHistoryRows(nextHistoryRows);
+    setResults(nextResults);
+    setEarnings(nextEarnings);
+    setMarket(nextMarket);
+    setDiagnostic(nextDiagnostic);
+    setLoading(false);
+  }, [ticker, models, quote, earnings, market, closes, closeDates, historyRows, results]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Live SSE: only updates the quote card smoothly
-  const streamUrl = live
-    ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5`
-    : null;
+  // Live SSE: pause while loading to avoid race with atomic load
+  const streamUrl =
+    live && !loading
+      ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5`
+      : null;
 
   useEventSource(streamUrl, {
     enabled: !!streamUrl,
@@ -374,7 +351,6 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -433,7 +409,7 @@ export default function App() {
     return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
 
-  // Force the last past day's Actual to the official last_close
+  // Ensure the last past "Actual" uses the official last_close for consistency
   const actualForPastLabels = (() => {
     const arr = [...actualForPastLabelsRaw];
     const lastIdx = arr.length - 1;
@@ -542,7 +518,7 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : (row?.actual ?? null);
 
-    // last past row uses quote.last_close
+    // last past row uses quote.last_close (just to be extra consistent)
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -725,13 +701,25 @@ export default function App() {
           )}
 
           {/* --- Actual vs Predicted (chart + table) --- */}
-          {results.length > 0 && closes.length >= 2 && (
+          {(results.length > 0 || loading) && closes.length >= 2 && (
             <div className="card" style={{ marginTop: 12 }}>
-              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
+              <h3 style={{ marginTop: 0 }}>
+                Actual vs. Predicted
+                {loading && (
+                  <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+                    refreshing…
+                  </span>
+                )}
+              </h3>
 
               {/* Chart */}
               <div style={{ height: 260, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.03)", padding: 8 }}>
-                <Chart type="line" data={avpChartData} options={avpChartOptions} />
+                <Chart
+                  key={`avp-${ticker}-${pastLabels[0] || "none"}-${pastLabels[pastLabels.length - 1] || "none"}-${horizon}`}
+                  type="line"
+                  data={avpChartData}
+                  options={avpChartOptions}
+                />
               </div>
 
               {/* Table */}
