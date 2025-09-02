@@ -67,10 +67,10 @@ function buildURL(path, params) {
   return url;
 }
 
-function withTimeout(fetchPromise, ms) {
+function withTimeout(fetcher, ms) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(new DOMException("Timeout", "TimeoutError")), ms);
-  return fetchPromise(ctrl.signal).finally(() => clearTimeout(id));
+  return fetcher(ctrl.signal).finally(() => clearTimeout(id));
 }
 
 // Wrap fetch with small retry on network/5xx/429 + timeout
@@ -223,7 +223,7 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
   return url.toString();
 }
 
-// ---------- Movers / Earnings week (missing in older file) ----------
+// ---------- Movers / Earnings week ----------
 
 /** Combined movers (gainers + losers) */
 export async function fetchMovers() {
@@ -243,24 +243,8 @@ export async function fetchTopLosers() {
   return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
 }
 
-/** Earnings calendar for this week */
+/** Earnings calendar for this week (Mon–Sun) */
 export async function fetchEarningsWeek() {
   const url = buildURL("/earnings_week");
   return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
-}
-
-export async function fetchMovers() {
-  const url = new URL(`${API_BASE}/movers`);
-  url.searchParams.set("_ts", Date.now().toString());
-  const res = await fetch(url, { headers: { Accept: "application/json", "Cache-Control": "no-cache", Pragma: "no-cache" }, cache: "no-store" });
-  const text = await res.text();
-  return text ? JSON.parse(text) : {};
-}
-
-export async function fetchEarningsWeek() {
-  const url = new URL(`${API_BASE}/earnings_week`);
-  url.searchParams.set("_ts", Date.now().toString());
-  const res = await fetch(url, { headers: { Accept: "application/json", "Cache-Control": "no-cache", Pragma: "no-cache" }, cache: "no-store" });
-  const text = await res.text();
-  return text ? JSON.parse(text) : {};
 }
