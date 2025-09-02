@@ -12,6 +12,7 @@ from app.services.finance_service import (
     get_earnings,
     get_market_breadth,
     get_daily_closes_with_dates,
+    get_daily_closes,            # <-- add this import for predict() fallback
     get_52w_stats,
 )
 
@@ -36,15 +37,13 @@ def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List
         try:
             dt = date.fromisoformat(str(d)[:10])
         except Exception:
-            out_d.append(str(d)[:10])
-            out_c.append(float(c))
+            out_d.append(str(d)[:10]); out_c.append(float(c))
             continue
 
         dow = dt.weekday()  # 0=Mon..6=Sun
         if dow >= 5 or dt.isoformat() == today_iso:  # weekend or today
             continue
-        out_d.append(dt.isoformat())
-        out_c.append(float(c))
+        out_d.append(dt.isoformat()); out_c.append(float(c))
     return out_d, out_c
 
 def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
@@ -115,6 +114,26 @@ def _alpha_to_common(item: dict) -> dict:
     name = item.get("ticker") or sym  # AV doesn’t include company name here
     return {"symbol": sym, "price": price, "change": change, "change_pct": change_pct, "name": name}
 
+# Universe for fallback movers (env POPULAR_TICKERS or this default)
+_FALLBACK_UNIVERSE = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","NFLX","AMD",
+    "JPM","V","MA","XOM","CVX","WMT","HD","PG","KO","PEP",
+    "UNH","JNJ","LLY","PFE","BAC","C","GS","MS","CSCO","ORCL",
+    "ADBE","CRM","QCOM","TXN","INTC","T","VZ","DIS","NKE","COST",
+    "MCD","ABT","TMO","UPS","LOW","IBM","CAT","HON","BA","PYPL",
+    "AMAT","MU","NOW","SHOP","PLTR","UBER","ABNB","MRNA","SQ","ROKU",
+    "SNOW","ZS","CRWD","PANW","SMCI","DE","GM","F","FDX","LMT",
+    "GE","MMM","MDLZ","MO","PM","BKNG","AXP","ADP","SPGI","ICE"
+]
+
+def _universe_from_env() -> List[str]:
+    raw = os.getenv("POPULAR_TICKERS", "")
+    if raw.strip():
+        toks = [t.strip().upper() for t in raw.split(",") if t.strip()]
+        if toks:
+            return toks[:200]
+    return _FALLBACK_UNIVERSE
+
 # ----------------------- routes -----------------------
 @router.get("/hello")
 async def say_hello():
@@ -135,9 +154,29 @@ class PredictResponse(BaseModel):
 
 @router.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest):
-    # simple deterministic demo predictions based on current price
-    random.seed(req.ticker.upper())
-    base = float(get_quote(req.ticker)["current_price"])
+    """
+    Generates simple demo predictions based on current price.
+    Robust to quote failures by falling back to last historical close.
+    """
+    symbol = req.ticker.upper().strip()
+
+    # Base price with safe fallback
+    base: Optional[float] = None
+    try:
+        q = get_quote(symbol)
+        base = float(q.get("current_price"))
+    except Exception:
+        try:
+            closes = get_daily_closes(symbol, 5)  # prefer 5 in case of missing days
+            if closes:
+                base = float(closes[-1])
+        except Exception:
+            pass
+    if base is None:
+        base = 100.0  # ultra-safe fallback so UI never dies
+
+    # deterministic predictions per model
+    random.seed(symbol)
     results: List[ModelPrediction] = []
     for m in req.models:
         preds = [round(base * (1 + random.uniform(-0.05, 0.05)), 2) for _ in range(7)]
@@ -155,13 +194,13 @@ async def predict_history(
     """
     For each of the last `days` TARGET DATES (most-recent last), return:
       - actual close on that date
-      - what each model *would have predicted for that date* using only data up to the prior trading day
+      - what each model would have predicted for that date using only data up to the prior trading day
     """
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
     models = _normalize_models_param(models)
 
-    # Need (days + 1) closes so we can predict each target from the previous day.
+    # Need (days + padding) closes so we can predict each target from the previous day.
     series = get_daily_closes_with_dates(symbol, days + 40)
     dates: List[str] = list(series.get("dates") or [])
     closes: List[float] = list(series.get("closes") or [])
@@ -200,8 +239,8 @@ async def predict_history(
             pred_map[m] = pred_val
             err_map[m] = round(((pred_val - actual) / (actual if actual else 1.0)) * 100.0, 2)
 
-        flat: Dict[str, Any] = {m: pred_map.get(m, None) for m in models}
-        flat_err: Dict[str, Any] = {f"{m}_err_pct": err_map.get(m, None) for m in models}
+        flat = {m: pred_map.get(m, None) for m in models}
+        flat_err = {f"{m}_err_pct": err_map.get(m, None) for m in models}
 
         row = {
             "date": target_date,
@@ -209,9 +248,9 @@ async def predict_history(
             "actual": round(actual, 2),
             "pred": pred_map,
             "error_pct": err_map,
+            **flat,
+            **flat_err,
         }
-        row.update(flat)
-        row.update(flat_err)
         rows.append(row)
 
     return {"ticker": symbol, "models": models, "rows": rows}
@@ -283,8 +322,7 @@ async def stats_endpoint(ticker: str):
     # Try service first
     try:
         stats = get_52w_stats(symbol) or {}
-        hi = stats.get("high_52w")
-        lo = stats.get("low_52w")
+        hi = stats.get("high_52w"); lo = stats.get("low_52w")
         if isinstance(hi, (int, float)) and isinstance(lo, (int, float)):
             hi = float(hi); lo = float(lo)
             return {
@@ -314,7 +352,7 @@ async def stats_endpoint(ticker: str):
     except Exception:
         pass
 
-    # As a last resort, return placeholders (prevents UI crash)
+    # As a last resort, placeholders
     return {
         "ticker": symbol,
         "high_52w": None, "low_52w": None,
@@ -328,25 +366,80 @@ async def movers():
     """
     Returns both gainers and losers:
     { "gainers": [...], "losers": [...] }
+    Tries Alpha Vantage; if missing/empty/rate-limited, falls back to computing
+    movers from a local universe via get_quote().
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
-    if not key:
-        return {"gainers": [], "losers": [], "error": "ALPHAVANTAGE_API_KEY missing"}
+    got_any = False
+    out_gainers: List[Dict[str, Any]] = []
+    out_losers: List[Dict[str, Any]] = []
 
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
+    # ---- Try Alpha Vantage ----
+    if key:
+        try:
+            url = "https://www.alphavantage.co/query"
+            params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(url, params=params)
+                data = r.json() if r.content else {}
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, params=params)
-        data = r.json() if r.content else {}
+            gainers_raw = data.get("top_gainers") or []
+            losers_raw = data.get("top_losers") or []
 
-    gainers_raw = data.get("top_gainers") or []
-    losers_raw = data.get("top_losers") or []
+            out_gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
+            out_losers  = [_alpha_to_common(x) for x in losers_raw][:25]
 
-    gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
-    losers = [_alpha_to_common(x) for x in losers_raw][:25]
+            # Consider it valid only if we have at least a few rows with numbers
+            def _valid(rows):
+                k = 0
+                for x in rows:
+                    if isinstance(x.get("price"), (int, float)) and isinstance(x.get("change_pct"), (int, float)):
+                        k += 1
+                    if k >= 5:
+                        return True
+                return False
 
-    return {"gainers": gainers, "losers": losers}
+            if _valid(out_gainers) or _valid(out_losers):
+                got_any = True
+        except Exception:
+            pass
+
+    # ---- Fallback via quotes if AV failed/missing ----
+    if not got_any:
+        universe = _universe_from_env()
+        rows: List[Dict[str, Any]] = []
+
+        # We’ll do simple parallelism by offloading get_quote (blocking requests) to threads.
+        async def fetch_one(sym: str) -> Optional[Dict[str, Any]]:
+            try:
+                # run blocking get_quote in a thread
+                q = await asyncio.to_thread(get_quote, sym)
+                price = float(q.get("current_price"))
+                last = float(q.get("last_close"))
+                pct = float(q.get("change_pct"))
+                change = price - last if (price is not None and last is not None) else None
+                if not (isinstance(price, float) and isinstance(pct, float)):
+                    return None
+                return {"symbol": sym, "price": price, "change": change, "change_pct": pct}
+            except Exception:
+                return None
+
+        # Limit concurrency so we don't hammer providers
+        sem = asyncio.Semaphore(12)
+
+        async def guarded(sym: str):
+            async with sem:
+                return await fetch_one(sym)
+
+        tasks = [guarded(s) for s in universe]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        rows = [r for r in results if r and isinstance(r.get("price"), float)]
+
+        rows.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
+        out_gainers = rows[:25]
+        out_losers = list(reversed(rows[-25:] if len(rows) >= 25 else rows[:25]))
+
+    return {"gainers": out_gainers, "losers": out_losers, **({} if got_any else {"source": "fallback"})}
 
 @router.get("/top_gainers")
 async def top_gainers():
