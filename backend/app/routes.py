@@ -12,7 +12,7 @@ from app.services.finance_service import (
     get_earnings,
     get_market_breadth,
     get_daily_closes_with_dates,
-    get_daily_closes,            # <-- add this import for predict() fallback
+    get_daily_closes,            # fallback base for predict()
     get_52w_stats,
 )
 
@@ -366,80 +366,101 @@ async def movers():
     """
     Returns both gainers and losers:
     { "gainers": [...], "losers": [...] }
-    Tries Alpha Vantage; if missing/empty/rate-limited, falls back to computing
-    movers from a local universe via get_quote().
+
+    Strategy:
+      1) Twelve Data batch /quote for a ticker universe (fast).
+      2) Alpha Vantage TOP_GAINERS_LOSERS.
+      3) Fallback via get_quote() over a small universe with limited concurrency.
     """
-    key = os.getenv("ALPHAVANTAGE_API_KEY")
-    got_any = False
-    out_gainers: List[Dict[str, Any]] = []
-    out_losers: List[Dict[str, Any]] = []
+    td_key = os.getenv("TWELVEDATA_API_KEY")
+    av_key = os.getenv("ALPHAVANTAGE_API_KEY")
 
-    # ---- Try Alpha Vantage ----
-    if key:
+    # ---------- 1) Twelve Data batch (preferred & fast) ----------
+    if td_key:
         try:
-            url = "https://www.alphavantage.co/query"
-            params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(url, params=params)
+            symbols = _universe_from_env()[:80]  # keep tight for speed
+            all_rows: List[Dict[str, Any]] = []
+
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                # TD handles comma-separated symbols; chunk to be safe
+                for i in range(0, len(symbols), 60):
+                    chunk = symbols[i:i+60]
+                    r = await client.get(
+                        "https://api.twelvedata.com/quote",
+                        params={"symbol": ",".join(chunk), "apikey": td_key},
+                    )
+                    js = r.json() if r.content else {}
+                    # When multiple symbols: TD returns { "AAPL": {...}, "MSFT": {...}, ... }
+                    if isinstance(js, dict):
+                        for sym in chunk:
+                            info = js.get(sym) or {}
+                            # If TD returns error for some symbols, they may be missing
+                            try:
+                                price = float(info.get("close"))
+                                prev  = float(info.get("previous_close", price))
+                                chg   = price - prev
+                                pct   = 0.0 if prev == 0 else ((price - prev) / prev * 100.0)
+                                all_rows.append({
+                                    "symbol": sym,
+                                    "price": round(price, 2),
+                                    "change": round(chg, 2),
+                                    "change_pct": round(pct, 2),
+                                })
+                            except Exception:
+                                continue
+
+            clean = [x for x in all_rows if isinstance(x.get("price"), (int, float))]
+            clean.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
+            gainers = clean[:25]
+            losers  = list(reversed(clean[-25:])) if len(clean) >= 25 else clean[:25]
+            return {"gainers": gainers, "losers": losers, "source": "twelvedata"}
+        except Exception:
+            # fall through
+            pass
+
+    # ---------- 2) Alpha Vantage (quick when key present) ----------
+    if av_key:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                r = await client.get(
+                    "https://www.alphavantage.co/query",
+                    params={"function": "TOP_GAINERS_LOSERS", "apikey": av_key},
+                )
                 data = r.json() if r.content else {}
-
             gainers_raw = data.get("top_gainers") or []
-            losers_raw = data.get("top_losers") or []
+            losers_raw  = data.get("top_losers") or []
+            gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
+            losers  = [_alpha_to_common(x) for x in losers_raw][:25]
 
-            out_gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
-            out_losers  = [_alpha_to_common(x) for x in losers_raw][:25]
-
-            # Consider it valid only if we have at least a few rows with numbers
-            def _valid(rows):
-                k = 0
-                for x in rows:
-                    if isinstance(x.get("price"), (int, float)) and isinstance(x.get("change_pct"), (int, float)):
-                        k += 1
-                    if k >= 5:
-                        return True
-                return False
-
-            if _valid(out_gainers) or _valid(out_losers):
-                got_any = True
+            # Accept only if we got something numeric
+            if (any(isinstance(g.get("price"), (int, float)) for g in gainers) or
+                any(isinstance(l.get("price"), (int, float)) for l in losers)):
+                return {"gainers": gainers, "losers": losers, "source": "alphavantage"}
         except Exception:
             pass
 
-    # ---- Fallback via quotes if AV failed/missing ----
-    if not got_any:
-        universe = _universe_from_env()
-        rows: List[Dict[str, Any]] = []
+    # ---------- 3) Fallback via get_quote() (limit universe + concurrency) ----------
+    symbols = _universe_from_env()[:40]  # keep small so it returns fast
+    sem = asyncio.Semaphore(10)
 
-        # We’ll do simple parallelism by offloading get_quote (blocking requests) to threads.
-        async def fetch_one(sym: str) -> Optional[Dict[str, Any]]:
+    async def fetch_one(sym: str):
+        async with sem:
             try:
-                # run blocking get_quote in a thread
                 q = await asyncio.to_thread(get_quote, sym)
                 price = float(q.get("current_price"))
-                last = float(q.get("last_close"))
-                pct = float(q.get("change_pct"))
-                change = price - last if (price is not None and last is not None) else None
-                if not (isinstance(price, float) and isinstance(pct, float)):
-                    return None
-                return {"symbol": sym, "price": price, "change": change, "change_pct": pct}
+                prev  = float(q.get("last_close"))
+                pct   = float(q.get("change_pct"))
+                chg   = price - prev
+                return {"symbol": sym, "price": round(price,2),
+                        "change": round(chg,2), "change_pct": round(pct,2)}
             except Exception:
                 return None
 
-        # Limit concurrency so we don't hammer providers
-        sem = asyncio.Semaphore(12)
-
-        async def guarded(sym: str):
-            async with sem:
-                return await fetch_one(sym)
-
-        tasks = [guarded(s) for s in universe]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        rows = [r for r in results if r and isinstance(r.get("price"), float)]
-
-        rows.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
-        out_gainers = rows[:25]
-        out_losers = list(reversed(rows[-25:] if len(rows) >= 25 else rows[:25]))
-
-    return {"gainers": out_gainers, "losers": out_losers, **({} if got_any else {"source": "fallback"})}
+    rows = [r for r in await asyncio.gather(*(fetch_one(s) for s in symbols)) if r]
+    rows.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
+    gainers = rows[:25]
+    losers  = list(reversed(rows[-25:])) if len(rows) >= 25 else rows[:25]
+    return {"gainers": gainers, "losers": losers, "source": "local"}
 
 @router.get("/top_gainers")
 async def top_gainers():

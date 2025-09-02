@@ -35,7 +35,8 @@ if (typeof window !== "undefined") {
 // -------- fetch helpers --------
 const DEFAULT_RETRIES = 1; // extra attempts after the first
 const RETRY_DELAY_MS = 350;
-const REQUEST_TIMEOUT_MS = 10000; // 10s network timeout
+const REQUEST_TIMEOUT_MS = 10000; // default 10s
+const LONG_TIMEOUT_MS = 20000; // 20s for heavy endpoints
 
 const defaultGetHeaders = {
   "Cache-Control": "no-cache",
@@ -74,13 +75,14 @@ function withTimeout(fetcher, ms) {
 }
 
 // Wrap fetch with small retry on network/5xx/429 + timeout
-async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
+// NOTE: allow custom timeout per call
+async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES, timeoutMs = REQUEST_TIMEOUT_MS) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await withTimeout(
         (signal) => fetch(url, { ...options, signal }),
-        REQUEST_TIMEOUT_MS
+        timeoutMs
       );
       // Retry on 429/5xx
       if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
@@ -148,7 +150,8 @@ export async function fetchPredict({ ticker, models }) {
         body: JSON.stringify({ ticker, models }),
         cache: "no-store",
       },
-      DEFAULT_RETRIES
+      DEFAULT_RETRIES,
+      LONG_TIMEOUT_MS // <-- give predictions more room
     )
   );
 }
@@ -228,7 +231,14 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
 /** Combined movers (gainers + losers) */
 export async function fetchMovers() {
   const url = buildURL("/movers");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(
+    await fetchWithRetry(
+      url,
+      { headers: defaultGetHeaders, cache: "no-store" },
+      DEFAULT_RETRIES,
+      LONG_TIMEOUT_MS // <-- movers can fan out; allow more time
+    )
+  );
 }
 
 /** Convenience: only top gainers */
