@@ -12,7 +12,7 @@ from app.services.finance_service import (
     get_earnings,
     get_market_breadth,
     get_daily_closes_with_dates,
-    get_daily_closes,            # fallback base for predict()
+    get_daily_closes,  # used by movers fallback + predict() fallback
     get_52w_stats,
 )
 
@@ -20,12 +20,11 @@ router = APIRouter()
 
 # ----------------------- helpers -----------------------
 def _is_crypto(symbol: str) -> bool:
-    s = (symbol or "").upper()
-    return "-" in s  # crude heuristic: BTC-USD, ETH-USD, etc.
+    return "-" in (symbol or "").upper()  # BTC-USD etc.
 
 def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List[str], List[float]]:
     """
-    Drop weekends and 'today' for equities so we only keep completed trading days.
+    Drop weekends and 'today' for equities so we keep only completed trading days.
     Assumes dates are ISO strings (YYYY-MM-DD), most-recent last.
     """
     if not dates or not closes or len(dates) != len(closes):
@@ -155,8 +154,8 @@ class PredictResponse(BaseModel):
 @router.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest):
     """
-    Generates simple demo predictions based on current price.
-    Robust to quote failures by falling back to last historical close.
+    Demo predictions based on current price.
+    Robust to quote failures by falling back to last available historical close.
     """
     symbol = req.ticker.upper().strip()
 
@@ -167,7 +166,7 @@ async def predict(req: PredictRequest):
         base = float(q.get("current_price"))
     except Exception:
         try:
-            closes = get_daily_closes(symbol, 5)  # prefer 5 in case of missing days
+            closes = get_daily_closes(symbol, 5)
             if closes:
                 base = float(closes[-1])
         except Exception:
@@ -200,12 +199,10 @@ async def predict_history(
     days = max(1, min(int(days), 60))
     models = _normalize_models_param(models)
 
-    # Need (days + padding) closes so we can predict each target from the previous day.
     series = get_daily_closes_with_dates(symbol, days + 40)
     dates: List[str] = list(series.get("dates") or [])
     closes: List[float] = list(series.get("closes") or [])
 
-    # Calendar filtering for equities (skip weekends and today)
     if not _is_crypto(symbol):
         dates, closes = _filter_equity_calendar(dates, closes)
 
@@ -213,14 +210,11 @@ async def predict_history(
     if n < 2:
         return {"ticker": symbol, "models": models, "rows": []}
 
-    # Pin the most recent actual to the quote's last_close for consistency
     _pin_last_close(symbol, dates, closes)
 
-    # Build rows keyed by TARGET DATE i (predicted using i-1)
     indices = list(range(1, n))
     targets = indices[-days:]
 
-    # deterministic biases per model so backtest lines differ a bit
     model_bias = {"LSTM": 0.0020, "ARIMA": 0.0, "RandomForest": -0.0010, "XGBoost": 0.0015}
 
     rows: List[Dict[str, Any]] = []
@@ -366,101 +360,110 @@ async def movers():
     """
     Returns both gainers and losers:
     { "gainers": [...], "losers": [...] }
-
     Strategy:
-      1) Twelve Data batch /quote for a ticker universe (fast).
-      2) Alpha Vantage TOP_GAINERS_LOSERS.
-      3) Fallback via get_quote() over a small universe with limited concurrency.
+      1) Try Alpha Vantage TOP_GAINERS_LOSERS (fast when available)
+      2) Fallback with a hard time budget:
+         - Cap universe size
+         - For each symbol: try get_quote (2.5s), else get_daily_closes(3) (2.5s)
+         - Overall wall time capped (~12s)
+    Always returns quickly with best-effort partial data.
     """
-    td_key = os.getenv("TWELVEDATA_API_KEY")
-    av_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    key = os.getenv("ALPHAVANTAGE_API_KEY")
+    out_gainers: List[Dict[str, Any]] = []
+    out_losers: List[Dict[str, Any]] = []
+    used_source = "alphavantage"
 
-    # ---------- 1) Twelve Data batch (preferred & fast) ----------
-    if td_key:
+    # ---- 1) Alpha Vantage fast path ----
+    if key:
         try:
-            symbols = _universe_from_env()[:80]  # keep tight for speed
-            all_rows: List[Dict[str, Any]] = []
-
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                # TD handles comma-separated symbols; chunk to be safe
-                for i in range(0, len(symbols), 60):
-                    chunk = symbols[i:i+60]
-                    r = await client.get(
-                        "https://api.twelvedata.com/quote",
-                        params={"symbol": ",".join(chunk), "apikey": td_key},
-                    )
-                    js = r.json() if r.content else {}
-                    # When multiple symbols: TD returns { "AAPL": {...}, "MSFT": {...}, ... }
-                    if isinstance(js, dict):
-                        for sym in chunk:
-                            info = js.get(sym) or {}
-                            # If TD returns error for some symbols, they may be missing
-                            try:
-                                price = float(info.get("close"))
-                                prev  = float(info.get("previous_close", price))
-                                chg   = price - prev
-                                pct   = 0.0 if prev == 0 else ((price - prev) / prev * 100.0)
-                                all_rows.append({
-                                    "symbol": sym,
-                                    "price": round(price, 2),
-                                    "change": round(chg, 2),
-                                    "change_pct": round(pct, 2),
-                                })
-                            except Exception:
-                                continue
-
-            clean = [x for x in all_rows if isinstance(x.get("price"), (int, float))]
-            clean.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
-            gainers = clean[:25]
-            losers  = list(reversed(clean[-25:])) if len(clean) >= 25 else clean[:25]
-            return {"gainers": gainers, "losers": losers, "source": "twelvedata"}
-        except Exception:
-            # fall through
-            pass
-
-    # ---------- 2) Alpha Vantage (quick when key present) ----------
-    if av_key:
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                r = await client.get(
-                    "https://www.alphavantage.co/query",
-                    params={"function": "TOP_GAINERS_LOSERS", "apikey": av_key},
-                )
+            url = "https://www.alphavantage.co/query"
+            params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(url, params=params)
                 data = r.json() if r.content else {}
-            gainers_raw = data.get("top_gainers") or []
-            losers_raw  = data.get("top_losers") or []
-            gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
-            losers  = [_alpha_to_common(x) for x in losers_raw][:25]
 
-            # Accept only if we got something numeric
-            if (any(isinstance(g.get("price"), (int, float)) for g in gainers) or
-                any(isinstance(l.get("price"), (int, float)) for l in losers)):
-                return {"gainers": gainers, "losers": losers, "source": "alphavantage"}
+            gainers_raw = data.get("top_gainers") or []
+            losers_raw  = data.get("top_losers")  or []
+
+            out_gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
+            out_losers  = [_alpha_to_common(x) for x in losers_raw][:25]
+
+            def _valid(rows):
+                k = 0
+                for x in rows:
+                    if isinstance(x.get("price"), (int, float)) and isinstance(x.get("change_pct"), (int, float)):
+                        k += 1
+                    if k >= 5:
+                        return True
+                return False
+
+            if _valid(out_gainers) or _valid(out_losers):
+                return {"gainers": out_gainers, "losers": out_losers, "source": used_source}
+        except Exception:
+            pass  # fall through to local fallback
+
+    # ---- 2) Local fallback with hard budget ----
+    used_source = "fallback-local"
+    universe = _universe_from_env()[:96]  # cap to keep it snappy
+
+    async def compute_row(sym: str) -> Optional[Dict[str, Any]]:
+        # Try quote first (fast, includes intraday change)
+        try:
+            q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=2.5)
+            price = float(q.get("current_price"))
+            last  = float(q.get("last_close"))
+            pct   = float(q.get("change_pct"))
+            chg = None
+            try:
+                chg = price - last
+            except Exception:
+                pass
+            if isinstance(price, float) and isinstance(pct, float):
+                return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
         except Exception:
             pass
 
-    # ---------- 3) Fallback via get_quote() (limit universe + concurrency) ----------
-    symbols = _universe_from_env()[:40]  # keep small so it returns fast
-    sem = asyncio.Semaphore(10)
+        # Then try last two historical closes (very reliable)
+        try:
+            closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 3), timeout=2.5)
+            closes = [float(x) for x in closes if isinstance(x, (int, float, str))]
+            if len(closes) >= 2:
+                last = float(closes[-1])
+                prev = float(closes[-2])
+                if prev and prev != 0:
+                    chg = last - prev
+                    pct = (chg / prev) * 100.0
+                else:
+                    chg, pct = 0.0, 0.0
+                return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
+        except Exception:
+            pass
 
-    async def fetch_one(sym: str):
-        async with sem:
-            try:
-                q = await asyncio.to_thread(get_quote, sym)
-                price = float(q.get("current_price"))
-                prev  = float(q.get("last_close"))
-                pct   = float(q.get("change_pct"))
-                chg   = price - prev
-                return {"symbol": sym, "price": round(price,2),
-                        "change": round(chg,2), "change_pct": round(pct,2)}
-            except Exception:
-                return None
+        return None
 
-    rows = [r for r in await asyncio.gather(*(fetch_one(s) for s in symbols)) if r]
-    rows.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
-    gainers = rows[:25]
-    losers  = list(reversed(rows[-25:])) if len(rows) >= 25 else rows[:25]
-    return {"gainers": gainers, "losers": losers, "source": "local"}
+    # make tasks and enforce overall wall-time budget
+    tasks = [asyncio.create_task(compute_row(s)) for s in universe]
+    done, pending = await asyncio.wait(tasks, timeout=12.0)
+    rows: List[Dict[str, Any]] = []
+    for t in done:
+        try:
+            r = t.result()
+            if r and isinstance(r.get("price"), float):
+                rows.append(r)
+        except Exception:
+            pass
+    for p in pending:
+        p.cancel()
+
+    # rank and split
+    if rows:
+        rows.sort(key=lambda x: (x.get("change_pct") or 0.0), reverse=True)
+        out_gainers = rows[:25]
+        out_losers = list(reversed(rows[-25:] if len(rows) >= 25 else rows[:25]))
+    else:
+        out_gainers, out_losers = [], []
+
+    return {"gainers": out_gainers, "losers": out_losers, "source": used_source, "partial": bool(done)}
 
 @router.get("/top_gainers")
 async def top_gainers():
