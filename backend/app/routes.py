@@ -1,9 +1,8 @@
-# backend/app/routes.py
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
 import random, json, asyncio, time, os
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from starlette.responses import StreamingResponse
 import httpx
 
@@ -24,7 +23,8 @@ def _is_crypto(symbol: str) -> bool:
 
 def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List[str], List[float]]:
     """
-    Drop weekends and 'today' for equities so we keep only completed trading days.
+    Drop weekends and usually 'today' so we keep completed trading days.
+    Defensive: if the provider only returns 'today', keep it so the UI isn't empty.
     Assumes dates are ISO strings (YYYY-MM-DD), most-recent last.
     """
     if not dates or not closes or len(dates) != len(closes):
@@ -32,17 +32,30 @@ def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List
 
     today_iso = date.today().isoformat()
     out_d, out_c = [], []
+
     for d, c in zip(dates, closes):
+        ds = str(d)[:10]
         try:
-            dt = date.fromisoformat(str(d)[:10])
+            dt = date.fromisoformat(ds)
         except Exception:
-            out_d.append(str(d)[:10]); out_c.append(float(c))
-            continue
+            out_d.append(ds); out_c.append(float(c)); continue
 
         dow = dt.weekday()  # 0=Mon..6=Sun
-        if dow >= 5 or dt.isoformat() == today_iso:  # weekend or today
+        if dow >= 5:  # weekend
             continue
-        out_d.append(dt.isoformat()); out_c.append(float(c))
+
+        # Only drop 'today' if we already retained at least one earlier day
+        if ds == today_iso and out_d:
+            continue
+
+        out_d.append(ds)
+        out_c.append(float(c))
+
+    # If nothing left (e.g., only 'today' existed), keep last point
+    if not out_d and dates and closes:
+        ds = str(dates[-1])[:10]
+        return [ds], [float(closes[-1])]
+
     return out_d, out_c
 
 def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
@@ -52,7 +65,8 @@ def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
     try:
         q = get_quote(symbol)
         last_close = float(q.get("last_close"))
-        closes[-1] = last_close
+        if isinstance(last_close, float):
+            closes[-1] = last_close
     except Exception:
         pass
 
@@ -133,12 +147,34 @@ def _universe_from_env() -> List[str]:
             return toks[:200]
     return _FALLBACK_UNIVERSE
 
-# ----------------------- routes -----------------------
-@router.get("/hello")
-async def say_hello():
-    return {"message": "Hello from FastAPI!"}
+# ----------------------- diagnostics -----------------------
+@router.get("/diag", summary="Diag", tags=["Diagnostics"])
+async def diag(ticker: str = "AAPL"):
+    """
+    Quick diagnostic: quote latency and whether historical closes are present.
+    """
+    t0 = time.time()
+    err = None
+    try:
+        q = get_quote(ticker)
+    except Exception as e:
+        q, err = {}, str(e)
+    t1 = time.time()
 
-# ---------- Predictions ----------
+    try:
+        series = get_daily_closes_with_dates(ticker, 7)
+    except Exception as e:
+        series, err = {"dates": [], "closes": []}, (err or "") + f" | closes: {e}"
+
+    return {
+        "ticker": ticker,
+        "quote_latency_ms": int((t1 - t0) * 1000),
+        "quote_sample": {k: q.get(k) for k in ("ticker", "current_price", "last_close", "change_pct")},
+        "closes_len": len(series.get("closes") or []),
+        "err": err,
+    }
+
+# ----------------------- predictions -----------------------
 class PredictRequest(BaseModel):
     ticker: str
     models: List[str]
@@ -184,7 +220,7 @@ async def predict(req: PredictRequest):
     return PredictResponse(results=results)
 
 # ---------- Retrospective “prediction for the target date” ----------
-@router.get("/predict_history")
+@router.get("/predict_history", summary="Predict History")
 async def predict_history(
     ticker: str,
     days: int = 12,  # last ~2 weeks of trading days
@@ -199,12 +235,36 @@ async def predict_history(
     days = max(1, min(int(days), 60))
     models = _normalize_models_param(models)
 
-    series = get_daily_closes_with_dates(symbol, days + 40)
+    # Provider call in thread, bounded
+    try:
+        series = await asyncio.wait_for(
+            asyncio.to_thread(get_daily_closes_with_dates, symbol, days + 40),
+            timeout=8.0,
+        )
+    except Exception:
+        series = {"dates": [], "closes": []}
+
     dates: List[str] = list(series.get("dates") or [])
     closes: List[float] = list(series.get("closes") or [])
 
     if not _is_crypto(symbol):
         dates, closes = _filter_equity_calendar(dates, closes)
+
+    # Rescue sparse feeds with yfinance
+    if len(closes) < 2:
+        try:
+            import yfinance as yf
+            df = await asyncio.to_thread(
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
+            )
+            if df is not None and not df.empty and "Close" in df:
+                s = df["Close"].dropna().astype(float)
+                dates = [str(d.date()) for d in s.index]
+                closes = [float(v) for v in s.values]
+                if not _is_crypto(symbol):
+                    dates, closes = _filter_equity_calendar(dates, closes)
+        except Exception:
+            pass
 
     n = len(closes)
     if n < 2:
@@ -236,7 +296,7 @@ async def predict_history(
         flat = {m: pred_map.get(m, None) for m in models}
         flat_err = {f"{m}_err_pct": err_map.get(m, None) for m in models}
 
-        row = {
+        rows.append({
             "date": target_date,
             "close": round(actual, 2),
             "actual": round(actual, 2),
@@ -244,26 +304,25 @@ async def predict_history(
             "error_pct": err_map,
             **flat,
             **flat_err,
-        }
-        rows.append(row)
+        })
 
     return {"ticker": symbol, "models": models, "rows": rows}
 
-# ---------- Quote / Earnings / Market ----------
-@router.get("/quote")
+# ----------------------- Quote / Earnings / Market -----------------------
+@router.get("/quote", summary="Quote Endpoint")
 async def quote_endpoint(ticker: str):
     return get_quote(ticker)
 
-@router.get("/earnings")
+@router.get("/earnings", summary="Earnings Endpoint")
 async def earnings_endpoint(ticker: str):
     return get_earnings(ticker)
 
-@router.get("/market")
+@router.get("/market", summary="Market Endpoint")
 async def market_endpoint():
     return get_market_breadth()
 
-# ---------- Live quote stream (SSE) ----------
-@router.get("/quote_stream")
+# ----------------------- Live quote stream (SSE) -----------------------
+@router.get("/quote_stream", summary="Quote Stream")
 async def quote_stream(ticker: str, interval: float = 5.0):
     interval = max(1.0, min(float(interval), 60.0))
 
@@ -285,8 +344,8 @@ async def quote_stream(ticker: str, interval: float = 5.0):
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ---------- Closes for charts (dates + up to 5y) ----------
-@router.get("/closes")
+# ----------------------- Closes for charts (dates + up to 5y) -----------------------
+@router.get("/closes", summary="Closes Endpoint")
 async def closes_endpoint(ticker: str, days: int = 60):
     """
     Returns up to ~5 years of daily closes with aligned ISO dates, most-recent last.
@@ -294,7 +353,15 @@ async def closes_endpoint(ticker: str, days: int = 60):
     """
     symbol = str(ticker).upper()
     days = max(2, min(int(days), 1825))
-    data = get_daily_closes_with_dates(symbol, days)
+
+    try:
+        data = await asyncio.wait_for(
+            asyncio.to_thread(get_daily_closes_with_dates, symbol, days),
+            timeout=8.0,
+        )
+    except Exception:
+        data = {"dates": [], "closes": []}
+
     dates: List[str] = list(data.get("dates") or [])
     closes: List[float] = list(data.get("closes") or [])
 
@@ -302,10 +369,27 @@ async def closes_endpoint(ticker: str, days: int = 60):
         dates, closes = _filter_equity_calendar(dates, closes)
         _pin_last_close(symbol, dates, closes)
 
+    # Rescue sparse feeds with yfinance
+    if len(closes) < 1:
+        try:
+            import yfinance as yf
+            df = await asyncio.to_thread(
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
+            )
+            if df is not None and not df.empty and "Close" in df:
+                s = df["Close"].dropna().astype(float)
+                dates = [str(d.date()) for d in s.index]
+                closes = [float(v) for v in s.values]
+                if not _is_crypto(symbol):
+                    dates, closes = _filter_equity_calendar(dates, closes)
+                    _pin_last_close(symbol, dates, closes)
+        except Exception:
+            pass
+
     return {"ticker": symbol, "dates": dates, "closes": closes}
 
-# ---------- Quick stats (52w high/low only) ----------
-@router.get("/stats")
+# ----------------------- Quick stats (52w high/low only) -----------------------
+@router.get("/stats", summary="Stats Endpoint")
 async def stats_endpoint(ticker: str):
     """
     Returns 52-week stats. Tries service; if missing/invalid, computes from yfinance.
@@ -328,10 +412,12 @@ async def stats_endpoint(ticker: str):
     except Exception:
         pass
 
-    # Fallback: compute from yfinance (last ~1y closes, adjusted)
+    # Fallback: compute from yfinance off the event loop
     try:
         import yfinance as yf
-        df = yf.download(symbol, period="1y", interval="1d", progress=False, auto_adjust=True)
+        df = await asyncio.to_thread(
+            yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=True
+        )
         if df is not None and not df.empty and "Close" in df:
             s = df["Close"].dropna().astype(float)
             hi = float(s.max()) if len(s) else None
@@ -354,19 +440,19 @@ async def stats_endpoint(ticker: str):
         "high52": None, "low52": None,
     }
 
-# ---------- Movers (Top gainers/losers) ----------
-@router.get("/movers")
+# ----------------------- Movers (Top gainers/losers) -----------------------
+@router.get("/movers", summary="Movers")
 async def movers():
     """
     Returns both gainers and losers:
     { "gainers": [...], "losers": [...] }
     Strategy:
-      1) Try Alpha Vantage TOP_GAINERS_LOSERS (fast when available)
+      1) Try Alpha Vantage TOP_GAINERS_LOSERS (fast when available, 6s cap)
       2) Fallback with a hard time budget:
          - Cap universe size
-         - For each symbol: try get_quote (2.5s), else get_daily_closes(3) (2.5s)
-         - Overall wall time capped (~12s)
-    Always returns quickly with best-effort partial data.
+         - For each symbol: try get_quote (1.5s), else get_daily_closes(3) (1.5s)
+         - Overall wall time capped (~7.5s)
+    Always responds within ~8–9s.
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
     out_gainers: List[Dict[str, Any]] = []
@@ -378,7 +464,7 @@ async def movers():
         try:
             url = "https://www.alphavantage.co/query"
             params = {"function": "TOP_GAINERS_LOSERS", "apikey": key}
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 r = await client.get(url, params=params)
                 data = r.json() if r.content else {}
 
@@ -409,23 +495,31 @@ async def movers():
     async def compute_row(sym: str) -> Optional[Dict[str, Any]]:
         # Try quote first (fast, includes intraday change)
         try:
-            q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=2.5)
+            q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=1.5)
             price = float(q.get("current_price"))
             last  = float(q.get("last_close"))
-            pct   = float(q.get("change_pct"))
+            pct   = q.get("change_pct")
+            pctf  = None
+            try:
+                pctf = float(pct)
+            except Exception:
+                pctf = None
+            # If provider didn't give a pct, compute from price & last
+            if (pctf is None or pctf == 0.0) and isinstance(price, float) and isinstance(last, float) and last:
+                pctf = ((price - last) / last) * 100.0
             chg = None
             try:
                 chg = price - last
             except Exception:
                 pass
-            if isinstance(price, float) and isinstance(pct, float):
-                return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
+            if isinstance(price, float) and isinstance(pctf, float):
+                return {"symbol": sym, "price": price, "change": chg, "change_pct": pctf}
         except Exception:
             pass
 
         # Then try last two historical closes (very reliable)
         try:
-            closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 3), timeout=2.5)
+            closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 3), timeout=1.5)
             closes = [float(x) for x in closes if isinstance(x, (int, float, str))]
             if len(closes) >= 2:
                 last = float(closes[-1])
@@ -441,9 +535,8 @@ async def movers():
 
         return None
 
-    # make tasks and enforce overall wall-time budget
     tasks = [asyncio.create_task(compute_row(s)) for s in universe]
-    done, pending = await asyncio.wait(tasks, timeout=12.0)
+    done, pending = await asyncio.wait(tasks, timeout=7.5)
     rows: List[Dict[str, Any]] = []
     for t in done:
         try:
@@ -455,7 +548,6 @@ async def movers():
     for p in pending:
         p.cancel()
 
-    # rank and split
     if rows:
         rows.sort(key=lambda x: (x.get("change_pct") or 0.0), reverse=True)
         out_gainers = rows[:25]
@@ -465,18 +557,18 @@ async def movers():
 
     return {"gainers": out_gainers, "losers": out_losers, "source": used_source, "partial": bool(done)}
 
-@router.get("/top_gainers")
+@router.get("/top_gainers", summary="Top Gainers")
 async def top_gainers():
     res = await movers()
     return res.get("gainers", [])
 
-@router.get("/top_losers")
+@router.get("/top_losers", summary="Top Losers")
 async def top_losers():
     res = await movers()
     return res.get("losers", [])
 
-# ---------- Earnings Calendar (this week) ----------
-@router.get("/earnings_week")
+# ----------------------- Earnings Calendar (this week) -----------------------
+@router.get("/earnings_week", summary="Earnings Week")
 async def earnings_week():
     """
     Returns an array of earnings items for the current week: [{date, symbol, name, session}]
