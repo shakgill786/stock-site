@@ -563,58 +563,56 @@ export default function App() {
 
   return (
     <div className="app-root">
-      {/* Top header (sticky at top, no overlap) */}
-      {/* Hero header */}
+      {/* Hero header (centered) */}
       <div className="hero-wrap">
-        <div className="hero">
+        <div className="hero hero--center">
           <div>
             <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
-            <p className="hero-sub">Live quotes, movers, and this week’s earnings</p>
+            <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
+          </div>
+          <div className="hero-right">
+            <button className="btn ghost" onClick={() => window.location.reload()}>
+              ↻ Refresh
+            </button>
           </div>
         </div>
 
-      <style>{`
-        .hero-wrap { margin: 6px 0 12px; }
-        .hero {
-          display: flex; align-items: end; justify-content: space-between;
-          padding: 18px 16px;
-          border-radius: 16px;
-          background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
-          border: 1px solid rgba(255,255,255,0.08);
-          box-shadow: 0 8px 22px rgba(0,0,0,0.28);
-        }
-        .hero-title {
-          margin: 0;
-          font-size: clamp(22px, 3.6vw, 36px);
-          letter-spacing: .3px;
-          line-height: 1.15;
-        }
+        {/* Scoped hero styles */}
+        <style>{`
+          .hero-wrap { margin: 6px 0 12px; }
+          .hero {
+            display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
+            padding: 18px 16px;
+            border-radius: 16px;
+            background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 8px 22px rgba(0,0,0,0.28);
+          }
+          .hero-title {
+            margin: 0;
+            font-size: clamp(22px, 3.6vw, 36px);
+            letter-spacing: .3px;
+            line-height: 1.15;
+          }
+          .hero-sub { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
+          .hero-right { display: flex; align-items: center; gap: 8px; }
 
-        .hero-sub {
-          margin: 4px 0 0;
-          color: #a7adbc;
-          font-size: 13px;
-        }
+          /* Centered variant */
+          .hero--center {
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+          }
+          .hero--center .hero-right { margin-top: 8px; }
 
-        .hero-right { display: flex; align-items: center; gap: 8px; }
-
-        /* Centered variant: center the block & move actions under the title */
-        .hero--center {
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          text-align: center;
-        }
-        .hero--center .hero-right { margin-top: 8px; }
-
-        /* Mobile: stack automatically; keep centered variant centered */
-        @media (max-width: 720px) {
-          .hero { flex-direction: column; align-items: flex-start; }
-          .hero--center { align-items: center; }
-          .hero-right { width: 100%; justify-content: center; }
-        }
-      `}</style>
-    </div>
+          @media (max-width: 720px) {
+            .hero { flex-direction: column; align-items: flex-start; }
+            .hero--center { align-items: center; }
+            .hero-right { width: 100%; justify-content: center; }
+          }
+        `}</style>
+      </div>
 
       <main className="container grid-2col">
         {/* LEFT: Watchlist */}
@@ -648,7 +646,7 @@ export default function App() {
             />
           )}
 
-          {/* Hot movers + Earnings next 7d (directly under compare toggle) */}
+          {/* Hot movers + Earnings next 7d */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* Anchor for smooth-scroll target */}
@@ -828,10 +826,10 @@ export default function App() {
           )}
 
           {diagnostic && (
-          <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
-            <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
+            <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
               <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
-          </div>
+            </div>
           )}
 
           {/* Prediction Error */}
@@ -951,19 +949,21 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
   const onMove = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    setCursorX(clamp(x, pad, pad + w));
-    setHoverIdx(idxForX(x));
-    if (drag) {
-      const dx = x - drag.startX;
-      const frac = dx / w;
-      const windowSize = drag.startView.end - drag.startView.start;
-      let newStart = drag.startView.start - Math.round(frac * windowSize);
-      let newEnd = newStart + windowSize;
-      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
-      setView({ start: newStart, end: newEnd });
+    a: {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      setCursorX(clamp(x, pad, pad + w));
+      setHoverIdx(idxForX(x));
+      if (drag) {
+        const dx = x - drag.startX;
+        const frac = dx / w;
+        const windowSize = drag.startView.end - drag.startView.start;
+        let newStart = drag.startView.start - Math.round(frac * windowSize);
+        let newEnd = newStart + windowSize;
+        if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+        if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
+        setView({ start: newStart, end: newEnd });
+      }
     }
   };
 
