@@ -583,10 +583,38 @@ export default function App() {
           border: 1px solid rgba(255,255,255,0.08);
           box-shadow: 0 8px 22px rgba(0,0,0,0.28);
         }
-          .hero-title { margin: 0; font-size: clamp(20px, 3.8vw, 34px); letter-spacing: .3px; }
-          .hero-sub   { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
-        `}</style>
-      </div>
+        .hero-title {
+          margin: 0;
+          font-size: clamp(22px, 3.6vw, 36px);
+          letter-spacing: .3px;
+          line-height: 1.15;
+        }
+
+        .hero-sub {
+          margin: 4px 0 0;
+          color: #a7adbc;
+          font-size: 13px;
+        }
+
+        .hero-right { display: flex; align-items: center; gap: 8px; }
+
+        /* Centered variant: center the block & move actions under the title */
+        .hero--center {
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          text-align: center;
+        }
+        .hero--center .hero-right { margin-top: 8px; }
+
+        /* Mobile: stack automatically; keep centered variant centered */
+        @media (max-width: 720px) {
+          .hero { flex-direction: column; align-items: flex-start; }
+          .hero--center { align-items: center; }
+          .hero-right { width: 100%; justify-content: center; }
+        }
+      `}</style>
+    </div>
 
       <main className="container grid-2col">
         {/* LEFT: Watchlist */}
