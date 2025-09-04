@@ -564,9 +564,29 @@ export default function App() {
   return (
     <div className="app-root">
       {/* Top header (sticky at top, no overlap) */}
-      <header className="app-header">
-        <h1>Real-Time Stock & Crypto Dashboard</h1>
-      </header>
+      {/* Hero header */}
+      <div className="hero-wrap">
+        <div className="hero">
+          <div>
+            <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
+            <p className="hero-sub">Live quotes, movers, and this week’s earnings</p>
+          </div>
+        </div>
+
+      <style>{`
+        .hero-wrap { margin: 6px 0 12px; }
+        .hero {
+          display: flex; align-items: end; justify-content: space-between;
+          padding: 18px 16px;
+          border-radius: 16px;
+          background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
+          border: 1px solid rgba(255,255,255,0.08);
+          box-shadow: 0 8px 22px rgba(0,0,0,0.28);
+        }
+          .hero-title { margin: 0; font-size: clamp(20px, 3.8vw, 34px); letter-spacing: .3px; }
+          .hero-sub   { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
+        `}</style>
+      </div>
 
       <main className="container grid-2col">
         {/* LEFT: Watchlist */}
