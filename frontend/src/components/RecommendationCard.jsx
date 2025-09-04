@@ -1,49 +1,80 @@
 // frontend/src/components/RecommendationCard.jsx
 
 export default function RecommendationCard({ recommendation }) {
+  if (!recommendation) {
+    return (
+      <div>
+        <h3 style={{ marginTop: 0 }}>📈 Recommendation</h3>
+        <p className="muted" style={{ margin: 0 }}>N/A</p>
+      </div>
+    );
+  }
+
+  const action = String(recommendation.action || "Hold");
+  const model = recommendation.model || "—";
+  const avg = Number(recommendation.avgChangePct ?? 0);
+
+  const pillClass =
+    action === "Buy" ? "pill pill--good" :
+    action === "Sell" ? "pill pill--bad" :
+    "pill pill--neutral";
+
   return (
-    <div style={cardStyle}>
-      <h2 style={{ marginTop: 0 }}>📈 Recommendation</h2>
-      {!recommendation ? (
-        <p style={muted}>N/A</p>
-      ) : (
-        <>
-          <p style={{ margin: 0 }}>
-            Based on lowest proxy-MAPE: <strong>{recommendation.model}</strong>
-          </p>
-          <p style={{ margin: 0, fontSize: 18 }}>
-            <strong
-              style={{
-                color:
-                  recommendation.action === "Buy"
-                    ? "#2e7d32" // green
-                    : recommendation.action === "Sell"
-                    ? "#c62828" // red
-                    : "#9aa0a6", // grey for Hold
-              }}
-            >
-              {recommendation.action}
-            </strong>{" "}
-            <span style={mutedSmall}>
-              (avg change {Number(recommendation.avgChangePct).toFixed(2)}%)
-            </span>
-          </p>
-          <p style={mutedSmall}>
-            Proxy-MAPE = average |pred − last_close| / last_close
-          </p>
-        </>
-      )}
+    <div>
+      <h3 style={{ marginTop: 0 }}>📈 Recommendation</h3>
+
+      <div className="rec-row">
+        <span className={pillClass} aria-label={`Action: ${action}`}>{action}</span>
+        <span className="rec-sub">
+          avg change&nbsp;<strong>{avg.toFixed(2)}%</strong>
+        </span>
+      </div>
+
+      <div className="muted" style={{ marginTop: 6 }}>
+        Based on lowest proxy-MAPE: <strong>{model}</strong>
+      </div>
+
+      <div className="muted rec-footnote">
+        Proxy-MAPE = average |pred − last_close| / last_close
+      </div>
+
+      {/* scoped styles */}
+      <style>{`
+        .rec-row{
+          display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+          margin-top: 4px;
+        }
+        .rec-sub{ color: var(--muted); font-size: 0.95rem }
+        .rec-footnote{ font-size: 12px; margin-top: 6px }
+
+        .pill{
+          display: inline-block;
+          padding: 4px 10px;
+          border-radius: 999px;
+          font-weight: 700;
+          letter-spacing: .2px;
+          border: 1px solid var(--border);
+          background: linear-gradient(180deg, #101630, #0c1126);
+        }
+        .pill--good{
+          color: var(--good);
+          border-color: rgba(52,199,89,.35);
+          box-shadow: 0 0 0 2px rgba(52,199,89,.12) inset;
+        }
+        .pill--bad{
+          color: var(--bad);
+          border-color: rgba(255,59,48,.35);
+          box-shadow: 0 0 0 2px rgba(255,59,48,.12) inset;
+        }
+        .pill--neutral{
+          color: var(--muted);
+        }
+
+        @media (max-width: 720px){
+          .rec-sub{ font-size: 0.9rem }
+          .pill{ padding: 3px 9px }
+        }
+      `}</style>
     </div>
   );
 }
-
-const cardStyle = {
-  border: "1px solid #ddd",
-  borderRadius: 8,
-  padding: "1rem",
-  marginBottom: "1rem",
-  maxWidth: 340,
-};
-
-const muted = { color: "#666", margin: 0 };
-const mutedSmall = { color: "#666", margin: 0, fontSize: 12 };
