@@ -151,27 +151,47 @@ def _universe_from_env() -> List[str]:
 @router.get("/diag", summary="Diag", tags=["Diagnostics"])
 async def diag(ticker: str = "AAPL"):
     """
-    Quick diagnostic: quote latency and whether historical closes are present.
+    Check quote latency, provider history, and yfinance fallback availability.
     """
-    t0 = time.time()
-    err = None
+    import time as _time
+    t0 = _time.time()
+    q_err = None
     try:
         q = get_quote(ticker)
     except Exception as e:
-        q, err = {}, str(e)
-    t1 = time.time()
+        q, q_err = {}, str(e)
+    t1 = _time.time()
 
+    prov_dates = prov_closes = []
+    prov_err = None
     try:
-        series = get_daily_closes_with_dates(ticker, 7)
+        s = get_daily_closes_with_dates(ticker, 7)
+        prov_dates = list(s.get("dates") or [])
+        prov_closes = list(s.get("closes") or [])
     except Exception as e:
-        series, err = {"dates": [], "closes": []}, (err or "") + f" | closes: {e}"
+        prov_err = str(e)
+
+    yfin_ok = False
+    yfin_pts = 0
+    yfin_err = None
+    try:
+        import yfinance as yf  # noqa
+        yfin_ok = True
+        df = await asyncio.to_thread(
+            yf.download, ticker, period="3mo", interval="1d", progress=False, auto_adjust=True
+        )
+        if df is not None and not df.empty and "Close" in df:
+            yfin_pts = int(df["Close"].dropna().shape[0])
+    except Exception as e:
+        yfin_err = str(e)
 
     return {
         "ticker": ticker,
         "quote_latency_ms": int((t1 - t0) * 1000),
         "quote_sample": {k: q.get(k) for k in ("ticker", "current_price", "last_close", "change_pct")},
-        "closes_len": len(series.get("closes") or []),
-        "err": err,
+        "provider": {"closes_len": len(prov_closes), "err": prov_err},
+        "yfinance": {"installed": yfin_ok, "points": yfin_pts, "err": yfin_err},
+        "quote_err": q_err,
     }
 
 # ----------------------- predictions -----------------------
