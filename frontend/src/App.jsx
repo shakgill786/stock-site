@@ -8,6 +8,7 @@ import {
   fetchCloses,
   fetchPredictHistory,
   buildQuoteStreamURL,
+  ping, // 🔔 pre-warm backend
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
@@ -165,6 +166,14 @@ export default function App() {
   // Where to scroll when a symbol is chosen from the movers table
   const mainSectionRef = useRef(null);
 
+  // Pre-warm backend right after mount to reduce cold-start timeouts
+  useEffect(() => {
+    (async () => {
+      try { await ping(); } catch {}
+      setTimeout(() => { ping().catch(() => {}); }, 2500);
+    })();
+  }, []);
+
   // Helpers
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
@@ -234,6 +243,8 @@ export default function App() {
         if (reqVer.current !== myVer) return null;
         setQuote(q);
         prevPriceRef.current = q.current_price;
+        // ensure live SSE is enabled once we have a quote
+        if (!live) setLive(true);
         return q;
       } catch {
         if (reqVer.current !== myVer) return null;
@@ -328,7 +339,7 @@ export default function App() {
     if (reqVer.current === myVer) {
       setLoading(false);
     }
-  }, [ticker, models]);
+  }, [ticker, models, live]);
 
   useEffect(() => {
     loadData();
@@ -807,7 +818,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {avpRows.map((row, i) => (
+                    {[...pastRows, ...futureRows].map((row, i) => (
                       <tr key={`${row.kind}-${row.date || i}`}>
                         <td>
                           {row.date

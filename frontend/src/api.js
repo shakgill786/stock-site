@@ -48,9 +48,10 @@ export function clearAuthToken() {
 }
 
 // -------- fetch helpers --------
-const DEFAULT_RETRIES = 1; // extra attempts after the first
-const RETRY_DELAY_MS = 350;
-const REQUEST_TIMEOUT_MS = 10000; // 10s network timeout
+// Bump timeouts/retries to tolerate cold starts on free hosting
+const DEFAULT_RETRIES = 3;        // extra attempts after the first
+const RETRY_DELAY_MS = 800;
+const REQUEST_TIMEOUT_MS = 45000; // 45s network timeout
 
 const defaultGetHeaders = {
   "Cache-Control": "no-cache",
@@ -93,7 +94,18 @@ function withTimeout(fetcher, ms) {
   return fetcher(ctrl.signal).finally(() => clearTimeout(id));
 }
 
-// Wrap fetch with small retry on network/5xx/429 + timeout
+function isRetryable(res) {
+  return res?.status === 429 || (res?.status >= 500 && res?.status <= 599);
+}
+function isAbortOrTimeout(err) {
+  return (
+    err?.name === "AbortError" ||
+    err?.name === "TimeoutError" ||
+    String(err?.message || "").toLowerCase().includes("timeout")
+  );
+}
+
+// Wrap fetch with retry on network/5xx/429/timeout + timeout
 async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -102,18 +114,19 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
         (signal) => fetch(url, { ...options, signal }),
         REQUEST_TIMEOUT_MS
       );
-      // Retry on 429/5xx
-      if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
-        lastErr = new Error(`HTTP ${res.status}`);
-        if (attempt < retries) {
-          await sleep(RETRY_DELAY_MS * (attempt + 1));
-          continue;
-        }
+      if (isRetryable(res) && attempt < retries) {
+        await sleep(RETRY_DELAY_MS * (attempt + 1));
+        continue;
       }
       return res;
     } catch (e) {
       lastErr = e;
       if (attempt < retries) {
+        // Treat timeouts/aborts as retryable too
+        if (isAbortOrTimeout(e)) {
+          await sleep(RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
         await sleep(RETRY_DELAY_MS * (attempt + 1));
         continue;
       }
@@ -274,7 +287,7 @@ export async function fetchCloses(ticker, days = 7) {
   if (dates.length !== closes.length) {
     const n = Math.min(dates.length, closes.length);
     return { ticker: payload?.ticker || ticker, dates: dates.slice(0, n), closes: closes.slice(0, n) };
-    }
+  }
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
