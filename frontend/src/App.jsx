@@ -6,6 +6,7 @@ import {
   fetchMarket,
   fetchCloses,
   fetchPredictHistory,
+  buildQuoteStreamURL,
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
@@ -43,10 +44,6 @@ ChartJS.register(
 );
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
-const API_BASE =
-  import.meta.env.VITE_API_BASE ||
-  import.meta.env.VITE_API_BASE_URL ||
-  "http://127.0.0.1:8000";
 
 // ----- Date helpers (timezone-safe) -----
 const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
@@ -332,9 +329,7 @@ export default function App() {
   }, [loadData]);
 
   // Live SSE: only updates the quote card smoothly
-  const streamUrl = live
-    ? `${API_BASE}/quote_stream?ticker=${encodeURIComponent(ticker)}&interval=5`
-    : null;
+  const streamUrl = live ? buildQuoteStreamURL(ticker, 5) : null;
 
   useEventSource(streamUrl, {
     enabled: !!streamUrl,
@@ -949,21 +944,19 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
   const onMove = (e) => {
-    a: {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      setCursorX(clamp(x, pad, pad + w));
-      setHoverIdx(idxForX(x));
-      if (drag) {
-        const dx = x - drag.startX;
-        const frac = dx / w;
-        const windowSize = drag.startView.end - drag.startView.start;
-        let newStart = drag.startView.start - Math.round(frac * windowSize);
-        let newEnd = newStart + windowSize;
-        if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-        if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
-        setView({ start: newStart, end: newEnd });
-      }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setCursorX(clamp(x, pad, pad + w));
+    setHoverIdx(idxForX(x));
+    if (drag) {
+      const dx = x - drag.startX;
+      const frac = dx / w;
+      const windowSize = drag.startView.end - drag.startView.start;
+      let newStart = drag.startView.start - Math.round(frac * windowSize);
+      let newEnd = newStart + windowSize;
+      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
+      setView({ start: newStart, end: newEnd });
     }
   };
 

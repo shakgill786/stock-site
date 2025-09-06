@@ -1,5 +1,3 @@
-// frontend/src/api.js
-
 // --- Base URL resolution (env first; safe defaults) ---
 const RAW_ENV_BASE =
   import.meta.env.VITE_API_BASE ||
@@ -32,6 +30,19 @@ if (typeof window !== "undefined") {
   console.info("[api] API_BASE =", API_BASE);
 }
 
+// -------- auth token helpers --------
+const TOKEN_KEY = "AUTH_TOKEN";
+
+export function setAuthToken(token) {
+  try { localStorage.setItem(TOKEN_KEY, token || ""); } catch {}
+}
+export function getAuthToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+export function clearAuthToken() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch {}
+}
+
 // -------- fetch helpers --------
 const DEFAULT_RETRIES = 1; // extra attempts after the first
 const RETRY_DELAY_MS = 350;
@@ -49,6 +60,11 @@ const defaultPostHeaders = {
   "Content-Type": "application/json",
   Accept: "application/json",
 };
+
+function maybeAuth(headers = {}) {
+  const t = getAuthToken();
+  return t ? { ...headers, Authorization: `Bearer ${t}` } : headers;
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -132,11 +148,50 @@ export async function ping() {
   const url = buildURL("/hello");
   return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
 }
-
 export async function fetchHello() {
   return ping();
 }
 
+// --- Auth ---
+export async function register({ email, password }) {
+  const url = buildURL("/auth/register");
+  const data = await handle(
+    await fetchWithRetry(url, {
+      method: "POST",
+      headers: defaultPostHeaders,
+      body: JSON.stringify({ email, password }),
+      cache: "no-store",
+    })
+  );
+  if (data?.access_token) setAuthToken(data.access_token);
+  return data;
+}
+
+export async function login({ email, password }) {
+  const url = buildURL("/auth/login");
+  const data = await handle(
+    await fetchWithRetry(url, {
+      method: "POST",
+      headers: defaultPostHeaders,
+      body: JSON.stringify({ email, password }),
+      cache: "no-store",
+    })
+  );
+  if (data?.access_token) setAuthToken(data.access_token);
+  return data;
+}
+
+export async function me() {
+  const url = buildURL("/auth/me");
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+    })
+  );
+}
+
+// --- Predictions & data ---
 export async function fetchPredict({ ticker, models }) {
   const url = buildURL("/predict");
   return handle(
