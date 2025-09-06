@@ -1,59 +1,50 @@
-import { createContext, useContext, useEffect, useState } from "react";
-import { authLogin, authRegister, authMe } from "../api";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import * as api from "../api";
 
 const AuthCtx = createContext(null);
-export const useAuth = () => useContext(AuthCtx);
 
 export function AuthProvider({ children }) {
-  const [token, setToken] = useState(() => localStorage.getItem("AUTH_TOKEN") || "");
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(!!token);
-  const [authError, setAuthError] = useState("");
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (!token) { setUser(null); setAuthLoading(false); return; }
     (async () => {
       try {
-        setAuthLoading(true);
-        const me = await authMe();
-        setUser(me);
-        setAuthError("");
-      } catch (e) {
+        const u = await api.me();
+        setUser(u || null);
+      } catch {
         setUser(null);
-        setToken("");
-        localStorage.removeItem("AUTH_TOKEN");
-        setAuthError(e?.message || "Auth failed");
       } finally {
-        setAuthLoading(false);
+        setReady(true);
       }
     })();
-  }, [token]);
+  }, []);
 
   const login = async (email, password) => {
-    setAuthError("");
-    const res = await authLogin({ email, password });
-    localStorage.setItem("AUTH_TOKEN", res.access_token);
-    setToken(res.access_token);
-    return res;
+    await api.login({ email, password });      // sets token
+    const u = await api.me().catch(() => null);
+    setUser(u || { email });
+    return u;
   };
 
   const register = async (email, password) => {
-    setAuthError("");
-    const res = await authRegister({ email, password });
-    localStorage.setItem("AUTH_TOKEN", res.access_token);
-    setToken(res.access_token);
-    return res;
+    await api.register({ email, password });   // sets token
+    const u = await api.me().catch(() => null);
+    setUser(u || { email });
+    return u;
   };
 
   const logout = () => {
-    localStorage.removeItem("AUTH_TOKEN");
-    setToken("");
+    api.clearAuthToken();
     setUser(null);
   };
 
-  return (
-    <AuthCtx.Provider value={{ token, user, authLoading, authError, login, register, logout }}>
-      {children}
-    </AuthCtx.Provider>
-  );
+  const value = useMemo(() => ({ user, ready, login, register, logout }), [user, ready]);
+  return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>;
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthCtx);
+  if (!ctx) throw new Error("useAuth must be used within <AuthProvider>");
+  return ctx;
 }

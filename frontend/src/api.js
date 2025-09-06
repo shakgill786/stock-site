@@ -16,6 +16,10 @@ const RAW_BASE = RAW_ENV_BASE || HARDCODE_BACKEND || "http://127.0.0.1:8000";
 // Normalize: strip trailing slashes
 export const API_BASE = String(RAW_BASE).replace(/\/+$/, "");
 
+// Optional env overrides for special endpoints
+const MOVERS_ENDPOINT = import.meta.env.VITE_MOVERS_ENDPOINT || "/movers";
+const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/earnings_week";
+
 // Warn about common mixed-content misconfig: https page calling http backend
 if (typeof window !== "undefined") {
   const isHttpsPage = window.location.protocol === "https:";
@@ -146,7 +150,7 @@ async function handle(res) {
 
 export async function ping() {
   const url = buildURL("/hello");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 export async function fetchHello() {
   return ping();
@@ -191,6 +195,14 @@ export async function me() {
   );
 }
 
+/** SSE URL for quote streaming (passes token via query if present) */
+export function buildQuoteStreamURL(ticker, interval = 5) {
+  const url = buildURL("/quote_stream", { ticker, interval });
+  const tok = getAuthToken();
+  if (tok) url.searchParams.set("token", tok);
+  return url.toString();
+}
+
 // --- Predictions & data ---
 export async function fetchPredict({ ticker, models }) {
   const url = buildURL("/predict");
@@ -199,7 +211,7 @@ export async function fetchPredict({ ticker, models }) {
       url,
       {
         method: "POST",
-        headers: defaultPostHeaders,
+        headers: maybeAuth(defaultPostHeaders),
         body: JSON.stringify({ ticker, models }),
         cache: "no-store",
       },
@@ -226,34 +238,34 @@ export async function fetchPredictHistory({ ticker, models, days = 12 }) {
   list.forEach((m) => url.searchParams.append("models", m));
   url.searchParams.set("_ts", Date.now().toString());
 
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 export async function fetchQuote(ticker) {
   const url = buildURL("/quote", { ticker });
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 export async function fetchEarnings(ticker) {
   const url = buildURL("/earnings", { ticker });
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 // (unused but kept)
 export async function fetchDividends(ticker) {
   const url = buildURL("/dividends", { ticker });
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 export async function fetchMarket() {
   const url = buildURL("/market");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 export async function fetchCloses(ticker, days = 7) {
   const url = buildURL("/closes", { ticker, days });
   const payload = await handle(
-    await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" })
+    await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" })
   );
 
   // Light sanity normalization: ensure arrays exist & lengths match
@@ -262,44 +274,37 @@ export async function fetchCloses(ticker, days = 7) {
   if (dates.length !== closes.length) {
     const n = Math.min(dates.length, closes.length);
     return { ticker: payload?.ticker || ticker, dates: dates.slice(0, n), closes: closes.slice(0, n) };
-  }
+    }
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
 // Quick stats (52w high/low)
 export async function fetchStats(ticker) {
   const url = buildURL("/stats", { ticker });
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
-}
-
-/** SSE URL for quote streaming */
-export function buildQuoteStreamURL(ticker, interval = 5) {
-  const url = buildURL("/quote_stream", { ticker, interval });
-  return url.toString();
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 // ---------- Movers / Earnings week ----------
-
 /** Combined movers (gainers + losers) */
 export async function fetchMovers() {
-  const url = buildURL("/movers");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  const url = buildURL(MOVERS_ENDPOINT);
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 /** Convenience: only top gainers */
 export async function fetchTopGainers() {
   const url = buildURL("/top_gainers");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 /** Convenience: only top losers */
 export async function fetchTopLosers() {
   const url = buildURL("/top_losers");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 /** Earnings calendar for this week (Mon–Sun) */
 export async function fetchEarningsWeek() {
-  const url = buildURL("/earnings_week");
-  return handle(await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" }));
+  const url = buildURL(EARNINGS_WEEK_ENDPOINT);
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }

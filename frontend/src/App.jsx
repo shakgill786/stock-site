@@ -17,6 +17,8 @@ import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
+import AuthModal from "./components/AuthModal";          // ✨ add
+import { useAuth } from "./auth/AuthContext";           // ✨ add
 import "./App.css";
 
 import {
@@ -118,6 +120,9 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
 }
 
 export default function App() {
+  const { user, logout } = useAuth();             // ✨ add
+  const [showAuth, setShowAuth] = useState(false);// ✨ add
+
   const [ticker, setTicker] = useState("AAPL");
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
@@ -147,7 +152,7 @@ export default function App() {
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
-  const [closeDates, setCloseDates] = useState([]);
+  the [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
   // Retrospective history rows from backend (for past backtest lines)
@@ -565,7 +570,15 @@ export default function App() {
             <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
             <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
           </div>
-          <div className="hero-right">
+          <div className="hero-right" style={{ display: "flex", gap: 8 }}>
+            {user ? (
+              <>
+                <span className="muted" style={{ fontSize: 14 }}>👋 {user.email}</span>
+                <button className="btn ghost" onClick={logout} title="Sign out">Sign out</button>
+              </>
+            ) : (
+              <button className="btn" onClick={() => setShowAuth(true)}>Sign in / Create account</button>
+            )}
             <button className="btn ghost" onClick={() => window.location.reload()}>
               ↻ Refresh
             </button>
@@ -793,7 +806,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {avpRows.map((row, i) => (
+                    {[...pastRows, ...futureRows].map((row, i) => (
                       <tr key={`${row.kind}-${row.date || i}`}>
                         <td>
                           {row.date
@@ -894,6 +907,9 @@ export default function App() {
           </div>
         </MagnifyModal>
       )}
+
+      {/* 🔐 Auth modal mount */}
+      <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
     </div>
   );
 }
