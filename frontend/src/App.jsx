@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   fetchPredict,
@@ -17,8 +18,8 @@ import useEventSource from "./hooks/useEventSource";
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
-import AuthModal from "./components/AuthModal";          // ✨ add
-import { useAuth } from "./auth/AuthContext";           // ✨ add
+import AuthModal from "./components/AuthModal";
+import { useAuth } from "./auth/AuthContext";
 import "./App.css";
 
 import {
@@ -120,8 +121,8 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
 }
 
 export default function App() {
-  const { user, logout } = useAuth();             // ✨ add
-  const [showAuth, setShowAuth] = useState(false);// ✨ add
+  const { user, logout } = useAuth();
+  const [showAuth, setShowAuth] = useState(false);
 
   const [ticker, setTicker] = useState("AAPL");
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
@@ -152,7 +153,7 @@ export default function App() {
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
-  [closeDates, setCloseDates] = useState([]);
+  const [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
   // Retrospective history rows from backend (for past backtest lines)
@@ -806,7 +807,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {[...pastRows, ...futureRows].map((row, i) => (
+                    {avpRows.map((row, i) => (
                       <tr key={`${row.kind}-${row.date || i}`}>
                         <td>
                           {row.date
