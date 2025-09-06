@@ -152,7 +152,7 @@ export default function App() {
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
-  the [closeDates, setCloseDates] = useState([]);
+  [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
   // Retrospective history rows from backend (for past backtest lines)
