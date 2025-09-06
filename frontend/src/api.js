@@ -16,6 +16,10 @@ const RAW_BASE = RAW_ENV_BASE || HARDCODE_BACKEND || "http://127.0.0.1:8000";
 // Normalize: strip trailing slashes
 export const API_BASE = String(RAW_BASE).replace(/\/+$/, "");
 
+// Feature flag: enable/disable auth UI & calls from frontend
+export const AUTH_ENABLED =
+  String(import.meta.env.VITE_AUTH_ENABLED || "").toLowerCase() === "true";
+
 // Optional env overrides for special endpoints
 const MOVERS_ENDPOINT = import.meta.env.VITE_MOVERS_ENDPOINT || "/movers";
 const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/earnings_week";
@@ -29,7 +33,7 @@ if (typeof window !== "undefined") {
         `Set VITE_API_BASE to an HTTPS backend URL.`
     );
   }
-  console.info("[api] API_BASE =", API_BASE);
+  console.info("[api] API_BASE =", API_BASE, "| AUTH_ENABLED =", AUTH_ENABLED);
 }
 
 // -------- auth token helpers --------
@@ -45,23 +49,11 @@ export function clearAuthToken() {
   try { localStorage.removeItem(TOKEN_KEY); } catch {}
 }
 
-function extractToken(obj) {
-  if (!obj || typeof obj !== "object") return "";
-  return (
-    obj.access_token ||
-    obj.token ||
-    obj.jwt ||
-    obj.id_token ||
-    obj.access ||
-    ""
-  );
-}
-
 // -------- fetch helpers --------
-// Tolerate cold starts / free-tier hosting hiccups
-const DEFAULT_RETRIES = 3;        // extra attempts after the first
-const RETRY_DELAY_MS = 800;
-const REQUEST_TIMEOUT_MS = 45000; // 45s network timeout
+// Slightly generous defaults for free hosting cold starts
+const DEFAULT_RETRIES = 2;        // extra attempts after the first
+const RETRY_DELAY_MS = 600;
+const REQUEST_TIMEOUT_MS = 20000; // 20s network timeout
 
 const defaultGetHeaders = {
   "Cache-Control": "no-cache",
@@ -87,6 +79,7 @@ function sleep(ms) {
 
 function buildURL(path, params) {
   const url = new URL(`${API_BASE}${path.startsWith("/") ? path : `/${path}`}`);
+  // query params
   if (params && typeof params === "object") {
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
@@ -103,18 +96,7 @@ function withTimeout(fetcher, ms) {
   return fetcher(ctrl.signal).finally(() => clearTimeout(id));
 }
 
-function isRetryable(res) {
-  return res?.status === 429 || (res?.status >= 500 && res?.status <= 599);
-}
-function isAbortOrTimeout(err) {
-  return (
-    err?.name === "AbortError" ||
-    err?.name === "TimeoutError" ||
-    String(err?.message || "").toLowerCase().includes("timeout")
-  );
-}
-
-// Wrap fetch with retry on network/5xx/429/timeout
+// Wrap fetch with small retry on network/5xx/429 + timeout
 async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -123,9 +105,13 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
         (signal) => fetch(url, { ...options, signal }),
         REQUEST_TIMEOUT_MS
       );
-      if (isRetryable(res) && attempt < retries) {
-        await sleep(RETRY_DELAY_MS * (attempt + 1));
-        continue;
+      // Retry on 429/5xx
+      if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+        lastErr = new Error(`HTTP ${res.status}`);
+        if (attempt < retries) {
+          await sleep(RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
       }
       return res;
     } catch (e) {
@@ -153,16 +139,46 @@ async function handle(res) {
       try {
         const text = await res.text();
         detail = text?.slice?.(0, 300);
-      } catch {}
+      } catch { /* ignore */ }
     }
     const msg = detail ? `${res.status} ${res.statusText} – ${detail}` : `HTTP ${res.status}`;
     throw new Error(msg);
   }
+  // parse JSON (tolerate empty body)
   const txt = await res.text();
   return txt ? JSON.parse(txt) : {};
 }
 
-// ----- helpers: try multiple endpoint paths (auth varies across backends) -----
+// -------- API functions --------
+
+export async function ping() {
+  // Try a couple health-ish endpoints; tolerate missing ones
+  const candidates = ["/hello", "/health", "/healthz", "/api/health"];
+  for (const p of candidates) {
+    try {
+      const url = buildURL(p);
+      const res = await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" });
+      if (res.ok) return handle(res);
+    } catch { /* ignore and try next */ }
+  }
+  // fallback: no-op ok
+  return { ok: true };
+}
+export async function fetchHello() {
+  return ping();
+}
+
+// --- Auth ---
+// NOTE: If AUTH_ENABLED is false, these throw immediately
+function ensureAuthEnabled() {
+  if (!AUTH_ENABLED) throw new Error("AUTH_DISABLED: Auth is not enabled in this deployment.");
+}
+
+// You can extend these arrays if your backend later exposes different routes.
+const REGISTER_PATHS = ["/auth/register", "/register", "/users/register", "/signup"];
+const LOGIN_PATHS    = ["/auth/login", "/login", "/users/login", "/signin"];
+const ME_PATHS       = ["/auth/me", "/me", "/users/me", "/profile"];
+
 async function postJsonFallback(paths, body, headers = defaultPostHeaders) {
   let lastErr;
   for (const p of paths) {
@@ -174,21 +190,14 @@ async function postJsonFallback(paths, body, headers = defaultPostHeaders) {
         body: JSON.stringify(body ?? {}),
         cache: "no-store",
       });
-      if (res.status === 404) {
-        lastErr = new Error("HTTP 404");
-        continue; // try next path
-      }
+      if (res.status === 404) { lastErr = new Error("HTTP 404"); continue; }
       return await handle(res);
     } catch (e) {
-      // Only swallow 404-related or retryable connectivity; otherwise bubble
-      if (String(e?.message || "").includes("404")) {
-        lastErr = e;
-        continue;
-      }
+      if (String(e?.message || "").includes("404")) { lastErr = e; continue; }
       lastErr = e;
     }
   }
-  throw lastErr || new Error("No matching endpoint for POST " + paths.join(", "));
+  throw lastErr || new Error("No matching endpoint: " + paths.join(", "));
 }
 
 async function getJsonFallback(paths, headers = defaultGetHeaders, params) {
@@ -197,76 +206,48 @@ async function getJsonFallback(paths, headers = defaultGetHeaders, params) {
     try {
       const url = buildURL(p, params);
       const res = await fetchWithRetry(url, { headers, cache: "no-store" });
-      if (res.status === 404) {
-        lastErr = new Error("HTTP 404");
-        continue;
-      }
+      if (res.status === 404) { lastErr = new Error("HTTP 404"); continue; }
       return await handle(res);
     } catch (e) {
-      if (String(e?.message || "").includes("404")) {
-        lastErr = e;
-        continue;
-      }
+      if (String(e?.message || "").includes("404")) { lastErr = e; continue; }
       lastErr = e;
     }
   }
-  throw lastErr || new Error("No matching endpoint for GET " + paths.join(", "));
+  throw lastErr || new Error("No matching endpoint: " + paths.join(", "));
 }
 
-// -------- API functions --------
-
-export async function ping() {
-  // probe common health endpoints
-  const candidates = ["/hello", "/health", "/healthz", "/api/health"];
-  return getJsonFallback(candidates);
-}
-export async function fetchHello() {
-  return ping();
+function extractToken(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  return obj.access_token || obj.token || obj.jwt || obj.id_token || obj.access || "";
 }
 
-// --- Auth (adaptive) ---
-/**
- * Tries, in order:
- *   /auth/register, /register, /users/register, /signup
- * Accepts JSON response with access_token/token/jwt/id_token/access
- */
 export async function register({ email, password }) {
-  const data = await postJsonFallback(
-    ["/auth/register", "/register", "/users/register", "/signup"],
-    { email, password }
-  );
+  ensureAuthEnabled();
+  const data = await postJsonFallback(REGISTER_PATHS, { email, password });
   const tok = extractToken(data);
   if (tok) setAuthToken(tok);
   return data;
 }
 
-/**
- * Tries, in order:
- *   /auth/login, /login, /users/login, /signin, /token
- * If your backend expects OAuth2 Password flow (/token with form data),
- * also try the form-encoded variant.
- */
 export async function login({ email, password }) {
-  // First, try JSON-style login endpoints
+  ensureAuthEnabled();
+  // First, try JSON endpoints
   try {
-    const data = await postJsonFallback(
-      ["/auth/login", "/login", "/users/login", "/signin"],
-      { email, password }
-    );
+    const data = await postJsonFallback(LOGIN_PATHS, { email, password });
     const tok = extractToken(data);
     if (tok) setAuthToken(tok);
     return data;
   } catch (e) {
-    // Fallback: OAuth2 password grant (common in FastAPI at /token)
+    // Fallback: OAuth2 password grant at /token (form-encoded), if present
     try {
       const url = buildURL("/token");
-      const params = new URLSearchParams();
-      params.set("username", email);
-      params.set("password", password);
+      const form = new URLSearchParams();
+      form.set("username", email);
+      form.set("password", password);
       const res = await fetchWithRetry(url, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: params.toString(),
+        body: form.toString(),
         cache: "no-store",
       });
       const out = await handle(res);
@@ -274,21 +255,14 @@ export async function login({ email, password }) {
       if (tok) setAuthToken(tok);
       return out;
     } catch {
-      throw e; // surface original error if /token also fails
+      throw e;
     }
   }
 }
 
-/**
- * Tries, in order:
- *   /auth/me, /me, /users/me, /profile
- * Requires Authorization: Bearer <token>
- */
 export async function me() {
-  return getJsonFallback(
-    ["/auth/me", "/me", "/users/me", "/profile"],
-    maybeAuth(defaultGetHeaders)
-  );
+  ensureAuthEnabled();
+  return getJsonFallback(ME_PATHS, maybeAuth(defaultGetHeaders));
 }
 
 /** SSE URL for quote streaming (passes token via query if present) */
@@ -321,6 +295,7 @@ export async function fetchPredict({ ticker, models }) {
  * Returns: { ticker, models, rows: [{ date, close, actual, pred: {MODEL:val}, error_pct: {MODEL:pct} }] }
  */
 export async function fetchPredictHistory({ ticker, models, days = 12 }) {
+  // We need to .append() multiple models=... keys, so build manually
   const url = new URL(`${API_BASE}/predict_history`);
   url.searchParams.set("ticker", ticker);
   url.searchParams.set("days", String(days));
@@ -346,6 +321,7 @@ export async function fetchEarnings(ticker) {
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
+// (unused but kept)
 export async function fetchDividends(ticker) {
   const url = buildURL("/dividends", { ticker });
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
@@ -362,6 +338,7 @@ export async function fetchCloses(ticker, days = 7) {
     await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" })
   );
 
+  // Light sanity normalization: ensure arrays exist & lengths match
   const dates = Array.isArray(payload?.dates) ? payload.dates : [];
   const closes = Array.isArray(payload?.closes) ? payload.closes : [];
   if (dates.length !== closes.length) {
@@ -371,24 +348,32 @@ export async function fetchCloses(ticker, days = 7) {
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
+// Quick stats (52w high/low)
 export async function fetchStats(ticker) {
   const url = buildURL("/stats", { ticker });
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 
 // ---------- Movers / Earnings week ----------
+/** Combined movers (gainers + losers) */
 export async function fetchMovers() {
   const url = buildURL(MOVERS_ENDPOINT);
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
+
+/** Convenience: only top gainers */
 export async function fetchTopGainers() {
   const url = buildURL("/top_gainers");
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
+
+/** Convenience: only top losers */
 export async function fetchTopLosers() {
   const url = buildURL("/top_losers");
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
+
+/** Earnings calendar for this week (Mon–Sun) */
 export async function fetchEarningsWeek() {
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
