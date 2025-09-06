@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import router
+from app.db import init_db
+from app.auth.router import router as auth_router
 
 app = FastAPI(title="Stock & Crypto API", version="1.0.0")
 
@@ -12,7 +14,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.on_event("startup")
+def on_startup():
+    init_db()  # NEW: create tables if not exist
 # Health + tiny root
 @app.get("/", include_in_schema=False)
 def root():
@@ -23,4 +27,5 @@ def health():
     return {"ok": True}
 
 # Mount routers
+app.include_router(auth_router, prefix="/auth", tags=["Auth"])  # NEW
 app.include_router(router)
