@@ -1,3 +1,5 @@
+// frontend/src/api.js
+
 // --- Base URL resolution (env first; safe defaults) ---
 const RAW_ENV_BASE =
   import.meta.env.VITE_API_BASE ||
@@ -16,24 +18,64 @@ const RAW_BASE = RAW_ENV_BASE || HARDCODE_BACKEND || "http://127.0.0.1:8000";
 // Normalize: strip trailing slashes
 export const API_BASE = String(RAW_BASE).replace(/\/+$/, "");
 
-// Feature flag: enable/disable auth UI & calls from frontend
-export const AUTH_ENABLED =
-  String(import.meta.env.VITE_AUTH_ENABLED || "").toLowerCase() === "true";
-
 // Optional env overrides for special endpoints
 const MOVERS_ENDPOINT = import.meta.env.VITE_MOVERS_ENDPOINT || "/movers";
 const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/earnings_week";
+
+// ---- Auth feature toggles / paths ----
+const AUTH_ENABLED = String(import.meta.env.VITE_AUTH_ENABLED ?? "true").toLowerCase() === "true";
+const AUTH_STRICT = String(import.meta.env.VITE_AUTH_STRICT_PATHS ?? "false").toLowerCase() === "true";
+
+const ENV_LOGIN = import.meta.env.VITE_AUTH_LOGIN_PATH || "";
+const ENV_REGISTER = import.meta.env.VITE_AUTH_REGISTER_PATH || "";
+const ENV_ME = import.meta.env.VITE_AUTH_ME_PATH || "";
+
+// Build ordered fallback lists. We’ll try each until we get a non-404.
+const LOGIN_PATHS = [
+  ENV_LOGIN || null,
+  "/auth/login",
+  "/auth/auth/login",
+  "/login",
+  "/users/login",
+  "/signin",
+  "/token", // some backends use OAuth2 Password Grant as /token
+].filter(Boolean);
+
+const REGISTER_PATHS = [
+  ENV_REGISTER || null,
+  "/auth/register",
+  "/auth/auth/register",
+  "/register",
+  "/users/register",
+  "/signup",
+].filter(Boolean);
+
+const ME_PATHS = [
+  ENV_ME || null,
+  "/auth/me",
+  "/auth/auth/me",
+  "/me",
+  "/users/me",
+].filter(Boolean);
 
 // Warn about common mixed-content misconfig: https page calling http backend
 if (typeof window !== "undefined") {
   const isHttpsPage = window.location.protocol === "https:";
   if (isHttpsPage && API_BASE.startsWith("http://")) {
+    // eslint-disable-next-line no-console
     console.warn(
       `[api] API_BASE is HTTP (${API_BASE}) on an HTTPS page. Browsers will block requests. ` +
         `Set VITE_API_BASE to an HTTPS backend URL.`
     );
   }
-  console.info("[api] API_BASE =", API_BASE, "| AUTH_ENABLED =", AUTH_ENABLED);
+  // eslint-disable-next-line no-console
+  console.info("[api] API_BASE =", API_BASE);
+  // eslint-disable-next-line no-console
+  console.info("[api] AUTH_ENABLED =", AUTH_ENABLED, "AUTH_STRICT =", AUTH_STRICT);
+  if (AUTH_ENABLED) {
+    // eslint-disable-next-line no-console
+    console.info("[api] Auth paths (login/register/me) =", LOGIN_PATHS[0], REGISTER_PATHS[0], ME_PATHS[0]);
+  }
 }
 
 // -------- auth token helpers --------
@@ -50,10 +92,9 @@ export function clearAuthToken() {
 }
 
 // -------- fetch helpers --------
-// Slightly generous defaults for free hosting cold starts
-const DEFAULT_RETRIES = 2;        // extra attempts after the first
-const RETRY_DELAY_MS = 600;
-const REQUEST_TIMEOUT_MS = 20000; // 20s network timeout
+const DEFAULT_RETRIES = 1; // extra attempts after the first
+const RETRY_DELAY_MS = 350;
+const REQUEST_TIMEOUT_MS = 10000; // 10s network timeout
 
 const defaultGetHeaders = {
   "Cache-Control": "no-cache",
@@ -125,6 +166,44 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   throw lastErr;
 }
 
+// Try multiple paths, skipping 404s
+async function getFirst(paths, headers = defaultGetHeaders) {
+  const list = AUTH_STRICT ? [paths[0]] : paths;
+  let lastErr;
+  for (const p of list) {
+    try {
+      const url = buildURL(p);
+      const res = await fetchWithRetry(url, { headers, cache: "no-store" });
+      if (res.status === 404) continue;
+      return handle(res);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("All endpoints returned 404");
+}
+
+async function postJsonFirst(paths, body, headers = defaultPostHeaders) {
+  const list = AUTH_STRICT ? [paths[0]] : paths;
+  let lastErr;
+  for (const p of list) {
+    try {
+      const url = buildURL(p);
+      const res = await fetchWithRetry(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        cache: "no-store",
+      });
+      if (res.status === 404) continue;
+      return handle(res);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("All endpoints returned 404");
+}
+
 // Consistent JSON handling + better error messages
 async function handle(res) {
   if (!res || typeof res.ok !== "boolean") {
@@ -152,117 +231,33 @@ async function handle(res) {
 // -------- API functions --------
 
 export async function ping() {
-  // Try a couple health-ish endpoints; tolerate missing ones
-  const candidates = ["/hello", "/health", "/healthz", "/api/health"];
-  for (const p of candidates) {
-    try {
-      const url = buildURL(p);
-      const res = await fetchWithRetry(url, { headers: defaultGetHeaders, cache: "no-store" });
-      if (res.ok) return handle(res);
-    } catch { /* ignore and try next */ }
-  }
-  // fallback: no-op ok
-  return { ok: true };
+  const url = buildURL("/hello");
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 export async function fetchHello() {
   return ping();
 }
 
 // --- Auth ---
-// NOTE: If AUTH_ENABLED is false, these throw immediately
-function ensureAuthEnabled() {
-  if (!AUTH_ENABLED) throw new Error("AUTH_DISABLED: Auth is not enabled in this deployment.");
-}
-
-// You can extend these arrays if your backend later exposes different routes.
-const REGISTER_PATHS = ["/auth/register", "/register", "/users/register", "/signup"];
-const LOGIN_PATHS    = ["/auth/login", "/login", "/users/login", "/signin"];
-const ME_PATHS       = ["/auth/me", "/me", "/users/me", "/profile"];
-
-async function postJsonFallback(paths, body, headers = defaultPostHeaders) {
-  let lastErr;
-  for (const p of paths) {
-    try {
-      const url = buildURL(p);
-      const res = await fetchWithRetry(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body ?? {}),
-        cache: "no-store",
-      });
-      if (res.status === 404) { lastErr = new Error("HTTP 404"); continue; }
-      return await handle(res);
-    } catch (e) {
-      if (String(e?.message || "").includes("404")) { lastErr = e; continue; }
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("No matching endpoint: " + paths.join(", "));
-}
-
-async function getJsonFallback(paths, headers = defaultGetHeaders, params) {
-  let lastErr;
-  for (const p of paths) {
-    try {
-      const url = buildURL(p, params);
-      const res = await fetchWithRetry(url, { headers, cache: "no-store" });
-      if (res.status === 404) { lastErr = new Error("HTTP 404"); continue; }
-      return await handle(res);
-    } catch (e) {
-      if (String(e?.message || "").includes("404")) { lastErr = e; continue; }
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("No matching endpoint: " + paths.join(", "));
-}
-
-function extractToken(obj) {
-  if (!obj || typeof obj !== "object") return "";
-  return obj.access_token || obj.token || obj.jwt || obj.id_token || obj.access || "";
-}
-
 export async function register({ email, password }) {
-  ensureAuthEnabled();
-  const data = await postJsonFallback(REGISTER_PATHS, { email, password });
-  const tok = extractToken(data);
-  if (tok) setAuthToken(tok);
+  if (!AUTH_ENABLED) return { disabled: true };
+  const data = await postJsonFirst(REGISTER_PATHS, { email, password }, defaultPostHeaders);
+  if (data?.access_token) setAuthToken(data.access_token);
   return data;
 }
 
 export async function login({ email, password }) {
-  ensureAuthEnabled();
-  // First, try JSON endpoints
-  try {
-    const data = await postJsonFallback(LOGIN_PATHS, { email, password });
-    const tok = extractToken(data);
-    if (tok) setAuthToken(tok);
-    return data;
-  } catch (e) {
-    // Fallback: OAuth2 password grant at /token (form-encoded), if present
-    try {
-      const url = buildURL("/token");
-      const form = new URLSearchParams();
-      form.set("username", email);
-      form.set("password", password);
-      const res = await fetchWithRetry(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: form.toString(),
-        cache: "no-store",
-      });
-      const out = await handle(res);
-      const tok = extractToken(out);
-      if (tok) setAuthToken(tok);
-      return out;
-    } catch {
-      throw e;
-    }
-  }
+  if (!AUTH_ENABLED) return { disabled: true };
+  // Most backends here expect JSON {email,password}; if your backend uses OAuth2 /token,
+  // set VITE_AUTH_LOGIN_PATH=/token and adjust server to accept form-encoded.
+  const data = await postJsonFirst(LOGIN_PATHS, { email, password }, defaultPostHeaders);
+  if (data?.access_token) setAuthToken(data.access_token);
+  return data;
 }
 
 export async function me() {
-  ensureAuthEnabled();
-  return getJsonFallback(ME_PATHS, maybeAuth(defaultGetHeaders));
+  if (!AUTH_ENABLED) return {};
+  return getFirst(ME_PATHS, maybeAuth(defaultGetHeaders));
 }
 
 /** SSE URL for quote streaming (passes token via query if present) */
