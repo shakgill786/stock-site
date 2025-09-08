@@ -37,6 +37,7 @@ export default function AuthModal({ open, onClose }) {
         <form onSubmit={submit} style={{ marginTop: 10 }}>
           <input
             type="email"
+            autoComplete="email"
             placeholder="email@domain.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
