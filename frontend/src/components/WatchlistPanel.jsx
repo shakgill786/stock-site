@@ -1,9 +1,9 @@
 // frontend/src/components/WatchlistPanel.jsx
 import { useEffect, useMemo, useState } from "react";
-import useLocalStorage from "../hooks/useLocalStorage";
+import usePerUserStorage from "../hooks/usePerUserStorage";
 
 export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
-  const [watchlist, setWatchlist] = useLocalStorage("WATCHLIST_V1", []);
+  const [watchlist, setWatchlist] = usePerUserStorage("WATCHLIST_V1", []);
   const [symbol, setSymbol] = useState("");
   const [tag, setTag] = useState("no tag");
   const [filter, setFilter] = useState("all");

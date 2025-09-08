@@ -1,13 +1,27 @@
-import { useState } from "react";
+// frontend/src/components/AuthModal.jsx
+import { useMemo, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 
 export default function AuthModal({ open, onClose }) {
-  const { login, register } = useAuth();
+  const { login, register, updateProfile } = useAuth();
   const [mode, setMode] = useState("login"); // 'login' | 'signup'
+
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const isSignup = mode === "signup";
+  const canSubmit = useMemo(() => {
+    if (!email || !password) return false;
+    if (isSignup) {
+      if (!name || name.trim().length < 2) return false;
+      if (password !== confirm) return false;
+    }
+    return true;
+  }, [email, password, confirm, name, isSignup]);
 
   if (!open) return null;
 
@@ -16,8 +30,13 @@ export default function AuthModal({ open, onClose }) {
     setErr("");
     setBusy(true);
     try {
-      if (mode === "login") await login(email, password);
-      else await register(email, password);
+      if (isSignup) {
+        if (password !== confirm) throw new Error("Passwords do not match");
+        await register(email, password);       // backend: only email+password
+        if (name?.trim()) updateProfile({ name: name.trim() }); // store locally
+      } else {
+        await login(email, password);
+      }
       onClose?.();
     } catch (e2) {
       setErr(e2?.message || "Failed");
@@ -30,11 +49,24 @@ export default function AuthModal({ open, onClose }) {
     <div style={backdrop} onClick={onClose}>
       <div className="card" style={card} onClick={(e) => e.stopPropagation()}>
         <div className="row" style={{ justifyContent: "space-between" }}>
-          <h3 style={{ margin: 0 }}>{mode === "login" ? "Sign in" : "Create account"}</h3>
-          <button className="btn ghost" onClick={onClose}>✕</button>
+          <h3 style={{ margin: 0 }}>{isSignup ? "Create account" : "Sign in"}</h3>
+          <button className="btn ghost" onClick={onClose} aria-label="Close">✕</button>
         </div>
 
         <form onSubmit={submit} style={{ marginTop: 10 }}>
+          {isSignup && (
+            <input
+              type="text"
+              autoComplete="name"
+              placeholder="Full name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              minLength={2}
+              style={{ width: "100%", marginBottom: 8 }}
+            />
+          )}
+
           <input
             type="email"
             autoComplete="email"
@@ -44,26 +76,47 @@ export default function AuthModal({ open, onClose }) {
             required
             style={{ width: "100%", marginBottom: 8 }}
           />
+
           <input
             type="password"
-            placeholder="Password (min 6 chars)"
+            placeholder={isSignup ? "Create password (min 6 chars)" : "Password"}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
             minLength={6}
-            style={{ width: "100%", marginBottom: 10 }}
+            autoComplete={isSignup ? "new-password" : "current-password"}
+            style={{ width: "100%", marginBottom: isSignup ? 8 : 10 }}
           />
+
+          {isSignup && (
+            <input
+              type="password"
+              placeholder="Confirm password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              required
+              minLength={6}
+              autoComplete="new-password"
+              style={{ width: "100%", marginBottom: 10 }}
+            />
+          )}
+
           {err && <div className="muted" style={{ color: "#ff6b6b", marginBottom: 8 }}>{err}</div>}
-          <button className="btn" disabled={busy} style={{ width: "100%" }}>
-            {busy ? "Please wait…" : (mode === "login" ? "Sign in" : "Create account")}
+
+          <button className="btn" disabled={busy || !canSubmit} style={{ width: "100%" }}>
+            {busy ? "Please wait…" : isSignup ? "Create account" : "Sign in"}
           </button>
         </form>
 
         <div className="muted" style={{ textAlign: "center", marginTop: 10 }}>
-          {mode === "login" ? (
-            <>No account? <button className="ticker-link" onClick={() => setMode("signup")}>Sign up</button></>
+          {isSignup ? (
+            <>Have an account?{" "}
+              <button className="ticker-link" onClick={() => setMode("login")}>Sign in</button>
+            </>
           ) : (
-            <>Have an account? <button className="ticker-link" onClick={() => setMode("login")}>Sign in</button></>
+            <>No account?{" "}
+              <button className="ticker-link" onClick={() => setMode("signup")}>Sign up</button>
+            </>
           )}
         </div>
       </div>

@@ -1,7 +1,7 @@
 // frontend/src/components/CompareMode.jsx
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
-import useLocalStorage from "../hooks/useLocalStorage";
+import usePerUserStorage from "../hooks/usePerUserStorage";
 
 const MAX_TICKERS = 3;
 const SAVE_KEY = "COMPARE_LAST_V1";
@@ -30,7 +30,7 @@ export default function CompareMode({
     }
   };
 
-  const [watchlist] = useLocalStorage("WATCHLIST_V1", []);
+  const [watchlist] = usePerUserStorage("WATCHLIST_V1", []);
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}

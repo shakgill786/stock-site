@@ -585,7 +585,7 @@ export default function App() {
           <div className="hero-right" style={{ display: "flex", gap: 8 }}>
             {user ? (
               <>
-                <span className="muted" style={{ fontSize: 14 }}>👋 {user.email}</span>
+                <span className="muted" style={{ fontSize: 14 }}>👋 {user?.name || user?.email}</span>
                 <button className="btn ghost" onClick={logout} title="Sign out">Sign out</button>
               </>
             ) : (
