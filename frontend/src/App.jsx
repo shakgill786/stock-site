@@ -128,6 +128,10 @@ export default function App() {
   const [ticker, setTicker] = useState("AAPL");
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
+  // Compare Mode (controlled)
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareSymbols, setCompareSymbols] = useState([]);
+
   // Data states
   const [quote, setQuote] = useState(null);
   const [earnings, setEarnings] = useState(null);
@@ -148,9 +152,6 @@ export default function App() {
   const prevPriceRef = useRef(null);
   const tweenPrice = useTweenNumber(quote?.current_price ?? 0, { duration: 450 });
   const [blinkClass, setBlinkClass] = useState("");
-
-  // Compare Mode
-  const [compareOpen, setCompareOpen] = useState(false);
 
   // Price chart data (main card)
   const [closes, setCloses] = useState([]);
@@ -386,10 +387,20 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    // Smooth scroll to the main section (no page jump)
     requestAnimationFrame(() => {
       mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
+  };
+
+  // ➕ from Watchlist into Compare
+  const handleAddToCompare = (sym) => {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return;
+    setCompareSymbols((prev) => {
+      const next = [...new Set([...(prev || []), s])];
+      return next.slice(0, 3);
+    });
+    setCompareOpen(true);
   };
 
   // Client-side metrics & recommendation
@@ -416,14 +427,12 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Actual vs. Predicted (chart shows exactly the table window) ----------
+  // ---------- Actual vs. Predicted ----------
   const horizon = results?.[0]?.predictions?.length || 0;
 
-  // table past window (prefer predict_history dates)
   const pastDaysToShow = 10;
   const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
 
-  // future labels off the last past date (timezone-safe + skip weekends)
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : closeDates.length
@@ -436,16 +445,13 @@ export default function App() {
     return fmtLocalISO(d);
   });
 
-  // chart = past window + forecast horizon
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // actual values aligned to the past window labels
   const actualForPastLabelsRaw = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
     return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
   });
 
-  // Force the last past day's Actual to the official last_close
   const actualForPastLabels = (() => {
     const arr = [...actualForPastLabelsRaw];
     const lastIdx = arr.length - 1;
@@ -482,7 +488,6 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // dashed backtest for past window
       const backtestSeries = chartLabels.map((lab) => {
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
@@ -501,7 +506,6 @@ export default function App() {
         spanGaps: true,
       });
 
-      // solid current forecast, anchored to last actual in past window
       const start =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
@@ -547,14 +551,12 @@ export default function App() {
     },
   };
 
-  // Table rows: last N past days (backtest) + future horizon (current predictions)
   const pastRows = pastLabels.map((iso, i, arr) => {
     const dk = dkey(iso);
     const row = histByDate[dk];
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : (row?.actual ?? null);
 
-    // last past row uses quote.last_close
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -570,8 +572,6 @@ export default function App() {
     const perModel = results.map((r) => r.predictions?.[i] ?? null);
     return { date: d, actual: null, perModel, kind: "future" };
   });
-
-  const avpRows = [...pastRows, ...futureRows];
 
   return (
     <div className="app-root">
@@ -637,7 +637,11 @@ export default function App() {
       <main className="container grid-2col">
         {/* LEFT: Watchlist */}
         <aside className="left-rail">
-          <WatchlistPanel current={ticker} onLoad={(s) => setTicker(s)} />
+          <WatchlistPanel
+            current={ticker}
+            onLoad={(s) => setTicker(s)}
+            onAddToCompare={handleAddToCompare}   // ➕ hook up compare
+          />
           <div style={{ marginTop: 12 }}>
             <label>
               <input
@@ -661,7 +665,10 @@ export default function App() {
 
           {compareOpen && (
             <CompareMode
+              symbols={compareSymbols}                 // controlled ✅
+              onSymbolsChange={setCompareSymbols}
               defaultModels={models}
+              rememberSession={false}                  // no auto-restore, no phantom MSFT
               onExit={() => setCompareOpen(false)}
             />
           )}
@@ -795,12 +802,10 @@ export default function App() {
             <div className="card" style={{ marginTop: 12 }}>
               <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
 
-              {/* Chart */}
               <div style={{ height: 260, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.03)", padding: 8 }}>
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
-              {/* Table */}
               <div className="table-wrap" style={{ marginTop: 12 }}>
                 <table className="table">
                   <thead>
@@ -852,7 +857,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Prediction Error */}
           {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
           {/* Model selector */}
@@ -869,7 +873,7 @@ export default function App() {
             ))}
           </div>
 
-          {/* Forecast Table (original) — shows confidence when present */}
+          {/* Forecast Table */}
           {results.length > 0 && (
             <div className="card table-card">
               <div className="table-wrap">

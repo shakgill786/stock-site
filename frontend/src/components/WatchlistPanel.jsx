@@ -1,7 +1,8 @@
+// frontend/src/components/WatchlistPanel.jsx
 import { useEffect, useMemo, useState } from "react";
 import useLocalStorage from "../hooks/useLocalStorage";
 
-export default function WatchlistPanel({ current, onLoad }) {
+export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
   const [watchlist, setWatchlist] = useLocalStorage("WATCHLIST_V1", []);
   const [symbol, setSymbol] = useState("");
   const [tag, setTag] = useState("no tag");
@@ -13,7 +14,7 @@ export default function WatchlistPanel({ current, onLoad }) {
   // Auto-collapse on small screens; open on desktop
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1060px)");
-    const setFromMQ = () => setCollapsed(mql.matches); // collapsed on mobile by default
+    const setFromMQ = () => setCollapsed(mql.matches);
     setFromMQ();
     mql.addEventListener?.("change", setFromMQ);
     return () => mql.removeEventListener?.("change", setFromMQ);
@@ -148,15 +149,28 @@ export default function WatchlistPanel({ current, onLoad }) {
                 <div style={{ minWidth: 64, fontWeight: 700 }}>{s}</div>
                 <div className="muted" style={{ fontSize: 12 }}>{t || "no tag"}</div>
               </div>
-              <button
-                className="btn"
-                onClick={() => remove(s)}
-                style={{ width: 38, height: 32, padding: 0 }}
-                aria-label={`Remove ${s}`}
-                title={`Remove ${s}`}
-              >
-                ×
-              </button>
+
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => onAddToCompare?.(s)}
+                  title="Add to Compare"
+                  aria-label={`Add ${s} to Compare`}
+                  style={{ width: 38, height: 32, padding: 0 }}
+                >
+                  ➕
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => remove(s)}
+                  style={{ width: 38, height: 32, padding: 0 }}
+                  aria-label={`Remove ${s}`}
+                  title={`Remove ${s}`}
+                >
+                  ×
+                </button>
+              </div>
             </div>
           ))}
           {filtered.length === 0 && <div className="muted">No symbols.</div>}

@@ -1,3 +1,4 @@
+// frontend/src/components/CompareMode.jsx
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -5,9 +6,31 @@ import useLocalStorage from "../hooks/useLocalStorage";
 const MAX_TICKERS = 3;
 const SAVE_KEY = "COMPARE_LAST_V1";
 
-export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit }) {
+export default function CompareMode({
+  symbols,                     // optional controlled list
+  onSymbolsChange,             // optional setter for controlled list
+  defaultModels = ["LSTM", "ARIMA"],
+  rememberSession = false,     // 🔒 default OFF so placeholders never sneak in
+  onExit,
+}) {
+  const isControlled = Array.isArray(symbols) && typeof onSymbolsChange === "function";
+
+  // when uncontrolled, we keep our own state
+  const [internalSelected, setInternalSelected] = useState([]);
+  const selected = isControlled ? symbols : internalSelected;
+
+  // helpers to update selected for both modes
+  const upsert = (fnOrArr) => {
+    if (isControlled) {
+      if (typeof fnOrArr === "function") onSymbolsChange(fnOrArr);
+      else onSymbolsChange(() => fnOrArr);
+    } else {
+      if (typeof fnOrArr === "function") setInternalSelected(fnOrArr);
+      else setInternalSelected(fnOrArr);
+    }
+  };
+
   const [watchlist] = useLocalStorage("WATCHLIST_V1", []);
-  const [selected, setSelected] = useState([]);
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
@@ -21,47 +44,52 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
     return () => { mountedRef.current = false; };
   }, []);
 
-  // restore last session
+  // 🔁 restore last session (only if requested and UNCONTROLLED)
   useEffect(() => {
+    if (!rememberSession || isControlled) return;
     try {
       const saved = JSON.parse(localStorage.getItem(SAVE_KEY) || "null");
       if (saved && Array.isArray(saved.tickers)) {
-        setSelected(saved.tickers.slice(0, MAX_TICKERS));
-        if (saved.strategy === "short" || saved.strategy === "long") {
-          setWinnerStrategy(saved.strategy);
-        }
+        upsert(saved.tickers.slice(0, MAX_TICKERS));
+      }
+      if (saved?.strategy === "short" || saved?.strategy === "long") {
+        setWinnerStrategy(saved.strategy);
       }
     } catch {}
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rememberSession, isControlled]);
 
-  // persist session
+  // 💾 persist session (only if requested and UNCONTROLLED)
   useEffect(() => {
+    if (!rememberSession || isControlled) return;
     const payload = { tickers: selected, strategy: winnerStrategy };
     localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
-  }, [selected, winnerStrategy]);
+  }, [selected, winnerStrategy, rememberSession, isControlled]);
 
   const addFromInput = () => {
     const s = input.trim().toUpperCase();
     if (!s) return;
-    if (!selected.includes(s) && selected.length < MAX_TICKERS) {
-      setSelected((prev) => [...prev, s]);
-    }
+    upsert((prev) => {
+      const next = [...new Set([...(prev || []), s])];
+      return next.slice(0, MAX_TICKERS);
+    });
     setInput("");
   };
 
   const togglePick = (s) => {
-    if (selected.includes(s)) {
-      setSelected(selected.filter((x) => x !== s));
-    } else if (selected.length < MAX_TICKERS) {
-      setSelected([...selected, s]);
-    }
+    upsert((prev = []) => {
+      const has = prev.includes(s);
+      if (has) return prev.filter((x) => x !== s);
+      if (prev.length >= MAX_TICKERS) return prev;
+      return [...prev, s];
+    });
   };
 
-  const clearAll = () => setSelected([]);
+  const clearAll = () => upsert([]);
 
   const loadFromWatchlist = () => {
     const picks = (watchlist || []).map((w) => w.symbol).slice(0, MAX_TICKERS);
-    setSelected(picks);
+    upsert(picks);
   };
 
   /** Clean/validate closes array */
@@ -74,11 +102,10 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   /** Pull ~5 years if available; include dates for tooltips */
   const fetchClosesSafe = async (ticker) => {
     try {
-      const a = await fetchCloses(ticker, 1825); // ~5 years
+      const a = await fetchCloses(ticker, 1825);
       let c = normalizeCloses(a?.closes);
       if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
 
-      // retry looser (backend default)
       const b = await fetchCloses(ticker);
       c = normalizeCloses(b?.closes);
       return { dates: Array.isArray(b?.dates) ? b.dates : [], closes: c };
@@ -91,7 +118,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
   const load = useCallback(async () => {
     const myVer = ++reqVerRef.current;
 
-    if (!selected.length) {
+    if (!selected?.length) {
       if (mountedRef.current && reqVerRef.current === myVer) setRows([]);
       return;
     }
@@ -121,8 +148,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
               const mapeProxy =
                 r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
                 r.predictions.length;
-              const meanPred =
-                r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+              const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
               const avgChangePct = ((meanPred - base) / base) * 100;
               return { model: r.model, mapeProxy, avgChangePct };
             });
@@ -179,9 +205,7 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
     setRows(withWinner);
   }, [selected, models, winnerStrategy]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   return (
     <div className="card" style={{ marginTop: 12 }}>
@@ -235,8 +259,9 @@ export default function CompareMode({ defaultModels = ["LSTM", "ARIMA"], onExit 
             <input
               value={input}
               onChange={(e) => setInput(e.target.value.toUpperCase())}
-              placeholder="e.g. MSFT"
+              placeholder="e.g. MSFT"     // just a placeholder — not auto-added
               onKeyDown={(e) => e.key === "Enter" && addFromInput()}
+              autoComplete="off"
             />
             <button className="btn" onClick={addFromInput} disabled={selected.length >= MAX_TICKERS}>Add</button>
             <button className="btn ghost" onClick={clearAll} disabled={selected.length === 0}>Clear</button>
@@ -369,10 +394,10 @@ function CompareColumn({ row }) {
                 style={{
                   color:
                     recommendation.action === "Buy"
-                    ? "#2e7d32" // green
+                    ? "#2e7d32"
                     : recommendation.action === "Sell"
-                    ? "#c62828" // red
-                    : "#9aa0a6", // grey for Hold
+                    ? "#c62828"
+                    : "#9aa0a6",
                 }}
               >
                 {recommendation.action}
