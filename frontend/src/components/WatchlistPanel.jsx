@@ -1,17 +1,16 @@
-// frontend/src/components/WatchlistPanel.jsx
 import { useEffect, useMemo, useState } from "react";
 import usePerUserStorage from "../hooks/usePerUserStorage";
 
 export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
+  // Per-user watchlist (key is namespaced by the hook)
   const [watchlist, setWatchlist] = usePerUserStorage("WATCHLIST_V1", []);
+
   const [symbol, setSymbol] = useState("");
   const [tag, setTag] = useState("no tag");
   const [filter, setFilter] = useState("all");
 
   // Collapsible on mobile
   const [collapsed, setCollapsed] = useState(false);
-
-  // Auto-collapse on small screens; open on desktop
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1060px)");
     const setFromMQ = () => setCollapsed(mql.matches);
@@ -28,6 +27,7 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
   const add = () => {
     const s = symbol.trim().toUpperCase();
     if (!s) return;
+    if (!/^[A-Z0-9.\-]{1,15}$/.test(s)) return; // light sanity gate
     if (!watchlist.some((w) => w.symbol === s)) {
       setWatchlist([...watchlist, { symbol: s, tag }]);
     }

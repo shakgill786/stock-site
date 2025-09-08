@@ -1,4 +1,3 @@
-// frontend/src/components/CompareMode.jsx
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
 import usePerUserStorage from "../hooks/usePerUserStorage";
@@ -10,16 +9,16 @@ export default function CompareMode({
   symbols,                     // optional controlled list
   onSymbolsChange,             // optional setter for controlled list
   defaultModels = ["LSTM", "ARIMA"],
-  rememberSession = false,     // 🔒 default OFF so placeholders never sneak in
+  rememberSession = false,     // default OFF so placeholders never sneak in
   onExit,
 }) {
   const isControlled = Array.isArray(symbols) && typeof onSymbolsChange === "function";
 
-  // when uncontrolled, we keep our own state
+  // uncontrolled selection state
   const [internalSelected, setInternalSelected] = useState([]);
   const selected = isControlled ? symbols : internalSelected;
 
-  // helpers to update selected for both modes
+  // update helper
   const upsert = (fnOrArr) => {
     if (isControlled) {
       if (typeof fnOrArr === "function") onSymbolsChange(fnOrArr);
@@ -30,7 +29,9 @@ export default function CompareMode({
     }
   };
 
+  // per-user watchlist reader
   const [watchlist] = usePerUserStorage("WATCHLIST_V1", []);
+
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
@@ -44,7 +45,7 @@ export default function CompareMode({
     return () => { mountedRef.current = false; };
   }, []);
 
-  // 🔁 restore last session (only if requested and UNCONTROLLED)
+  // restore last session (only if requested and UNCONTROLLED)
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     try {
@@ -59,7 +60,7 @@ export default function CompareMode({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rememberSession, isControlled]);
 
-  // 💾 persist session (only if requested and UNCONTROLLED)
+  // persist session (only if requested and UNCONTROLLED)
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     const payload = { tickers: selected, strategy: winnerStrategy };
@@ -69,7 +70,8 @@ export default function CompareMode({
   const addFromInput = () => {
     const s = input.trim().toUpperCase();
     if (!s) return;
-    upsert((prev) => {
+    if (!/^[A-Z0-9.\-]{1,15}$/.test(s)) return;
+    upsert((prev = []) => {
       const next = [...new Set([...(prev || []), s])];
       return next.slice(0, MAX_TICKERS);
     });
@@ -92,17 +94,17 @@ export default function CompareMode({
     upsert(picks);
   };
 
-  /** Clean/validate closes array */
+  // normalize closes array
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
     const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  /** Pull ~5 years if available; include dates for tooltips */
+  // try long history then fallback
   const fetchClosesSafe = async (ticker) => {
     try {
-      const a = await fetchCloses(ticker, 1825);
+      const a = await fetchCloses(ticker, 1825); // ~5 years
       let c = normalizeCloses(a?.closes);
       if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
 
@@ -148,7 +150,8 @@ export default function CompareMode({
               const mapeProxy =
                 r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
                 r.predictions.length;
-              const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+              const meanPred =
+                r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
               const avgChangePct = ((meanPred - base) / base) * 100;
               return { model: r.model, mapeProxy, avgChangePct };
             });
@@ -236,14 +239,14 @@ export default function CompareMode({
           <div style={{ maxHeight: 160, overflow: "auto", border: "1px solid var(--border)", borderRadius: 10, padding: 8 }}>
             {watchlist.length === 0 && <div className="muted">Your watchlist is empty.</div>}
             {watchlist.map(({ symbol, tag }) => {
-              const active = selected.includes(symbol);
+              const active = selected?.includes(symbol);
               return (
                 <label key={symbol} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
                   <input
                     type="checkbox"
-                    checked={active}
+                    checked={!!active}
                     onChange={() => togglePick(symbol)}
-                    disabled={!active && selected.length >= MAX_TICKERS}
+                    disabled={!active && (selected?.length || 0) >= MAX_TICKERS}
                   />
                   <span style={{ minWidth: 70, display: "inline-block" }}>{symbol}</span>
                   <span className="muted" style={{ fontSize: 12 }}>{tag}</span>
@@ -263,12 +266,12 @@ export default function CompareMode({
               onKeyDown={(e) => e.key === "Enter" && addFromInput()}
               autoComplete="off"
             />
-            <button className="btn" onClick={addFromInput} disabled={selected.length >= MAX_TICKERS}>Add</button>
-            <button className="btn ghost" onClick={clearAll} disabled={selected.length === 0}>Clear</button>
+            <button className="btn" onClick={addFromInput} disabled={(selected?.length || 0) >= MAX_TICKERS}>Add</button>
+            <button className="btn ghost" onClick={clearAll} disabled={!selected?.length}>Clear</button>
           </div>
 
           <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-            Selected: {selected.join(", ") || "—"}
+            Selected: {(selected || []).join(", ") || "—"}
           </div>
 
           <h4 style={{ margin: "12px 0 6px" }}>Models</h4>
@@ -394,10 +397,10 @@ function CompareColumn({ row }) {
                 style={{
                   color:
                     recommendation.action === "Buy"
-                    ? "#2e7d32"
-                    : recommendation.action === "Sell"
-                    ? "#c62828"
-                    : "#9aa0a6",
+                      ? "#2e7d32"
+                      : recommendation.action === "Sell"
+                      ? "#c62828"
+                      : "#9aa0a6",
                 }}
               >
                 {recommendation.action}
@@ -481,6 +484,7 @@ function useTweenNumber(target = 0, { duration = 450 } = {}) {
 /** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
 function InteractiveChart({ data = [], labels = [], width = 220, height = 60, big = false }) {
   const pad = 10;
+  theight: 60
   const w = width - pad * 2;
   const h = height - pad * 2;
 
@@ -489,7 +493,6 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   const [hoverIdx, setHoverIdx] = useState(null);
   const [drag, setDrag] = useState(null); // {startX, startView}
 
-  // reset view if data length changes
   useEffect(() => {
     setView({ start: 0, end: Math.max(0, data.length - 1) });
   }, [data.length]);
@@ -498,7 +501,6 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     return <div className="muted" style={{ fontSize: 12 }}>no data</div>;
   }
 
-  // clamp helpers
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
@@ -530,38 +532,24 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
-    // drag-to-pan
     if (drag) {
       const dx = x - drag.startX;
       const frac = dx / w;
       const windowSize = drag.startView.end - drag.startView.start;
       let newStart = drag.startView.start - Math.round(frac * windowSize);
       let newEnd = newStart + windowSize;
-      // clamp range
-      if (newStart < 0) {
-        newStart = 0;
-        newEnd = windowSize;
-      }
-      if (newEnd > data.length - 1) {
-        newEnd = data.length - 1;
-        newStart = newEnd - windowSize;
-      }
+      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
       setView({ start: newStart, end: newEnd });
     }
   };
 
-  const onLeave = () => {
-    setCursorX(null);
-    setHoverIdx(null);
-    setDrag(null);
-  };
-
+  const onLeave = () => { setCursorX(null); setHoverIdx(null); setDrag(null); };
   const onDown = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     setDrag({ startX: x, startView: { ...view } });
   };
-
   const onUp = () => setDrag(null);
 
   const onWheel = (e) => {
@@ -571,7 +559,7 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     const focusIdx = idxForX(x);
 
     const windowSize = vEnd - vStart;
-    const delta = Math.sign(e.deltaY); // 1 = zoom out, -1 = zoom in
+    const delta = Math.sign(e.deltaY); // 1 = out, -1 = in
     const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = clamp(newSize, 5, data.length - 1);
@@ -579,14 +567,8 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
     let newEnd = newStart + newSize;
 
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = newSize;
-    }
-    if (newEnd > data.length - 1) {
-      newEnd = data.length - 1;
-      newStart = newEnd - newSize;
-    }
+    if (newStart < 0) { newStart = 0; newEnd = newSize; }
+    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
 
     setView({ start: newStart, end: newEnd });
   };
@@ -598,7 +580,6 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
-  // Hover label prefers real date when labels align
   let hoverLabel;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -613,7 +594,6 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
     hoverLabel = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
-  // tooltip width depends on label length
   const textW = Math.min(180, 70 + String(hoverLabel).length * 6);
   const boxX = Math.min(showX + 8, width - (textW + 10));
   const boxY = Math.max(showY - 26, 2);
@@ -630,33 +610,14 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      {/* background */}
       <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-
-      {/* polyline */}
-      <polyline
-        fill="none"
-        stroke={lastUp ? "#2e7d32" : "#c62828"}
-        strokeWidth={big ? 2.5 : 2}
-        points={points}
-      />
-
-      {/* cursor + crosshair */}
+      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
       {cursorX != null && (
         <>
           <line x1={showX} x2={showX} y1={pad} y2={pad + h} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
-          {/* tooltip bubble */}
           <g>
-            <rect
-              x={boxX}
-              y={boxY}
-              width={textW}
-              height="22"
-              rx="6"
-              fill="rgba(0,0,0,0.65)"
-              stroke="rgba(255,255,255,0.25)"
-            />
+            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {hoverLabel}
             </text>
