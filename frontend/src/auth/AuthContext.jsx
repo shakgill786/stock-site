@@ -5,8 +5,13 @@ import * as api from "../api";
 const AuthCtx = createContext(null);
 
 // ----- small helpers for local "profile" (name, etc.) -----
-const profileKeyFor = (u) =>
-  `PROFILE_V1__${(u?.id || u?.email || "guest").toLowerCase()}`;
+// Always coerce to string before .toLowerCase() to avoid crashes
+const safeScope = (u, fallback = "guest") => {
+  const raw = (u?.id ?? u?.email ?? fallback);
+  return String(raw || fallback).toLowerCase();
+};
+
+const profileKeyFor = (u) => `PROFILE_V1__${safeScope(u)}`;
 
 const readProfile = (u) => {
   try {
@@ -28,7 +33,7 @@ const writeProfile = (u, patch) => {
 const migrateWatchlistToUser = (u) => {
   try {
     const globalKey = "WATCHLIST_V1";
-    const scopedKey = `WATCHLIST_V1__${(u?.id || u?.email || "").toLowerCase()}`;
+    const scopedKey = `WATCHLIST_V1__${safeScope(u, "")}`;
     const oldVal = localStorage.getItem(globalKey);
     const already = localStorage.getItem(scopedKey);
     if (oldVal && !already) {

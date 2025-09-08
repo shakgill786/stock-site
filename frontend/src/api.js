@@ -231,8 +231,8 @@ async function handle(res) {
 // -------- API functions --------
 
 export async function ping() {
-  const url = buildURL("/hello");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+   const url = buildURL("/diag");
+   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
 }
 export async function fetchHello() {
   return ping();

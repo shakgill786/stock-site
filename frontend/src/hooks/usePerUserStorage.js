@@ -13,7 +13,8 @@ import { useAuth } from "../auth/AuthContext";
  */
 export default function usePerUserStorage(baseKey, initialValue) {
   const { user } = useAuth?.() || { user: null };
-  const uid = (user?.id || user?.email || "").toLowerCase() || "guest";
+  const rawUid = user?.id ?? user?.email ?? "guest";
+  const uid = String(rawUid || "guest").toLowerCase();
   const effectiveKey = useMemo(() => `${baseKey}__${uid}`, [baseKey, uid]);
 
   const read = () => {
