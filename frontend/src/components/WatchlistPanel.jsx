@@ -1,13 +1,26 @@
+// frontend/src/components/WatchlistPanel.jsx
 import { useEffect, useMemo, useState } from "react";
 import usePerUserStorage from "../hooks/usePerUserStorage";
+import { useAuth } from "../auth/AuthContext";
 
 export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
+  // who’s signed in (for resetting transient UI state on switch)
+  const { user } = useAuth();
+  const scope = String((user?.id || user?.email || "guest")).toLowerCase();
+
   // Per-user watchlist (key is namespaced by the hook)
   const [watchlist, setWatchlist] = usePerUserStorage("WATCHLIST_V1", []);
 
   const [symbol, setSymbol] = useState("");
   const [tag, setTag] = useState("no tag");
   const [filter, setFilter] = useState("all");
+
+  // Reset inputs whenever the account changes
+  useEffect(() => {
+    setSymbol("");
+    setTag("no tag");
+    setFilter("all");
+  }, [scope]);
 
   // Collapsible on mobile
   const [collapsed, setCollapsed] = useState(false);
@@ -21,7 +34,7 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
 
   const filtered = useMemo(() => {
     if (filter === "all") return watchlist;
-    return watchlist.filter((w) => (w.tag || "no tag") === filter);
+    return (watchlist || []).filter((w) => (w.tag || "no tag") === filter);
   }, [watchlist, filter]);
 
   const add = () => {
@@ -29,12 +42,12 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
     if (!s) return;
     if (!/^[A-Z0-9.\-]{1,15}$/.test(s)) return; // light sanity gate
     if (!watchlist.some((w) => w.symbol === s)) {
-      setWatchlist([...watchlist, { symbol: s, tag }]);
+      setWatchlist([...(watchlist || []), { symbol: s, tag }]);
     }
     setSymbol("");
   };
 
-  const remove = (s) => setWatchlist(watchlist.filter((w) => w.symbol !== s));
+  const remove = (s) => setWatchlist((watchlist || []).filter((w) => w.symbol !== s));
   const clearAll = () => setWatchlist([]);
 
   const onKeyDown = (e) => {

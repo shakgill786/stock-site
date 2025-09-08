@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
 import usePerUserStorage from "../hooks/usePerUserStorage";
+import { useAuth } from "../auth/AuthContext";
 
 const MAX_TICKERS = 3;
-const SAVE_KEY = "COMPARE_LAST_V1";
+const SAVE_KEY_BASE = "COMPARE_LAST_V1";
 
 export default function CompareMode({
   symbols,                     // optional controlled list
@@ -12,13 +13,19 @@ export default function CompareMode({
   rememberSession = false,     // default OFF so placeholders never sneak in
   onExit,
 }) {
+  const { user } = useAuth();
+  const scope = useMemo(
+    () => String((user?.id || user?.email || "guest")).toLowerCase(),
+    [user?.id, user?.email]
+  );
+  const SAVE_KEY = `${SAVE_KEY_BASE}__${scope}`;
+
   const isControlled = Array.isArray(symbols) && typeof onSymbolsChange === "function";
 
-  // uncontrolled selection state
+  // uncontrolled internal selection
   const [internalSelected, setInternalSelected] = useState([]);
   const selected = isControlled ? symbols : internalSelected;
 
-  // update helper
   const upsert = (fnOrArr) => {
     if (isControlled) {
       if (typeof fnOrArr === "function") onSymbolsChange(fnOrArr);
@@ -29,13 +36,23 @@ export default function CompareMode({
     }
   };
 
-  // per-user watchlist reader
+  // per-user watchlist
   const [watchlist] = usePerUserStorage("WATCHLIST_V1", []);
 
   const [input, setInput] = useState("");
   const [models, setModels] = useState(defaultModels);
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
   const [winnerStrategy, setWinnerStrategy] = useState("long"); // "long" | "short"
+
+  // 🔴 CLEAR transient state on user change (prevents cross-account bleed)
+  useEffect(() => {
+    upsert([]);
+    setRows([]);
+    setInput("");
+    // optionally reset strategy to default if you want:
+    // setWinnerStrategy("long");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
 
   // request versioning to avoid race conditions
   const reqVerRef = useRef(0);
@@ -45,7 +62,7 @@ export default function CompareMode({
     return () => { mountedRef.current = false; };
   }, []);
 
-  // restore last session (only if requested and UNCONTROLLED)
+  // 🔁 restore last session (scoped to user) — only if UNCONTROLLED
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     try {
@@ -58,14 +75,14 @@ export default function CompareMode({
       }
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rememberSession, isControlled]);
+  }, [rememberSession, isControlled, SAVE_KEY]);
 
-  // persist session (only if requested and UNCONTROLLED)
+  // 💾 persist session (scoped to user) — only if UNCONTROLLED
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     const payload = { tickers: selected, strategy: winnerStrategy };
     localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
-  }, [selected, winnerStrategy, rememberSession, isControlled]);
+  }, [selected, winnerStrategy, rememberSession, isControlled, SAVE_KEY]);
 
   const addFromInput = () => {
     const s = input.trim().toUpperCase();
@@ -94,17 +111,17 @@ export default function CompareMode({
     upsert(picks);
   };
 
-  // normalize closes array
+  /** Clean/validate closes array */
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
     const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  // try long history then fallback
+  /** Pull ~5 years if available; include dates for tooltips */
   const fetchClosesSafe = async (ticker) => {
     try {
-      const a = await fetchCloses(ticker, 1825); // ~5 years
+      const a = await fetchCloses(ticker, 1825);
       let c = normalizeCloses(a?.closes);
       if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
 
@@ -150,8 +167,7 @@ export default function CompareMode({
               const mapeProxy =
                 r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
                 r.predictions.length;
-              const meanPred =
-                r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+              const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
               const avgChangePct = ((meanPred - base) / base) * 100;
               return { model: r.model, mapeProxy, avgChangePct };
             });
@@ -262,7 +278,7 @@ export default function CompareMode({
             <input
               value={input}
               onChange={(e) => setInput(e.target.value.toUpperCase())}
-              placeholder="e.g. MSFT"     // just a placeholder — not auto-added
+              placeholder="e.g. MSFT"
               onKeyDown={(e) => e.key === "Enter" && addFromInput()}
               autoComplete="off"
             />
@@ -484,14 +500,13 @@ function useTweenNumber(target = 0, { duration = 450 } = {}) {
 /** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
 function InteractiveChart({ data = [], labels = [], width = 220, height = 60, big = false }) {
   const pad = 10;
-  theight: 60
   const w = width - pad * 2;
   const h = height - pad * 2;
 
   const [view, setView] = useState({ start: 0, end: Math.max(0, data.length - 1) });
   const [cursorX, setCursorX] = useState(null);
   const [hoverIdx, setHoverIdx] = useState(null);
-  const [drag, setDrag] = useState(null); // {startX, startView}
+  const [drag, setDrag] = useState(null);
 
   useEffect(() => {
     setView({ start: 0, end: Math.max(0, data.length - 1) });
@@ -580,6 +595,7 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
+  // Hover label prefers real date when labels align
   let hoverLabel;
   if (Array.isArray(labels) && labels.length === data.length) {
     const d = labels[showIdx];
@@ -610,14 +626,33 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
+      {/* background */}
       <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
+
+      {/* polyline */}
+      <polyline
+        fill="none"
+        stroke={lastUp ? "#2e7d32" : "#c62828"}
+        strokeWidth={big ? 2.5 : 2}
+        points={points}
+      />
+
+      {/* cursor + crosshair */}
       {cursorX != null && (
         <>
           <line x1={showX} x2={showX} y1={pad} y2={pad + h} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
+          {/* tooltip bubble */}
           <g>
-            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
+            <rect
+              x={boxX}
+              y={boxY}
+              width={textW}
+              height="22"
+              rx="6"
+              fill="rgba(0,0,0,0.65)"
+              stroke="rgba(255,255,255,0.25)"
+            />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {hoverLabel}
             </text>
