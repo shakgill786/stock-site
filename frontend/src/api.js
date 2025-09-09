@@ -131,20 +131,46 @@ function buildURL(path, params) {
   return url;
 }
 
-function withTimeout(fetcher, ms) {
+/**
+ * Run a fetcher with a timeout, but also honor an *external* AbortSignal if provided.
+ * We create our own controller for the timeout and "pipe" any external abort into it.
+ */
+function withTimeout(fetcher, ms, externalSignal) {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(new DOMException("Timeout", "TimeoutError")), ms);
+
+  // Pipe external aborts into our timeout controller (merging signals)
+  if (externalSignal instanceof AbortSignal) {
+    if (externalSignal.aborted) {
+      try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
+    } else {
+      const onAbort = () => {
+        try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
+      };
+      externalSignal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  const id = setTimeout(() => {
+    try {
+      ctrl.abort(new DOMException("Timeout", "TimeoutError"));
+    } catch {
+      ctrl.abort();
+    }
+  }, ms);
+
   return fetcher(ctrl.signal).finally(() => clearTimeout(id));
 }
 
 // Wrap fetch with small retry on network/5xx/429 + timeout
+// Accepts options.signal to allow external cancellation.
 async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await withTimeout(
         (signal) => fetch(url, { ...options, signal }),
-        REQUEST_TIMEOUT_MS
+        REQUEST_TIMEOUT_MS,
+        options.signal // <- merge external signal with timeout
       );
       // Retry on 429/5xx
       if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
@@ -157,6 +183,7 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
       return res;
     } catch (e) {
       lastErr = e;
+      if (e?.name === "AbortError") throw e; // surface cancellation
       if (attempt < retries) {
         await sleep(RETRY_DELAY_MS * (attempt + 1));
         continue;
@@ -230,34 +257,32 @@ async function handle(res) {
 
 // -------- API functions --------
 
-export async function ping() {
-   const url = buildURL("/diag");
-   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+export async function ping(opts) {
+  const url = buildURL("/diag");
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
-export async function fetchHello() {
-  return ping();
+export async function fetchHello(opts) {
+  return ping(opts);
 }
 
 // --- Auth ---
-export async function register({ email, password }) {
+export async function register({ email, password }, opts) {
   if (!AUTH_ENABLED) return { disabled: true };
-  const data = await postJsonFirst(REGISTER_PATHS, { email, password }, defaultPostHeaders);
+  const data = await postJsonFirst(REGISTER_PATHS, { email, password }, defaultPostHeaders, opts);
   if (data?.access_token) setAuthToken(data.access_token);
   return data;
 }
 
-export async function login({ email, password }) {
+export async function login({ email, password }, opts) {
   if (!AUTH_ENABLED) return { disabled: true };
-  // Most backends here expect JSON {email,password}; if your backend uses OAuth2 /token,
-  // set VITE_AUTH_LOGIN_PATH=/token and adjust server to accept form-encoded.
-  const data = await postJsonFirst(LOGIN_PATHS, { email, password }, defaultPostHeaders);
+  const data = await postJsonFirst(LOGIN_PATHS, { email, password }, defaultPostHeaders, opts);
   if (data?.access_token) setAuthToken(data.access_token);
   return data;
 }
 
-export async function me() {
+export async function me(opts) {
   if (!AUTH_ENABLED) return {};
-  return getFirst(ME_PATHS, maybeAuth(defaultGetHeaders));
+  return getFirst(ME_PATHS, maybeAuth(defaultGetHeaders), opts);
 }
 
 /** SSE URL for quote streaming (passes token via query if present) */
@@ -269,7 +294,7 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
 }
 
 // --- Predictions & data ---
-export async function fetchPredict({ ticker, models }) {
+export async function fetchPredict({ ticker, models }, opts) {
   const url = buildURL("/predict");
   return handle(
     await fetchWithRetry(
@@ -279,6 +304,7 @@ export async function fetchPredict({ ticker, models }) {
         headers: maybeAuth(defaultPostHeaders),
         body: JSON.stringify({ ticker, models }),
         cache: "no-store",
+        ...(opts || {}),
       },
       DEFAULT_RETRIES
     )
@@ -289,7 +315,7 @@ export async function fetchPredict({ ticker, models }) {
  * Retrospective “next-day” history for the last N trading days.
  * Returns: { ticker, models, rows: [{ date, close, actual, pred: {MODEL:val}, error_pct: {MODEL:pct} }] }
  */
-export async function fetchPredictHistory({ ticker, models, days = 12 }) {
+export async function fetchPredictHistory({ ticker, models, days = 12 }, opts) {
   // We need to .append() multiple models=... keys, so build manually
   const url = new URL(`${API_BASE}/predict_history`);
   url.searchParams.set("ticker", ticker);
@@ -303,34 +329,34 @@ export async function fetchPredictHistory({ ticker, models, days = 12 }) {
   list.forEach((m) => url.searchParams.append("models", m));
   url.searchParams.set("_ts", Date.now().toString());
 
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-export async function fetchQuote(ticker) {
+export async function fetchQuote(ticker, opts) {
   const url = buildURL("/quote", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-export async function fetchEarnings(ticker) {
+export async function fetchEarnings(ticker, opts) {
   const url = buildURL("/earnings", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
 // (unused but kept)
-export async function fetchDividends(ticker) {
+export async function fetchDividends(ticker, opts) {
   const url = buildURL("/dividends", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-export async function fetchMarket() {
+export async function fetchMarket(opts) {
   const url = buildURL("/market");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-export async function fetchCloses(ticker, days = 7) {
+export async function fetchCloses(ticker, days = 7, opts) {
   const url = buildURL("/closes", { ticker, days });
   const payload = await handle(
-    await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" })
+    await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) })
   );
 
   // Light sanity normalization: ensure arrays exist & lengths match
@@ -339,37 +365,37 @@ export async function fetchCloses(ticker, days = 7) {
   if (dates.length !== closes.length) {
     const n = Math.min(dates.length, closes.length);
     return { ticker: payload?.ticker || ticker, dates: dates.slice(0, n), closes: closes.slice(0, n) };
-  }
+    }
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
 // Quick stats (52w high/low)
-export async function fetchStats(ticker) {
+export async function fetchStats(ticker, opts) {
   const url = buildURL("/stats", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
 // ---------- Movers / Earnings week ----------
 /** Combined movers (gainers + losers) */
-export async function fetchMovers() {
+export async function fetchMovers(opts) {
   const url = buildURL(MOVERS_ENDPOINT);
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
 /** Convenience: only top gainers */
-export async function fetchTopGainers() {
+export async function fetchTopGainers(opts) {
   const url = buildURL("/top_gainers");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
 /** Convenience: only top losers */
-export async function fetchTopLosers() {
+export async function fetchTopLosers(opts) {
   const url = buildURL("/top_losers");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
 /** Earnings calendar for this week (Mon–Sun) */
-export async function fetchEarningsWeek() {
+export async function fetchEarningsWeek(opts) {
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store" }));
+  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }

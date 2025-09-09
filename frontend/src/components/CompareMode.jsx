@@ -44,23 +44,33 @@ export default function CompareMode({
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
   const [winnerStrategy, setWinnerStrategy] = useState("long"); // "long" | "short"
 
-  // 🔴 CLEAR transient state on user change (prevents cross-account bleed)
-  useEffect(() => {
-    upsert([]);
-    setRows([]);
-    setInput("");
-    // optionally reset strategy to default if you want:
-    // setWinnerStrategy("long");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope]);
-
   // request versioning to avoid race conditions
   const reqVerRef = useRef(0);
   const mountedRef = useRef(true);
+  const abortsRef = useRef([]); // track in-flight abort controllers
+
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
+
+  // 🔴 CLEAR transient state on user change (prevents cross-account bleed)
+  useEffect(() => {
+    // cancel any in-flight requests from previous user/scope
+    try { abortsRef.current.forEach((c) => c?.abort?.()); } catch {}
+    abortsRef.current = [];
+
+    // invalidate any in-flight load() calls from the previous user
+    reqVerRef.current++;
+
+    // clear UI state
+    upsert([]);
+    setRows([]);
+    setInput("");
+    // optionally reset strategy:
+    // setWinnerStrategy("long");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
 
   // 🔁 restore last session (scoped to user) — only if UNCONTROLLED
   useEffect(() => {
@@ -118,17 +128,18 @@ export default function CompareMode({
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  /** Pull ~5 years if available; include dates for tooltips */
-  const fetchClosesSafe = async (ticker) => {
+  /** Pull ~5 years if available; include dates for tooltips (cancellable) */
+  const fetchClosesSafe = async (ticker, signal) => {
     try {
-      const a = await fetchCloses(ticker, 1825);
+      const a = await fetchCloses(ticker, 1825, { signal });
       let c = normalizeCloses(a?.closes);
       if (c.length >= 2) return { dates: Array.isArray(a?.dates) ? a.dates : [], closes: c };
 
-      const b = await fetchCloses(ticker);
+      const b = await fetchCloses(ticker, undefined, { signal });
       c = normalizeCloses(b?.closes);
       return { dates: Array.isArray(b?.dates) ? b.dates : [], closes: c };
     } catch (e) {
+      if (e?.name === "AbortError") return { dates: [], closes: [] };
       console.warn("[closes] failed for", ticker, e);
       return { dates: [], closes: [] };
     }
@@ -137,6 +148,10 @@ export default function CompareMode({
   const load = useCallback(async () => {
     const myVer = ++reqVerRef.current;
 
+    // new batch: cancel any previous and reset controllers
+    try { abortsRef.current.forEach((c) => c?.abort?.()); } catch {}
+    abortsRef.current = [];
+
     if (!selected?.length) {
       if (mountedRef.current && reqVerRef.current === myVer) setRows([]);
       return;
@@ -144,12 +159,15 @@ export default function CompareMode({
 
     const tasks = selected.map(async (symbol) => {
       const t = symbol.toUpperCase();
+      const ctrl = new AbortController();
+      abortsRef.current.push(ctrl);
+
       try {
         const [q, pred, c7, stat] = await Promise.all([
-          fetchQuote(t),
-          fetchPredict({ ticker: t, models }),
-          fetchClosesSafe(t),
-          fetchStats(t).catch(() => null),
+          fetchQuote(t, { signal: ctrl.signal }),
+          fetchPredict({ ticker: t, models }, { signal: ctrl.signal }),
+          fetchClosesSafe(t, ctrl.signal),
+          fetchStats(t, { signal: ctrl.signal }).catch(() => null),
         ]);
 
         const results = pred?.results || [];
@@ -185,6 +203,7 @@ export default function CompareMode({
 
         return { symbol: t, quote, results, closes, dates, stats, metrics, recommendation, error: null };
       } catch (e) {
+        if (e?.name === "AbortError") return null; // ignore canceled task
         return {
           symbol: t,
           quote: null,
@@ -199,7 +218,7 @@ export default function CompareMode({
       }
     });
 
-    const out = await Promise.all(tasks);
+    const out = (await Promise.all(tasks)).filter(Boolean);
     if (!mountedRef.current || reqVerRef.current !== myVer) return;
 
     // winner logic (strategy aware)
