@@ -51,6 +51,12 @@ engine = create_engine(
     pool_recycle=300,   # 5 minutes
 )
 
+def _mask_url(u: str) -> str:
+    import re
+    return re.sub(r':([^:@/]+)@', ':••••••••@', u)
+
+print("[db] Using", _mask_url(DATABASE_URL.split("?")[0]))
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
