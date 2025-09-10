@@ -44,14 +44,18 @@ export default function CompareMode({
   const [rows, setRows] = useState([]); // {symbol, quote, results, closes, dates, stats, metrics, recommendation, error, isWinner}
   const [winnerStrategy, setWinnerStrategy] = useState("long"); // "long" | "short"
 
-  // request versioning to avoid race conditions
+  // request versioning + lifecycle
   const reqVerRef = useRef(0);
   const mountedRef = useRef(true);
   const abortsRef = useRef([]); // track in-flight abort controllers
 
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      try { abortsRef.current.forEach((c) => c?.abort?.()); } catch {}
+      abortsRef.current = [];
+    };
   }, []);
 
   // 🔴 CLEAR transient state on user change (prevents cross-account bleed)

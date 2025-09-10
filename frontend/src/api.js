@@ -38,7 +38,7 @@ const LOGIN_PATHS = [
   "/login",
   "/users/login",
   "/signin",
-  "/token", // some backends use OAuth2 Password Grant as /token
+  "/token",
 ].filter(Boolean);
 
 const REGISTER_PATHS = [
@@ -62,18 +62,14 @@ const ME_PATHS = [
 if (typeof window !== "undefined") {
   const isHttpsPage = window.location.protocol === "https:";
   if (isHttpsPage && API_BASE.startsWith("http://")) {
-    // eslint-disable-next-line no-console
     console.warn(
       `[api] API_BASE is HTTP (${API_BASE}) on an HTTPS page. Browsers will block requests. ` +
         `Set VITE_API_BASE to an HTTPS backend URL.`
     );
   }
-  // eslint-disable-next-line no-console
   console.info("[api] API_BASE =", API_BASE);
-  // eslint-disable-next-line no-console
   console.info("[api] AUTH_ENABLED =", AUTH_ENABLED, "AUTH_STRICT =", AUTH_STRICT);
   if (AUTH_ENABLED) {
-    // eslint-disable-next-line no-console
     console.info("[api] Auth paths (login/register/me) =", LOGIN_PATHS[0], REGISTER_PATHS[0], ME_PATHS[0]);
   }
 }
@@ -133,12 +129,12 @@ function buildURL(path, params) {
 
 /**
  * Run a fetcher with a timeout, but also honor an *external* AbortSignal if provided.
- * We create our own controller for the timeout and "pipe" any external abort into it.
+ * We create our own controller for the timeout and pipe external aborts into it.
  */
 function withTimeout(fetcher, ms, externalSignal) {
   const ctrl = new AbortController();
 
-  // Pipe external aborts into our timeout controller (merging signals)
+  // Pipe external aborts into our timeout controller (merge)
   if (externalSignal instanceof AbortSignal) {
     if (externalSignal.aborted) {
       try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
@@ -266,23 +262,23 @@ export async function fetchHello(opts) {
 }
 
 // --- Auth ---
-export async function register({ email, password }, opts) {
+export async function register({ email, password }) {
   if (!AUTH_ENABLED) return { disabled: true };
-  const data = await postJsonFirst(REGISTER_PATHS, { email, password }, defaultPostHeaders, opts);
+  const data = await postJsonFirst(REGISTER_PATHS, { email, password }, defaultPostHeaders);
   if (data?.access_token) setAuthToken(data.access_token);
   return data;
 }
 
-export async function login({ email, password }, opts) {
+export async function login({ email, password }) {
   if (!AUTH_ENABLED) return { disabled: true };
-  const data = await postJsonFirst(LOGIN_PATHS, { email, password }, defaultPostHeaders, opts);
+  const data = await postJsonFirst(LOGIN_PATHS, { email, password }, defaultPostHeaders);
   if (data?.access_token) setAuthToken(data.access_token);
   return data;
 }
 
-export async function me(opts) {
+export async function me() {
   if (!AUTH_ENABLED) return {};
-  return getFirst(ME_PATHS, maybeAuth(defaultGetHeaders), opts);
+  return getFirst(ME_PATHS, maybeAuth(defaultGetHeaders));
 }
 
 /** SSE URL for quote streaming (passes token via query if present) */
@@ -313,10 +309,8 @@ export async function fetchPredict({ ticker, models }, opts) {
 
 /**
  * Retrospective “next-day” history for the last N trading days.
- * Returns: { ticker, models, rows: [{ date, close, actual, pred: {MODEL:val}, error_pct: {MODEL:pct} }] }
  */
 export async function fetchPredictHistory({ ticker, models, days = 12 }, opts) {
-  // We need to .append() multiple models=... keys, so build manually
   const url = new URL(`${API_BASE}/predict_history`);
   url.searchParams.set("ticker", ticker);
   url.searchParams.set("days", String(days));
@@ -365,7 +359,7 @@ export async function fetchCloses(ticker, days = 7, opts) {
   if (dates.length !== closes.length) {
     const n = Math.min(dates.length, closes.length);
     return { ticker: payload?.ticker || ticker, dates: dates.slice(0, n), closes: closes.slice(0, n) };
-    }
+  }
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
@@ -376,25 +370,21 @@ export async function fetchStats(ticker, opts) {
 }
 
 // ---------- Movers / Earnings week ----------
-/** Combined movers (gainers + losers) */
 export async function fetchMovers(opts) {
   const url = buildURL(MOVERS_ENDPOINT);
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-/** Convenience: only top gainers */
 export async function fetchTopGainers(opts) {
   const url = buildURL("/top_gainers");
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-/** Convenience: only top losers */
 export async function fetchTopLosers(opts) {
   const url = buildURL("/top_losers");
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
 }
 
-/** Earnings calendar for this week (Mon–Sun) */
 export async function fetchEarningsWeek(opts) {
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
   return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
