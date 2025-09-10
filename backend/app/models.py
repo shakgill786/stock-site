@@ -9,134 +9,224 @@ import numpy as np
 import pandas as pd
 
 
-# ---------- Feature engineering ----------
-def build_supervised_features(close: pd.Series, max_lag: int = 30) -> pd.DataFrame:
+# =========================
+# Feature engineering
+# =========================
+def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    """Wilder’s RSI with safe defaults."""
+    diff = close.diff()
+    gain = diff.clip(lower=0.0)
+    loss = -diff.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / window, adjust=False).mean()
+    rs = avg_gain / (avg_loss.replace(0.0, np.nan))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def build_supervised_features(
+    close: pd.Series,
+    max_lag: int = 30,
+    windows: tuple[int, ...] = (7, 14, 21),
+) -> pd.DataFrame:
     """
-    Build supervised features from a Close series: lags + rolling stats.
+    Leakage-safe features from Close:
+      - price & return lags
+      - rolling mean/std/min/max of price
+      - rolling mean/std of returns
+      - RSI(14), realized vol(21)
+    Target: next-period return (ret[t+1]).
     """
     s = pd.Series(close).astype(float).copy()
     s.index = pd.to_datetime(s.index)
 
-    df = pd.DataFrame({"Close": s})
+    ret = s.pct_change()
+    logret = np.log(s).diff()
+
+    df = pd.DataFrame({
+        "Close": s,
+        "ret": ret,
+        "logret": logret,
+    })
+
+    # lags (price + return)
     for l in range(1, max_lag + 1):
-        df[f"lag_{l}"] = df["Close"].shift(l)
+        df[f"lag_close_{l}"] = df["Close"].shift(l)
+        df[f"lag_ret_{l}"] = df["ret"].shift(l)
 
-    for w in (7, 14, 21):
-        df[f"roll_mean_{w}"] = df["Close"].rolling(w).mean()
-        df[f"roll_std_{w}"] = df["Close"].rolling(w).std()
-        df[f"roll_min_{w}"] = df["Close"].rolling(w).min()
-        df[f"roll_max_{w}"] = df["Close"].rolling(w).max()
+    # rolling features (price + returns)
+    for w in windows:
+        # price
+        df[f"roll_close_mean_{w}"] = df["Close"].rolling(w).mean()
+        df[f"roll_close_std_{w}"] = df["Close"].rolling(w).std()
+        df[f"roll_close_min_{w}"] = df["Close"].rolling(w).min()
+        df[f"roll_close_max_{w}"] = df["Close"].rolling(w).max()
+        # returns
+        df[f"roll_ret_mean_{w}"] = df["ret"].rolling(w).mean()
+        df[f"roll_ret_std_{w}"] = df["ret"].rolling(w).std()
 
+    # momentum/volatility
+    df["rsi_14"] = _rsi(df["Close"], 14)
+    df["rv_21"] = df["ret"].rolling(21).std() * np.sqrt(252.0)
+
+    # target is next period return (more stationary)
+    df["y_next_ret"] = df["ret"].shift(-1)
+
+    # drop NaNs (starts of lags/rolling; last row due to shift(-1))
     df = df.dropna()
     return df
 
 
-def _multi_step_walk(regressor, last_row: np.ndarray, steps: int, backfill_fn) -> List[float]:
+def _rebuild_features_for_step(
+    hist_close: List[float],
+    max_lag: int = 30,
+    windows: tuple[int, ...] = (7, 14, 21),
+) -> Tuple[np.ndarray, List[str]]:
     """
-    Multi-step forecast by feeding each prediction back into the features.
+    Recompute the latest feature vector from a synthetic close history.
+    Used during multi-step recursion so rollings/RSI evolve with predictions.
     """
-    preds: List[float] = []
-    feat = last_row
-    for _ in range(steps):
-        yhat = float(regressor.predict(feat.reshape(1, -1))[0])
-        preds.append(yhat)
-        feat = backfill_fn(preds)
-    return preds
+    s = pd.Series(hist_close, dtype=float)
+    ret = s.pct_change()
+    logret = np.log(s).diff()
+
+    feats = {
+        "Close": s.iloc[-1],
+        "ret": ret.iloc[-1],
+        "logret": logret.iloc[-1],
+    }
+
+    for l in range(1, max_lag + 1):
+        if len(s) - l <= 0:
+            feats[f"lag_close_{l}"] = np.nan
+            feats[f"lag_ret_{l}"] = np.nan
+        else:
+            feats[f"lag_close_{l}"] = s.iloc[-l]
+            feats[f"lag_ret_{l}"] = ret.iloc[-l]
+
+    for w in windows:
+        feats[f"roll_close_mean_{w}"] = s.rolling(w).mean().iloc[-1]
+        feats[f"roll_close_std_{w}"] = s.rolling(w).std().iloc[-1]
+        feats[f"roll_close_min_{w}"] = s.rolling(w).min().iloc[-1]
+        feats[f"roll_close_max_{w}"] = s.rolling(w).max().iloc[-1]
+        feats[f"roll_ret_mean_{w}"] = ret.rolling(w).mean().iloc[-1]
+        feats[f"roll_ret_std_{w}"] = ret.rolling(w).std().iloc[-1]
+
+    feats["rsi_14"] = _rsi(s, 14).iloc[-1]
+    feats["rv_21"] = ret.rolling(21).std().iloc[-1] * np.sqrt(252.0)
+
+    cols = list(feats.keys())
+    X = np.array([feats[c] for c in cols], dtype=float)
+    if np.isnan(X).any():
+        X = np.nan_to_num(X, nan=np.nanmean(X[np.isfinite(X)]) if np.isfinite(X).any() else 0.0)
+    return X, cols
 
 
-# ---------- Models ----------
-def train_predict_rf(close: pd.Series, horizon: int = 1) -> Tuple[float, List[float]]:
-    # Import inside the function to avoid module import errors at app startup
-    try:
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-    except Exception as e:
-        raise ImportError("scikit-learn not installed") from e
+# =========================
+# Models (RF/XGB on returns; ARIMA baseline on price)
+# =========================
+def _train_rf_xgb_common(
+    close: pd.Series,
+    horizon: int,
+    which: str,
+) -> Tuple[float, List[float]]:
+    df = build_supervised_features(close, max_lag=30, windows=(7, 14, 21))
+    y = df["y_next_ret"].values.astype(float)
+    X = df.drop(columns=["y_next_ret"]).values.astype(float)
+    cols = [c for c in df.columns if c != "y_next_ret"]
 
-    df = build_supervised_features(close)
-    y = df["Close"].values
-    X = df.drop(columns=["Close"]).values
-    if len(y) < 60:
-        raise ValueError("Not enough data for RandomForest")
+    if len(y) < 120:
+        raise ValueError(f"Not enough data for {which} (need >=120 rows)")
 
     split = int(len(y) * 0.85)
     X_train, y_train = X[:split], y[:split]
     X_last = X[-1]
+    last_close = float(df["Close"].iloc[-1])
 
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("rf", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)),
-    ])
+    if which == "rf":
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.pipeline import Pipeline
+            from sklearn.preprocessing import StandardScaler
+        except Exception as e:
+            raise ImportError("scikit-learn not installed") from e
+
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("rf", RandomForestRegressor(
+                n_estimators=500,
+                max_depth=None,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+            )),
+        ])
+    elif which == "xgb":
+        try:
+            import xgboost as xgb
+            from sklearn.pipeline import Pipeline
+            from sklearn.preprocessing import StandardScaler
+        except Exception as e:
+            raise ImportError("xgboost/scikit-learn not installed") from e
+
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("xgb", xgb.XGBRegressor(
+                n_estimators=800,
+                max_depth=6,
+                learning_rate=0.03,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=4,
+                tree_method="hist",
+            )),
+        ])
+    else:
+        raise ValueError("which must be 'rf' or 'xgb'")
+
     model.fit(X_train, y_train)
 
-    cols = df.drop(columns=["Close"]).columns.tolist()
-
-    def backfill_fn(preds: List[float]) -> np.ndarray:
-        xdict = dict(zip(cols, X_last.tolist()))
-        last_close = float(close.iloc[-1])
-        synthetic = [last_close] + preds
-        for k in range(1, 31):
-            key = f"lag_{k}"
-            if key in xdict and len(synthetic) >= k:
-                xdict[key] = synthetic[-k]
-        return np.array([xdict[c] for c in cols], dtype=float)
-
-    one = float(model.predict(X_last.reshape(1, -1))[0])
+    # 1-step: predict return, convert to price
+    next_ret = float(model.predict(X_last.reshape(1, -1))[0])
+    next_price = float(last_close * (1.0 + next_ret))
     if horizon <= 1:
-        return one, [one]
-    multi = _multi_step_walk(model, X_last.astype(float), horizon, backfill_fn)
-    return multi[0], multi
+        return next_price, [next_price]
+
+    # multi-step with rolling feature refresh
+    max_need = max(30, 21, 14) + 3
+    hist = list(df["Close"].tail(max_need).astype(float).values)
+
+    path_prices: List[float] = []
+    for _ in range(horizon):
+        X_step, cols_step = _rebuild_features_for_step(hist, max_lag=30, windows=(7, 14, 21))
+        if cols_step != cols:
+            idx = [cols_step.index(c) for c in cols]
+            X_feed = X_step[idx]
+        else:
+            X_feed = X_step
+
+        step_ret = float(model.predict(X_feed.reshape(1, -1))[0])
+        next_p = float(hist[-1] * (1.0 + step_ret))
+        path_prices.append(next_p)
+        hist.append(next_p)
+        if len(hist) > max_need:
+            hist = hist[-max_need:]
+
+    return path_prices[0], path_prices
+
+
+def train_predict_rf(close: pd.Series, horizon: int = 1) -> Tuple[float, List[float]]:
+    return _train_rf_xgb_common(close, horizon, which="rf")
 
 
 def train_predict_xgb(close: pd.Series, horizon: int = 1) -> Tuple[float, List[float]]:
-    try:
-        import xgboost as xgb
-    except Exception as e:
-        raise ImportError("xgboost not installed") from e
-
-    df = build_supervised_features(close)
-    y = df["Close"].values
-    X = df.drop(columns=["Close"]).values
-    if len(y) < 60:
-        raise ValueError("Not enough data for XGBoost")
-
-    split = int(len(y) * 0.85)
-    X_train, y_train = X[:split], y[:split]
-    X_last = X[-1]
-
-    booster = xgb.XGBRegressor(
-        n_estimators=600,
-        max_depth=6,
-        learning_rate=0.03,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-        n_jobs=4,
-    )
-    booster.fit(X_train, y_train)
-
-    cols = df.drop(columns=["Close"]).columns.tolist()
-
-    def backfill_fn(preds: List[float]) -> np.ndarray:
-        xdict = dict(zip(cols, X_last.tolist()))
-        last_close = float(close.iloc[-1])
-        synthetic = [last_close] + preds
-        for k in range(1, 31):
-            key = f"lag_{k}"
-            if key in xdict and len(synthetic) >= k:
-                xdict[key] = synthetic[-k]
-        return np.array([xdict[c] for c in cols], dtype=float)
-
-    one = float(booster.predict(X_last.reshape(1, -1))[0])
-    if horizon <= 1:
-        return one, [one]
-    multi = _multi_step_walk(booster, X_last.astype(float), horizon, backfill_fn)
-    return multi[0], multi
+    return _train_rf_xgb_common(close, horizon, which="xgb")
 
 
 def train_predict_arima(close: pd.Series, horizon: int = 1) -> Tuple[float, List[float]]:
-    # Prefer pmdarima; fallback to statsmodels; otherwise error.
+    """ARIMA baseline on price (unchanged behavior)."""
     try:
         import pmdarima as pm
         with warnings.catch_warnings():
@@ -168,7 +258,9 @@ def train_predict_arima(close: pd.Series, horizon: int = 1) -> Tuple[float, List
         raise ImportError("Neither pmdarima nor statsmodels is available") from e
 
 
-# ---------- Orchestrator ----------
+# =========================
+# Orchestrator
+# =========================
 def predict_all_models(close: pd.Series, horizon: int = 1) -> Dict[str, Dict]:
     """
     Train and predict with available models. Returns:
@@ -180,21 +272,18 @@ def predict_all_models(close: pd.Series, horizon: int = 1) -> Dict[str, Dict]:
     """
     results: Dict[str, Dict] = {}
 
-    # RandomForest
     try:
         nxt, path = train_predict_rf(close, horizon)
         results["RandomForest"] = {"next": float(nxt), "path": list(map(float, path))}
     except Exception as e:
         results["RandomForest"] = {"error": str(e)}
 
-    # XGBoost
     try:
         nxt, path = train_predict_xgb(close, horizon)
         results["XGBoost"] = {"next": float(nxt), "path": list(map(float, path))}
     except Exception as e:
         results["XGBoost"] = {"error": str(e)}
 
-    # ARIMA
     try:
         nxt, path = train_predict_arima(close, horizon)
         results["ARIMA"] = {"next": float(nxt), "path": list(map(float, path))}
