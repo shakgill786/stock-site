@@ -1,6 +1,7 @@
 // frontend/src/auth/AuthContext.jsx
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import * as api from "../api";
+import { getAuthToken } from "../api";
 
 const AuthCtx = createContext(null);
 
@@ -52,8 +53,15 @@ export function AuthProvider({ children }) {
     return { ...u, ...prof };
   };
 
+  // On mount: only call /me if we already have a token to avoid 401 noise
   useEffect(() => {
     (async () => {
+      const hasToken = !!getAuthToken();
+      if (!hasToken) {
+        setUser(null);
+        setReady(true);
+        return;
+      }
       try {
         const u = await api.me();
         setUser(hydrate(u) || null);
