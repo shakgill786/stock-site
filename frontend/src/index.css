@@ -24,10 +24,10 @@ a:hover {
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
+  display: block;          /* was flex */
   min-width: 320px;
-  min-height: 100vh;
+  min-height: 100vh;       /* keep if you like; OK with scrolling */
+  place-items: initial;    /* neutralize template rule if present */
 }
 
 h1 {

@@ -73,7 +73,6 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
   const filtered = useMemo(() => {
     const r = Array.isArray(rows) ? rows.map(normalizeRow) : [];
     const lim = Number(minPrice) || 0;
-    // allow rows that have price and EITHER change or pct
     return r.filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)) && x.price >= lim);
   }, [rows, minPrice]);
 
@@ -147,7 +146,6 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                // ensure we use normalized values
                 const { symbol: sym, price, change, change_pct } = normalizeRow(r);
                 const up = isNum(change) ? change >= 0 : isNum(change_pct) ? change_pct >= 0 : true;
                 const top = i < 3;
@@ -158,9 +156,10 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                       <button
                         type="button"
                         className="ticker-link"
-                        onClick={() =>
-                          window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym })) || onPick?.(sym)
-                        }
+                        onClick={() => {
+                          onPick?.(sym); // ← ensure App handler fires (scroll)
+                          window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
+                        }}
                         title={`Load ${sym}`}
                       >
                         {sym}
@@ -256,9 +255,10 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                             <button
                               type="button"
                               className="ticker-link"
-                              onClick={() =>
-                                window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym })) || onPick?.(sym)
-                              }
+                              onClick={() => {
+                                onPick?.(sym); // ← ensure App handler fires (scroll)
+                                window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
+                              }}
                               title={`Load ${sym}`}
                             >
                               {sym}
@@ -307,7 +307,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
     if (typeof onSelectTicker === "function") onSelectTicker(s);
-    else window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
+    window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
   };
 
   const refresh = async () => {
@@ -317,7 +317,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
-      // accept rows that have price and EITHER change or change_pct
       const g = (Array.isArray(mv?.gainers) ? mv.gainers : [])
         .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)))
         .map(normalizeRow);
