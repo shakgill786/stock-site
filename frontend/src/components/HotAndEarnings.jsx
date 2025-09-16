@@ -1,10 +1,7 @@
 // frontend/src/components/HotAndEarnings.jsx
-// Polished Movers (Gainers/Losers) + Earnings Week
-// - sticky headers, scrollable tables
-// - sort + min price filter for movers
-// - source badge (alphavantage | fallback-local)
-// - grouped earnings by date with sticky separators
-// - accessible, compact, and click-to-load tickers
+// Movers (Gainers/Losers) + Earnings Week
+// - derives missing change <-> change_pct so UI never shows 0.00/0.00
+// - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
 import { fetchMovers, fetchEarningsWeek } from "../api";
@@ -23,11 +20,7 @@ const fmtDateHuman = (iso) => {
   if (!iso) return "—";
   try {
     const d = new Date(`${String(iso).slice(0, 10)}T00:00:00`);
-    return d.toLocaleDateString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-    });
+    return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
   } catch {
     return iso;
   }
@@ -41,6 +34,22 @@ const SESSION_BADGE = (s) => {
     return { text: "AMC", bg: "rgba(244,67,54,0.15)", fg: "#ef9a9a", br: "rgba(239,154,154,0.35)" };
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
+
+/* ---------- small normalizer to fill missing fields ---------- */
+function normalizeRow(row) {
+  const symbol = String(row?.symbol || row?.ticker || "").toUpperCase();
+  const price = isNum(row?.price) ? num(row.price) : undefined;
+
+  let change = isNum(row?.change) ? num(row.change) : undefined;
+  let change_pct = isNum(row?.change_pct) ? num(row.change_pct) : undefined;
+
+  if (price != null) {
+    if (change == null && change_pct != null) change = (change_pct / 100) * price;
+    if (change_pct == null && change != null && price !== 0) change_pct = (change / price) * 100;
+  }
+
+  return { symbol, price, change, change_pct, name: row?.name ?? "" };
+}
 
 /* ---------- shared UI shells ---------- */
 function Card({ title, right, children }) {
@@ -57,16 +66,15 @@ function Card({ title, right, children }) {
 
 /* ---------- Movers Table (with filter + sort) ---------- */
 function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
-  // price filter
-  const [minPrice, setMinPrice] = useState(1); // 0 | 1 | 5
-  // sort: key in {"change","change_pct"} and dir in {"desc","asc"}
+  const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
   const [sortDir, setSortDir] = useState("desc");
 
   const filtered = useMemo(() => {
-    const r = Array.isArray(rows) ? rows : [];
+    const r = Array.isArray(rows) ? rows.map(normalizeRow) : [];
     const lim = Number(minPrice) || 0;
-    return r.filter((x) => (isNum(x?.price) ? num(x.price) >= lim : false));
+    // allow rows that have price and EITHER change or pct
+    return r.filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)) && x.price >= lim);
   }, [rows, minPrice]);
 
   const sorted = useMemo(() => {
@@ -118,41 +126,31 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
         <div className="he-scroll">
           <table className="he-table">
             <colgroup>
-              <col style={{ width: "10%" }} /> {/* # */}
-              <col style={{ width: "28%" }} /> {/* symbol */}
-              <col style={{ width: "22%" }} /> {/* price */}
-              <col style={{ width: "20%" }} /> {/* $ chg */}
-              <col style={{ width: "20%" }} /> {/* % chg */}
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "28%" }} />
+              <col style={{ width: "22%" }} />
+              <col style={{ width: "20%" }} />
+              <col style={{ width: "20%" }} />
             </colgroup>
             <thead>
               <tr>
                 <th className="num">#</th>
                 <th>Symbol</th>
                 <th className="num">Price</th>
-                <th
-                  className="num th-click"
-                  onClick={() => onHeaderClick("change")}
-                  title="Sort by $ change"
-                >
+                <th className="num th-click" onClick={() => onHeaderClick("change")} title="Sort by $ change">
                   $ Change {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
-                <th
-                  className="num th-click"
-                  onClick={() => onHeaderClick("change_pct")}
-                  title="Sort by % change"
-                >
+                <th className="num th-click" onClick={() => onHeaderClick("change_pct")} title="Sort by % change">
                   % Change {sortKey === "change_pct" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
               </tr>
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                const sym = String(r?.symbol || r?.ticker || `#${i}`).toUpperCase();
-                const price = num(r?.price);
-                const chg = num(r?.change);
-                const pct = num(r?.change_pct);
-                const up = isNum(chg) ? chg >= 0 : pct >= 0;
-                const top = i < 3; // highlight top 3
+                // ensure we use normalized values
+                const { symbol: sym, price, change, change_pct } = normalizeRow(r);
+                const up = isNum(change) ? change >= 0 : isNum(change_pct) ? change_pct >= 0 : true;
+                const top = i < 3;
                 return (
                   <tr key={`${sym}-${i}`} className={top ? "he-toprow" : ""}>
                     <td className="num">{i + 1}</td>
@@ -161,8 +159,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                         type="button"
                         className="ticker-link"
                         onClick={() =>
-                          onPick?.(sym) ??
-                          window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }))
+                          window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym })) || onPick?.(sym)
                         }
                         title={`Load ${sym}`}
                       >
@@ -170,8 +167,8 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                       </button>
                     </td>
                     <td className="num">{fmtMoney(price)}</td>
-                    <td className={`num ${up ? "pos" : "neg"}`}>{fmtSignMoney(chg)}</td>
-                    <td className={`num ${pct >= 0 ? "pos" : "neg"}`}>{fmtPct(pct)}</td>
+                    <td className={`num ${up ? "pos" : "neg"}`}>{fmtSignMoney(change)}</td>
+                    <td className={`num ${isNum(change_pct) && change_pct >= 0 ? "pos" : "neg"}`}>{fmtPct(change_pct)}</td>
                   </tr>
                 );
               })}
@@ -204,9 +201,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
     }
     return Array.from(map.entries())
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, rows]) =>
-        [date, rows.sort((a, b) => (a.symbol || "").localeCompare(b.symbol || ""))]
-      );
+      .map(([date, rows]) => [date, rows.sort((a, b) => (a.symbol || "").localeCompare(b.symbol || ""))]);
   }, [filtered]);
 
   return (
@@ -249,9 +244,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                 return (
                   <FragmentBlock key={date}>
                     <tr className="he-group-row">
-                      <td colSpan={3} style={{ fontWeight: 700 }}>
-                        {fmtDateHuman(date)}
-                      </td>
+                      <td colSpan={3} style={{ fontWeight: 700 }}>{fmtDateHuman(date)}</td>
                     </tr>
                     {rows.map((r, i) => {
                       const badge = SESSION_BADGE(r.session);
@@ -264,8 +257,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                               type="button"
                               className="ticker-link"
                               onClick={() =>
-                                onPick?.(sym) ??
-                                window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }))
+                                window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym })) || onPick?.(sym)
                               }
                               title={`Load ${sym}`}
                             >
@@ -298,10 +290,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
   );
 }
 
-// tiny helper to return an array of <tr> without extra DOM wrappers
-function FragmentBlock({ children }) {
-  return <>{children}</>;
-}
+function FragmentBlock({ children }) { return <>{children}</>; }
 
 /* ---------- Main component ---------- */
 export default function HotAndEarnings({ onSelectTicker }) {
@@ -312,7 +301,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
   const [gainers, setGainers] = useState([]);
   const [losers, setLosers] = useState([]);
   const [earnings, setEarnings] = useState([]);
-  const [moverSource, setMoverSource] = useState(""); // "alphavantage" | "fallback-local"
+  const [moverSource, setMoverSource] = useState("");
 
   const pick = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
@@ -327,12 +316,16 @@ export default function HotAndEarnings({ onSelectTicker }) {
     setErrMovers("");
     try {
       const mv = await fetchMovers();
-      const g = (Array.isArray(mv?.gainers) ? mv.gainers : []).filter(
-        (x) => isNum(x?.price) && isNum(x?.change_pct)
-      );
-      const l = (Array.isArray(mv?.losers) ? mv.losers : []).filter(
-        (x) => isNum(x?.price) && isNum(x?.change_pct)
-      );
+
+      // accept rows that have price and EITHER change or change_pct
+      const g = (Array.isArray(mv?.gainers) ? mv.gainers : [])
+        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)))
+        .map(normalizeRow);
+
+      const l = (Array.isArray(mv?.losers) ? mv.losers : [])
+        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)))
+        .map(normalizeRow);
+
       setGainers(g);
       setLosers(l);
       setMoverSource(mv?.source || "");
@@ -361,9 +354,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     }
   };
 
-  useEffect(() => {
-    refresh();
-  }, []);
+  useEffect(() => { refresh(); }, []);
 
   return (
     <div className="he-grid">
@@ -396,112 +387,37 @@ export default function HotAndEarnings({ onSelectTicker }) {
 
       {/* component-scoped styles */}
       <style>{`
-        .he-grid {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 12px;
-          width: 100%;
-          margin-top: 8px;
-        }
-        .he-toolbar {
-          grid-column: 1 / -1;
-          display: flex;
-          justify-content: flex-end;
-        }
+        .he-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; margin-top: 8px; }
+        .he-toolbar { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
         @media (min-width: 980px) {
-          .he-grid {
-            grid-template-columns: 1fr 1fr;
-          }
-          .he-grid > :nth-last-child(1) {
-            grid-column: 1 / -1; /* Earnings spans two columns on wide screens */
-          }
+          .he-grid { grid-template-columns: 1fr 1fr; }
+          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; }
         }
-
         .he-card {
-          padding: 12px;
-          overflow: hidden;
-          border-radius: 14px;
+          padding: 12px; overflow: hidden; border-radius: 14px;
           background: radial-gradient(120% 120% at 100% 0%, rgba(160,170,255,0.06), rgba(25,28,45,0.6) 55%, rgba(17,20,35,0.8));
-          border: 1px solid rgba(255,255,255,0.07);
-          box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+          border: 1px solid rgba(255,255,255,0.07); box-shadow: 0 6px 18px rgba(0,0,0,0.25);
         }
-        .he-card-head {
-          display: flex;
-          align-items: baseline;
-          justify-content: space-between;
-          margin-bottom: 6px;
-        }
-        .he-card-head h3 {
-          margin: 0;
-        }
+        .he-card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+        .he-card-head h3 { margin: 0; }
         .he-head-right { display: flex; gap: 10px; align-items: center; }
-
         .he-controls { display: flex; gap: 8px; align-items: center; }
         .he-source { font-size: 12px; color: #a8b2ff; }
-
-        .he-scroll {
-          max-height: 420px;
-          overflow: auto;
-          border-radius: 12px;
-          background: rgba(255,255,255,0.02);
-          border: 1px solid rgba(255,255,255,0.06);
-        }
-
-        .he-table {
-          width: 100%;
-          table-layout: fixed;
-          font-size: 13px;
-          border-collapse: separate;
-          border-spacing: 0;
-        }
-        .he-table thead th {
-          position: sticky; top: 0;
-          background: rgba(12,14,24,0.85);
-          backdrop-filter: blur(2px);
-          z-index: 2;
-          padding: 8px 10px;
-        }
-        .he-table tbody tr:nth-child(odd) {
-          background: rgba(255,255,255,0.02);
-        }
-        .he-table td, .he-table th {
-          vertical-align: middle;
-          padding: 8px 10px;
-        }
-
+        .he-scroll { max-height: 420px; overflow: auto; border-radius: 12px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); }
+        .he-table { width: 100%; table-layout: fixed; font-size: 13px; border-collapse: separate; border-spacing: 0; }
+        .he-table thead th { position: sticky; top: 0; background: rgba(12,14,24,0.85); backdrop-filter: blur(2px); z-index: 2; padding: 8px 10px; }
+        .he-table tbody tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
+        .he-table td, .he-table th { vertical-align: middle; padding: 8px 10px; }
         .num { text-align: right; font-variant-numeric: tabular-nums; }
         .th-click { cursor: pointer; user-select: none; }
         .pos { color: #2e7d32; font-weight: 600; }
         .neg { color: #c62828; font-weight: 600; }
         .he-toprow td { background: linear-gradient(90deg, rgba(168,178,255,0.07), transparent 60%); }
-
-        .he-group-row td {
-          position: sticky; top: 28px; /* below table head */
-          background: rgba(70,80,130,0.16);
-          border-top: 1px solid rgba(255,255,255,0.06);
-          z-index: 1;
-          font-weight: 700;
-        }
-
-        .he-badge{
-          display: inline-block;
-          padding: 2px 8px;
-          border-radius: 999px;
-          font-size: 12px;
-          line-height: 1.3;
-        }
-
-        .ticker-link{
-          background: transparent; border: none; padding: 0; margin: 0;
-          cursor: pointer; color: #a2c4ff; text-decoration: underline; text-underline-offset: 2px; font: inherit;
-          font-weight: 700; letter-spacing: .2px;
-        }
-        .ticker-link:hover{
-          color: #d6e3ff; text-shadow: 0 0 6px rgba(110,168,255,.45); text-decoration-thickness: 2px;
-        }
-
-        .muted { color: #a7adbc; }
-        .muted.error { color: #ff6b6b; }
+        .he-group-row td { position: sticky; top: 28px; background: rgba(70,80,130,0.16); border-top: 1px solid rgba(255,255,255,0.06); z-index: 1; font-weight: 700; }
+        .he-badge{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; line-height: 1.3; }
+        .ticker-link{ background: transparent; border: none; padding: 0; margin: 0; cursor: pointer; color: #a2c4ff; text-decoration: underline; text-underline-offset: 2px; font: inherit; font-weight: 700; letter-spacing: .2px; }
+        .ticker-link:hover{ color: #d6e3ff; text-shadow: 0 0 6px rgba(110,168,255,.45); text-decoration-thickness: 2px; }
+        .muted { color: #a7adbc; } .muted.error { color: #ff6b6b; }
       `}</style>
     </div>
   );
