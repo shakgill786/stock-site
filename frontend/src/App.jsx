@@ -116,9 +116,38 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
     outCloses[lastIdx] = Number(quote.last_close);
   }
 
-  // Then drop obvious duplicated tail (different dates, identical closes)
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
+}
+
+/* ---------- robust scroll helpers ---------- */
+function getScrollableAncestor(el) {
+  let node = el?.parentElement;
+  while (node) {
+    const style = getComputedStyle(node);
+    const canScroll =
+      /(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight;
+    if (canScroll) return node;
+    node = node.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
+}
+function scrollToTarget(el) {
+  if (!el) return;
+  const scroller = getScrollableAncestor(el);
+  const elRect = el.getBoundingClientRect();
+  const scRect =
+    scroller === document.documentElement
+      ? { top: 0 }
+      : scroller.getBoundingClientRect();
+  const current =
+    scroller === document.documentElement ? window.pageYOffset : scroller.scrollTop;
+  const top = current + (elRect.top - scRect.top) - 8;
+  if (scroller === document.documentElement) {
+    window.scrollTo({ top, behavior: "smooth" });
+  } else {
+    scroller.scrollTo({ top, behavior: "smooth" });
+  }
 }
 
 export default function App() {
@@ -170,8 +199,12 @@ export default function App() {
   // Pre-warm backend right after mount to reduce cold-start timeouts
   useEffect(() => {
     (async () => {
-      try { await ping(); } catch {}
-      setTimeout(() => { ping().catch(() => {}); }, 2500);
+      try {
+        await ping();
+      } catch {}
+      setTimeout(() => {
+        ping().catch(() => {});
+      }, 2500);
     })();
   }, []);
 
@@ -244,7 +277,6 @@ export default function App() {
         if (reqVer.current !== myVer) return null;
         setQuote(q);
         prevPriceRef.current = q.current_price;
-        // ensure live SSE is enabled once we have a quote
         if (!live) setLive(true);
         return q;
       } catch {
@@ -387,17 +419,8 @@ export default function App() {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
     setTicker(t);
-    requestAnimationFrame(() => {
-      const el = mainSectionRef.current;
-      if (!el) return;
-      // Primary: native smooth scroll to the anchor
-      el.scrollIntoView({ behavior: "smooth", block: "start", inline: "nearest" });
-      // Fallback nudge for Safari/iOS and odd layouts
-      try {
-        const y = el.getBoundingClientRect().top + window.pageYOffset - 8;
-        window.scrollTo({ top: y, behavior: "smooth" });
-      } catch {}
-    });
+    const go = () => scrollToTarget(mainSectionRef.current);
+    requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
   // ➕ from Watchlist into Compare
@@ -457,7 +480,7 @@ export default function App() {
 
   const actualForPastLabelsRaw = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : (histByDate[iso]?.actual ?? null);
+    return idx >= 0 ? closes[idx] : histByDate[iso]?.actual ?? null;
   });
 
   const actualForPastLabels = (() => {
@@ -474,10 +497,7 @@ export default function App() {
   const avpDatasets = useMemo(() => {
     if (!chartLabels.length) return [];
 
-    const actualSeries = [
-      ...actualForPastLabels,
-      ...Array(futureLabels.length).fill(null),
-    ];
+    const actualSeries = [...actualForPastLabels, ...Array(futureLabels.length).fill(null)];
 
     const ds = [
       {
@@ -514,8 +534,7 @@ export default function App() {
         spanGaps: true,
       });
 
-      const start =
-        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
+      const start = [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
         start,
@@ -563,7 +582,7 @@ export default function App() {
     const dk = dkey(iso);
     const row = histByDate[dk];
     const idx = closeDates.lastIndexOf(iso);
-    let actual = idx >= 0 ? closes[idx] : (row?.actual ?? null);
+    let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
@@ -593,11 +612,17 @@ export default function App() {
           <div className="hero-right" style={{ display: "flex", gap: 8 }}>
             {user ? (
               <>
-                <span className="muted" style={{ fontSize: 14 }}>👋 {user?.name || user?.email}</span>
-                <button className="btn ghost" onClick={logout} title="Sign out">Sign out</button>
+                <span className="muted" style={{ fontSize: 14 }}>
+                  👋 {user?.name || user?.email}
+                </span>
+                <button className="btn ghost" onClick={logout} title="Sign out">
+                  Sign out
+                </button>
               </>
             ) : (
-              <button className="btn" onClick={() => setShowAuth(true)}>Sign in / Create account</button>
+              <button className="btn" onClick={() => setShowAuth(true)}>
+                Sign in / Create account
+              </button>
             )}
             <button className="btn ghost" onClick={() => window.location.reload()}>
               ↻ Refresh
@@ -648,7 +673,7 @@ export default function App() {
           <WatchlistPanel
             current={ticker}
             onLoad={(s) => setTicker(s)}
-            onAddToCompare={handleAddToCompare}   // ➕ hook up compare
+            onAddToCompare={handleAddToCompare}
           />
           <div style={{ marginTop: 12 }}>
             <label>
@@ -673,10 +698,10 @@ export default function App() {
 
           {compareOpen && (
             <CompareMode
-              symbols={compareSymbols}                 // controlled ✅
+              symbols={compareSymbols}
               onSymbolsChange={setCompareSymbols}
               defaultModels={models}
-              rememberSession={false}                  // no auto-restore, no phantom MSFT
+              rememberSession={false}
               onExit={() => setCompareOpen(false)}
             />
           )}
@@ -698,8 +723,13 @@ export default function App() {
             </button>
           </form>
 
-          {/* >>> Anchor for smooth-scroll target (moved here) <<< */}
-          <div ref={mainSectionRef} />
+          {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
+          <div
+            id="main-stock-info"
+            ref={mainSectionRef}
+            style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
+            aria-hidden
+          />
 
           {/* Top info row */}
           <div className="row" style={{ gap: 16, marginBottom: 12 }}>
@@ -725,7 +755,9 @@ export default function App() {
                 </p>
               ) : quote ? (
                 <>
-                  <p style={{ margin: 0 }}>Last Close: ${Number(quote.last_close).toFixed(2)}</p>
+                  <p style={{ margin: 0 }}>
+                    Last Close: ${Number(quote.last_close).toFixed(2)}
+                  </p>
                   <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
                     <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
                       ${tweenPrice.toFixed(2)}
@@ -766,7 +798,9 @@ export default function App() {
                         />
                       </div>
                     ) : (
-                      <div className="muted" style={{ fontSize: 12 }}>no chart data</div>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        no chart data
+                      </div>
                     )}
                   </div>
                   {closes.length >= 2 && (
@@ -776,7 +810,9 @@ export default function App() {
                   )}
                 </>
               ) : (
-                <p className="muted" style={{ margin: 0 }}>N/A</p>
+                <p className="muted" style={{ margin: 0 }}>
+                  N/A
+                </p>
               )}
             </div>
 
@@ -810,7 +846,15 @@ export default function App() {
             <div className="card" style={{ marginTop: 12 }}>
               <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
 
-              <div style={{ height: 260, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.03)", padding: 8 }}>
+              <div
+                style={{
+                  height: 260,
+                  borderRadius: 12,
+                  overflow: "hidden",
+                  background: "rgba(255,255,255,0.03)",
+                  padding: 8,
+                }}
+              >
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
@@ -927,7 +971,13 @@ export default function App() {
       {showBigPriceChart && (
         <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
           <div style={{ borderRadius: 12, overflow: "hidden" }}>
-            <InteractivePriceChart data={closes || []} labels={closeDates || []} width={800} height={300} big />
+            <InteractivePriceChart
+              data={closes || []}
+              labels={closeDates || []}
+              width={800}
+              height={300}
+              big
+            />
           </div>
         </MagnifyModal>
       )}
@@ -960,7 +1010,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
-  const vEnd   = clamp(view.end,   vStart + 1, data.length - 1);
+  const vEnd = clamp(view.end, vStart + 1, data.length - 1);
   const windowData = data.slice(vStart, vEnd + 1);
 
   const min = Math.min(...windowData);
@@ -984,26 +1034,33 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
   const onMove = (e) => {
-    the:
-    {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      setCursorX(clamp(x, pad, pad + w));
-      setHoverIdx(idxForX(x));
-      if (drag) {
-        const dx = x - drag.startX;
-        const frac = dx / w;
-        const windowSize = drag.startView.end - drag.startView.start;
-        let newStart = drag.startView.start - Math.round(frac * windowSize);
-        let newEnd = newStart + windowSize;
-        if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-        if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
-        setView({ start: newStart, end: newEnd });
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setCursorX(clamp(x, pad, pad + w));
+    setHoverIdx(idxForX(x));
+    if (drag) {
+      const dx = x - drag.startX;
+      const frac = dx / w;
+      const windowSize = drag.startView.end - drag.startView.start;
+      let newStart = drag.startView.start - Math.round(frac * windowSize);
+      let newEnd = newStart + windowSize;
+      if (newStart < 0) {
+        newStart = 0;
+        newEnd = windowSize;
       }
+      if (newEnd > data.length - 1) {
+        newEnd = data.length - 1;
+        newStart = newEnd - windowSize;
+      }
+      setView({ start: newStart, end: newEnd });
     }
   };
 
-  const onLeave = () => { setCursorX(null); setHoverIdx(null); setDrag(null); };
+  const onLeave = () => {
+    setCursorX(null);
+    setHoverIdx(null);
+    setDrag(null);
+  };
   const onDown = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -1023,11 +1080,18 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = clamp(newSize, 5, data.length - 1);
 
-    let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
+    let newStart =
+      focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
     let newEnd = newStart + newSize;
 
-    if (newStart < 0) { newStart = 0; newEnd = newSize; }
-    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
+    if (newStart < 0) {
+      newStart = 0;
+      newEnd = newSize;
+    }
+    if (newEnd > data.length - 1) {
+      newEnd = data.length - 1;
+      newStart = newEnd - newSize;
+    }
 
     setView({ start: newStart, end: newEnd });
   };
@@ -1045,12 +1109,16 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     const d = labels[showIdx];
     try {
       const dt = asLocalDate(d);
-      label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      label = dt.toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      });
     } catch {
       label = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx; // 0 = latest
+    const rel = data.length - 1 - showIdx; // 0 = latest
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
@@ -1076,14 +1144,42 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
+      <rect
+        x="0"
+        y="0"
+        width={width}
+        height={height}
+        rx="8"
+        ry="8"
+        fill="rgba(255,255,255,0.03)"
+      />
+      <polyline
+        fill="none"
+        stroke={lastUp ? "#2e7d32" : "#c62828"}
+        strokeWidth={big ? 2.5 : 2}
+        points={points}
+      />
       {cursorX != null && (
         <>
-          <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
+          <line
+            x1={showX}
+            x2={showX}
+            y1={10}
+            y2={height - 10}
+            stroke="#a8b2ff"
+            strokeDasharray="3,3"
+          />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
           <g>
-            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
+            <rect
+              x={boxX}
+              y={boxY}
+              width={textW}
+              height="22"
+              rx="6"
+              fill="rgba(0,0,0,0.65)"
+              stroke="rgba(255,255,255,0.25)"
+            />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {label}
             </text>
@@ -1119,7 +1215,9 @@ function MagnifyModal({ title, children, onClose }) {
         <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>{title}</h3>
           <div className="row" style={{ gap: 8 }}>
-            <button className="btn ghost" onClick={onClose}>Close</button>
+            <button className="btn ghost" onClick={onClose}>
+              Close
+            </button>
           </div>
         </div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
