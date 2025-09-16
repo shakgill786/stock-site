@@ -388,7 +388,15 @@ export default function App() {
     if (!t) return;
     setTicker(t);
     requestAnimationFrame(() => {
-      mainSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const el = mainSectionRef.current;
+      if (!el) return;
+      // Primary: native smooth scroll to the anchor
+      el.scrollIntoView({ behavior: "smooth", block: "start", inline: "nearest" });
+      // Fallback nudge for Safari/iOS and odd layouts
+      try {
+        const y = el.getBoundingClientRect().top + window.pageYOffset - 8;
+        window.scrollTo({ top: y, behavior: "smooth" });
+      } catch {}
     });
   };
 
@@ -676,9 +684,6 @@ export default function App() {
           {/* Hot movers + Earnings next 7d */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
-          {/* Anchor for smooth-scroll target */}
-          <div ref={mainSectionRef} />
-
           <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
               value={ticker}
@@ -692,6 +697,9 @@ export default function App() {
               {loading ? "Loading…" : "Load Data"}
             </button>
           </form>
+
+          {/* >>> Anchor for smooth-scroll target (moved here) <<< */}
+          <div ref={mainSectionRef} />
 
           {/* Top info row */}
           <div className="row" style={{ gap: 16, marginBottom: 12 }}>
@@ -976,19 +984,22 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const lastUp = windowData[windowData.length - 1] >= windowData[0];
 
   const onMove = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    setCursorX(clamp(x, pad, pad + w));
-    setHoverIdx(idxForX(x));
-    if (drag) {
-      const dx = x - drag.startX;
-      const frac = dx / w;
-      const windowSize = drag.startView.end - drag.startView.start;
-      let newStart = drag.startView.start - Math.round(frac * windowSize);
-      let newEnd = newStart + windowSize;
-      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
-      setView({ start: newStart, end: newEnd });
+    the:
+    {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      setCursorX(clamp(x, pad, pad + w));
+      setHoverIdx(idxForX(x));
+      if (drag) {
+        const dx = x - drag.startX;
+        const frac = dx / w;
+        const windowSize = drag.startView.end - drag.startView.start;
+        let newStart = drag.startView.start - Math.round(frac * windowSize);
+        let newEnd = newStart + windowSize;
+        if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+        if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
+        setView({ start: newStart, end: newEnd });
+      }
     }
   };
 
