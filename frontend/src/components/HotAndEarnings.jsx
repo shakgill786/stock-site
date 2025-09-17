@@ -1,7 +1,8 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week
-// - strict number parsing (no null/"" -> 0 coercion)
-// - derives missing change <-> change_pct and from prev_close/last_close
+// - strict parsing (no ""/null -> 0 coercion)
+// - derives change/% from previousClose (best) or open (fallback)
+// - ignores placeholder zeros coming from feeds
 // - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
@@ -12,14 +13,15 @@ const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
   if (typeof v === "number") return v;
   if (typeof v === "string") {
-    const s = v.trim().replace(/[%,$]/g, ""); // allow "1.23%", "$1.23"
-    if (s === "") return NaN;
+    const s = v.trim().replace(/[%,$]/g, "");
+    if (!s) return NaN;
     const n = Number(s);
     return Number.isFinite(n) ? n : NaN;
   }
   return NaN;
 };
 const isNum = (v) => Number.isFinite(toNum(v));
+const nearZero = (v) => Math.abs(toNum(v)) < 1e-9;
 
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
@@ -46,23 +48,25 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
-/* ---------- normalizer (tolerates many key names) ---------- */
+/* ---------- robust normalizer ---------- */
 function firstNum(row, keys) {
   for (const k of keys) {
-    const v = row?.[k];
-    if (isNum(v)) return toNum(v);
+    if (k in (row || {})) {
+      const v = row[k];
+      if (isNum(v)) return toNum(v);
+    }
   }
   return undefined;
 }
 
 function normalizeRow(row) {
-  const symbol =
-    String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
+  const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
+  // price (last/current)
   const price =
     firstNum(row, ["price", "last", "last_price", "current", "close", "Close"]) ?? undefined;
 
-  // candidates (some APIs return strings like "1.23%")
+  // possible fields for change and percent
   let change = firstNum(row, ["change", "chg", "delta", "Change"]);
   let change_pct = firstNum(row, [
     "change_pct",
@@ -71,21 +75,53 @@ function normalizeRow(row) {
     "pct_change",
     "pct",
     "ChangePercent",
+    "changePct",
+    "percentChange",
   ]);
 
-  // derive from prev/last close if needed
-  const prevClose =
-    firstNum(row, ["prev_close", "previous_close", "last_close", "PrevClose", "PreviousClose"]) ??
-    undefined;
+  // reference bases
+  const prevClose = firstNum(row, [
+    "prev_close",
+    "previous_close",
+    "previousClose",
+    "priorClose",
+    "last_close",
+    "PrevClose",
+    "PreviousClose",
+    "close_prev",
+    "yesterday_close",
+  ]);
+  const open = firstNum(row, ["open", "Open"]);
 
-  if (!isNum(change) && isNum(price) && isNum(prevClose)) {
-    change = price - prevClose;
+  // Prefer deriving from prevClose if we have it.
+  if (isNum(price) && isNum(prevClose)) {
+    const derivedChange = price - prevClose;
+    const derivedPct = (derivedChange / prevClose) * 100;
+
+    // If feed gives 0/placeholder, override with derived values.
+    if (!isNum(change) || nearZero(change)) change = derivedChange;
+    if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
-  if (!isNum(change_pct) && isNum(change) && isNum(price) && price !== 0) {
-    change_pct = (change / price) * 100;
+
+  // If still missing and we at least have "open", derive an intraday move.
+  if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
+    const intraday = price - open;
+    const intradayPct = (intraday / open) * 100;
+    if (!isNum(change) || nearZero(change)) change = intraday;
+    if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
+
+  // If we only have pct (common as a string) + price, back-compute change.
   if (!isNum(change) && isNum(change_pct) && isNum(price)) {
-    change = (change_pct / 100) * price;
+    change = (toNum(change_pct) / 100) * toNum(price);
+  }
+
+  // If we only have change, compute pct. Prefer prevClose if known, else price.
+  if (!isNum(change_pct) && isNum(change)) {
+    const base = isNum(prevClose) ? prevClose : isNum(price) ? price : undefined;
+    if (isNum(base) && !nearZero(base)) {
+      change_pct = (toNum(change) / toNum(base)) * 100;
+    }
   }
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
@@ -118,7 +154,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
       (x) =>
         isNum(x.price) &&
         toNum(x.price) >= lim &&
-        // keep rows that truly have change info (not coerced zeros)
+        // keep if we *now* have either change or pct after derivation
         (isNum(x.change) || isNum(x.change_pct))
     );
   }, [normalized, minPrice]);
@@ -206,7 +242,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                         type="button"
                         className="ticker-link"
                         onClick={() => {
-                          onPick?.(sym); // let App scroll
+                          onPick?.(sym);
                           window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
                         }}
                         title={`Load ${sym}`}
@@ -307,7 +343,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                               type="button"
                               className="ticker-link"
                               onClick={() => {
-                                onPick?.(sym); // let App scroll
+                                onPick?.(sym);
                                 window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
                               }}
                               title={`Load ${sym}`}
@@ -341,7 +377,9 @@ function EarningsCard({ items = [], loading, error, onPick }) {
   );
 }
 
-function FragmentBlock({ children }) { return <>{children}</>; }
+function FragmentBlock({ children }) {
+  return <>{children}</>;
+}
 
 /* ---------- Main component ---------- */
 export default function HotAndEarnings({ onSelectTicker }) {
@@ -368,17 +406,23 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
+      // Normalize FIRST, then filter by derived values
       const g = (Array.isArray(mv?.gainers) ? mv.gainers : [])
         .map(normalizeRow)
-        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)));
+        .filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)));
 
       const l = (Array.isArray(mv?.losers) ? mv.losers : [])
         .map(normalizeRow)
-        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)));
+        .filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)));
 
       setGainers(g);
       setLosers(l);
       setMoverSource(mv?.source || "");
+      // Tiny peek at the feed (helps if a field name is odd)
+      console.debug("[movers] sample source:", mv?.source, {
+        gainers: mv?.gainers?.slice?.(0, 2),
+        losers: mv?.losers?.slice?.(0, 2),
+      });
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
@@ -404,12 +448,16 @@ export default function HotAndEarnings({ onSelectTicker }) {
     }
   };
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh();
+  }, []);
 
   return (
     <div className="he-grid">
       <div className="he-toolbar">
-        <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
+        <button className="btn ghost" onClick={refresh} title="Refresh sections">
+          ↻ Refresh
+        </button>
       </div>
 
       <MoversCard
@@ -428,12 +476,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         onPick={pick}
         fetchedFrom={moverSource}
       />
-      <EarningsCard
-        items={earnings}
-        loading={loadingEarnings}
-        error={errEarnings}
-        onPick={pick}
-      />
+      <EarningsCard items={earnings} loading={loadingEarnings} error={errEarnings} onPick={pick} />
 
       {/* component-scoped styles */}
       <style>{`
