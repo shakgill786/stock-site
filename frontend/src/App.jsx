@@ -149,6 +149,15 @@ function scrollToTarget(el) {
     scroller.scrollTo({ top, behavior: "smooth" });
   }
 }
+function scrollMainInfoNow() {
+  const el = document.getElementById("main-stock-info");
+  if (el && typeof el.scrollIntoView === "function") {
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (el) {
+    const top = el.getBoundingClientRect().top + window.pageYOffset - 8;
+    window.scrollTo({ top, behavior: "smooth" });
+  }
+}
 
 export default function App() {
   const { user, logout } = useAuth();
@@ -196,15 +205,23 @@ export default function App() {
   // Where to scroll when a symbol is chosen from the movers table
   const mainSectionRef = useRef(null);
 
+  // 🔔 Listen for global ticker:set so clicks from movers/earnings always scroll & set
+  useEffect(() => {
+    const handler = (e) => {
+      const sym = String(e?.detail || "").toUpperCase().trim();
+      if (sym) setTicker(sym);
+      // let any DOM updates paint, then scroll
+      requestAnimationFrame(() => requestAnimationFrame(scrollMainInfoNow));
+    };
+    window.addEventListener("ticker:set", handler);
+    return () => window.removeEventListener("ticker:set", handler);
+  }, []);
+
   // Pre-warm backend right after mount to reduce cold-start timeouts
   useEffect(() => {
     (async () => {
-      try {
-        await ping();
-      } catch {}
-      setTimeout(() => {
-        ping().catch(() => {});
-      }, 2500);
+      try { await ping(); } catch {}
+      setTimeout(() => { ping().catch(() => {}); }, 2500);
     })();
   }, []);
 
@@ -414,7 +431,7 @@ export default function App() {
   const toggleModel = (m) =>
     setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
 
-  // When user clicks a symbol in movers table:
+  // When user clicks a symbol in movers table (prop path)
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
@@ -497,7 +514,10 @@ export default function App() {
   const avpDatasets = useMemo(() => {
     if (!chartLabels.length) return [];
 
-    const actualSeries = [...actualForPastLabels, ...Array(futureLabels.length).fill(null)];
+    const actualSeries = [
+      ...actualForPastLabels,
+      ...Array(futureLabels.length).fill(null),
+    ];
 
     const ds = [
       {
@@ -534,7 +554,8 @@ export default function App() {
         spanGaps: true,
       });
 
-      const start = [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
+      const start =
+        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
         start,
@@ -1010,7 +1031,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
-  const vEnd = clamp(view.end, vStart + 1, data.length - 1);
+  const vEnd   = clamp(view.end,   vStart + 1, data.length - 1);
   const windowData = data.slice(vStart, vEnd + 1);
 
   const min = Math.min(...windowData);
@@ -1044,23 +1065,13 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       const windowSize = drag.startView.end - drag.startView.start;
       let newStart = drag.startView.start - Math.round(frac * windowSize);
       let newEnd = newStart + windowSize;
-      if (newStart < 0) {
-        newStart = 0;
-        newEnd = windowSize;
-      }
-      if (newEnd > data.length - 1) {
-        newEnd = data.length - 1;
-        newStart = newEnd - windowSize;
-      }
+      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
+      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
       setView({ start: newStart, end: newEnd });
     }
   };
 
-  const onLeave = () => {
-    setCursorX(null);
-    setHoverIdx(null);
-    setDrag(null);
-  };
+  const onLeave = () => { setCursorX(null); setHoverIdx(null); setDrag(null); };
   const onDown = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -1080,18 +1091,11 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = clamp(newSize, 5, data.length - 1);
 
-    let newStart =
-      focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
+    let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
     let newEnd = newStart + newSize;
 
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = newSize;
-    }
-    if (newEnd > data.length - 1) {
-      newEnd = data.length - 1;
-      newStart = newEnd - newSize;
-    }
+    if (newStart < 0) { newStart = 0; newEnd = newSize; }
+    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
 
     setView({ start: newStart, end: newEnd });
   };
@@ -1109,16 +1113,12 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     const d = labels[showIdx];
     try {
       const dt = asLocalDate(d);
-      label = dt.toLocaleDateString(undefined, {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-      });
+      label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
     } catch {
       label = String(d);
     }
   } else {
-    const rel = data.length - 1 - showIdx; // 0 = latest
+    const rel = (data.length - 1) - showIdx; // 0 = latest
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
@@ -1144,42 +1144,14 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      <rect
-        x="0"
-        y="0"
-        width={width}
-        height={height}
-        rx="8"
-        ry="8"
-        fill="rgba(255,255,255,0.03)"
-      />
-      <polyline
-        fill="none"
-        stroke={lastUp ? "#2e7d32" : "#c62828"}
-        strokeWidth={big ? 2.5 : 2}
-        points={points}
-      />
+      <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
+      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
       {cursorX != null && (
         <>
-          <line
-            x1={showX}
-            x2={showX}
-            y1={10}
-            y2={height - 10}
-            stroke="#a8b2ff"
-            strokeDasharray="3,3"
-          />
+          <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
           <g>
-            <rect
-              x={boxX}
-              y={boxY}
-              width={textW}
-              height="22"
-              rx="6"
-              fill="rgba(0,0,0,0.65)"
-              stroke="rgba(255,255,255,0.25)"
-            />
+            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {label}
             </text>
