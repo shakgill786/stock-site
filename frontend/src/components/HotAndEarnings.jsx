@@ -1,20 +1,31 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week
-// - derives missing change <-> change_pct so UI never shows 0.00/0.00
+// - strict number parsing (no null/"" -> 0 coercion)
+// - derives missing change <-> change_pct and from prev_close/last_close
 // - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
 import { fetchMovers, fetchEarningsWeek } from "../api";
 
-/* ---------- helpers & formatters ---------- */
-const num = (v) => (typeof v === "number" ? v : Number(v));
-const isNum = (v) => Number.isFinite(num(v));
+/* ---------- strict helpers & formatters ---------- */
+const toNum = (v) => {
+  if (v === null || v === undefined) return NaN;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const s = v.trim().replace(/[%,$]/g, ""); // allow "1.23%", "$1.23"
+    if (s === "") return NaN;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  return NaN;
+};
+const isNum = (v) => Number.isFinite(toNum(v));
 
-const fmtMoney = (v) => (isNum(v) ? `$${num(v).toFixed(2)}` : "—");
+const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
-  isNum(v) ? `${num(v) >= 0 ? "+" : ""}$${Math.abs(num(v)).toFixed(2)}` : "—";
+  isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}$${Math.abs(toNum(v)).toFixed(2)}` : "—";
 const fmtPct = (v) =>
-  isNum(v) ? `${num(v) >= 0 ? "+" : ""}${num(v).toFixed(2)}%` : "—";
+  isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}${toNum(v).toFixed(2)}%` : "—";
 
 const fmtDateHuman = (iso) => {
   if (!iso) return "—";
@@ -35,17 +46,46 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
-/* ---------- small normalizer to fill missing fields ---------- */
+/* ---------- normalizer (tolerates many key names) ---------- */
+function firstNum(row, keys) {
+  for (const k of keys) {
+    const v = row?.[k];
+    if (isNum(v)) return toNum(v);
+  }
+  return undefined;
+}
+
 function normalizeRow(row) {
-  const symbol = String(row?.symbol || row?.ticker || "").toUpperCase();
-  const price = isNum(row?.price) ? num(row.price) : undefined;
+  const symbol =
+    String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
-  let change = isNum(row?.change) ? num(row.change) : undefined;
-  let change_pct = isNum(row?.change_pct) ? num(row.change_pct) : undefined;
+  const price =
+    firstNum(row, ["price", "last", "last_price", "current", "close", "Close"]) ?? undefined;
 
-  if (price != null) {
-    if (change == null && change_pct != null) change = (change_pct / 100) * price;
-    if (change_pct == null && change != null && price !== 0) change_pct = (change / price) * 100;
+  // candidates (some APIs return strings like "1.23%")
+  let change = firstNum(row, ["change", "chg", "delta", "Change"]);
+  let change_pct = firstNum(row, [
+    "change_pct",
+    "change_percent",
+    "percent_change",
+    "pct_change",
+    "pct",
+    "ChangePercent",
+  ]);
+
+  // derive from prev/last close if needed
+  const prevClose =
+    firstNum(row, ["prev_close", "previous_close", "last_close", "PrevClose", "PreviousClose"]) ??
+    undefined;
+
+  if (!isNum(change) && isNum(price) && isNum(prevClose)) {
+    change = price - prevClose;
+  }
+  if (!isNum(change_pct) && isNum(change) && isNum(price) && price !== 0) {
+    change_pct = (change / price) * 100;
+  }
+  if (!isNum(change) && isNum(change_pct) && isNum(price)) {
+    change = (change_pct / 100) * price;
   }
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
@@ -70,18 +110,25 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
   const [sortKey, setSortKey] = useState("change_pct");
   const [sortDir, setSortDir] = useState("desc");
 
+  const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
+
   const filtered = useMemo(() => {
-    const r = Array.isArray(rows) ? rows.map(normalizeRow) : [];
-    const lim = Number(minPrice) || 0;
-    return r.filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)) && x.price >= lim);
-  }, [rows, minPrice]);
+    const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
+    return normalized.filter(
+      (x) =>
+        isNum(x.price) &&
+        toNum(x.price) >= lim &&
+        // keep rows that truly have change info (not coerced zeros)
+        (isNum(x.change) || isNum(x.change_pct))
+    );
+  }, [normalized, minPrice]);
 
   const sorted = useMemo(() => {
     const arr = [...filtered];
     const key = sortKey;
     arr.sort((a, b) => {
-      const va = isNum(a?.[key]) ? num(a[key]) : -Infinity;
-      const vb = isNum(b?.[key]) ? num(b[key]) : -Infinity;
+      const va = isNum(a?.[key]) ? toNum(a[key]) : -Infinity;
+      const vb = isNum(b?.[key]) ? toNum(b[key]) : -Infinity;
       const cmp = vb - va;
       return sortDir === "desc" ? cmp : -cmp;
     });
@@ -135,7 +182,9 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
               <tr>
                 <th className="num">#</th>
                 <th>Symbol</th>
-                <th className="num">Price</th>
+                <th className="num th-click" onClick={() => onHeaderClick("price")}>
+                  Price {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                </th>
                 <th className="num th-click" onClick={() => onHeaderClick("change")} title="Sort by $ change">
                   $ Change {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
@@ -146,8 +195,8 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                const { symbol: sym, price, change, change_pct } = normalizeRow(r);
-                const up = isNum(change) ? change >= 0 : isNum(change_pct) ? change_pct >= 0 : true;
+                const { symbol: sym, price, change, change_pct } = r; // already normalized
+                const up = isNum(change) ? toNum(change) >= 0 : isNum(change_pct) ? toNum(change_pct) >= 0 : true;
                 const top = i < 3;
                 return (
                   <tr key={`${sym}-${i}`} className={top ? "he-toprow" : ""}>
@@ -157,7 +206,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                         type="button"
                         className="ticker-link"
                         onClick={() => {
-                          onPick?.(sym); // ← ensure App handler fires (scroll)
+                          onPick?.(sym); // let App scroll
                           window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
                         }}
                         title={`Load ${sym}`}
@@ -167,7 +216,9 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
                     </td>
                     <td className="num">{fmtMoney(price)}</td>
                     <td className={`num ${up ? "pos" : "neg"}`}>{fmtSignMoney(change)}</td>
-                    <td className={`num ${isNum(change_pct) && change_pct >= 0 ? "pos" : "neg"}`}>{fmtPct(change_pct)}</td>
+                    <td className={`num ${isNum(change_pct) && toNum(change_pct) >= 0 ? "pos" : "neg"}`}>
+                      {fmtPct(change_pct)}
+                    </td>
                   </tr>
                 );
               })}
@@ -256,7 +307,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                               type="button"
                               className="ticker-link"
                               onClick={() => {
-                                onPick?.(sym); // ← ensure App handler fires (scroll)
+                                onPick?.(sym); // let App scroll
                                 window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
                               }}
                               title={`Load ${sym}`}
@@ -318,12 +369,12 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const mv = await fetchMovers();
 
       const g = (Array.isArray(mv?.gainers) ? mv.gainers : [])
-        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)))
-        .map(normalizeRow);
+        .map(normalizeRow)
+        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)));
 
       const l = (Array.isArray(mv?.losers) ? mv.losers : [])
-        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)))
-        .map(normalizeRow);
+        .map(normalizeRow)
+        .filter((x) => isNum(x?.price) && (isNum(x?.change) || isNum(x?.change_pct)));
 
       setGainers(g);
       setLosers(l);
