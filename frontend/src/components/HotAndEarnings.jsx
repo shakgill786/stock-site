@@ -1,12 +1,12 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week
-// - strict parsing (no ""/null -> 0 coercion)
-// - derives change/% from previousClose (best) or open (fallback)
-// - ignores placeholder zeros coming from feeds
+// - strict parsing (no accidental string->0 coercion)
+// - intelligently derives change/% from previousClose or open
+// - hydrates any rows with missing/zero change via fetchQuote (batched)
 // - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
-import { fetchMovers, fetchEarningsWeek } from "../api";
+import { fetchMovers, fetchEarningsWeek, fetchQuote } from "../api";
 
 /* ---------- strict helpers & formatters ---------- */
 const toNum = (v) => {
@@ -48,7 +48,7 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
-/* ---------- robust normalizer ---------- */
+/* ---------- normalizer + derivations ---------- */
 function firstNum(row, keys) {
   for (const k of keys) {
     if (k in (row || {})) {
@@ -103,7 +103,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
 
-  // If still missing and we at least have "open", derive an intraday move.
+  // Fallback: derive intraday from open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = price - open;
     const intradayPct = (intraday / open) * 100;
@@ -111,7 +111,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
 
-  // If we only have pct (common as a string) + price, back-compute change.
+  // If we only have pct + price, back-compute change.
   if (!isNum(change) && isNum(change_pct) && isNum(price)) {
     change = (toNum(change_pct) / 100) * toNum(price);
   }
@@ -125,6 +125,56 @@ function normalizeRow(row) {
   }
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
+}
+
+/* ---------- quote hydration for missing/zero change ---------- */
+const HYDRATE_BATCH = 6;
+
+async function hydrateMissing(rows) {
+  const out = rows.map((r) => ({ ...r })); // copy
+  const need = out
+    .map((r, i) => ({
+      i,
+      sym: r.symbol,
+      missing: !(isNum(r.change) && !nearZero(r.change)) && !(isNum(r.change_pct) && !nearZero(r.change_pct)),
+    }))
+    .filter((x) => x.missing && x.sym);
+
+  for (let k = 0; k < need.length; k += HYDRATE_BATCH) {
+    const slice = need.slice(k, k + HYDRATE_BATCH);
+    await Promise.all(
+      slice.map(async ({ i, sym }) => {
+        try {
+          const q = await fetchQuote(sym);
+          const price = isNum(out[i].price) ? out[i].price : toNum(q?.current_price);
+          const lastClose = toNum(q?.last_close);
+          let change = isNum(q?.change) ? toNum(q.change) : NaN;
+          let change_pct = isNum(q?.change_pct) ? toNum(q.change_pct) : NaN;
+
+          // Derive if quote didn't provide
+          if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
+            change = toNum(price) - toNum(lastClose);
+          }
+          if ((!isNum(change_pct) || nearZero(change_pct)) && isNum(change) && isNum(lastClose) && !nearZero(lastClose)) {
+            change_pct = (toNum(change) / toNum(lastClose)) * 100;
+          }
+
+          // Merge then re-normalize so downstream formatting stays consistent
+          out[i] = normalizeRow({
+            ...out[i],
+            price,
+            last_close: lastClose,
+            change,
+            change_pct,
+          });
+        } catch {
+          // ignore failures; row will remain as-is
+        }
+      })
+    );
+  }
+
+  return out;
 }
 
 /* ---------- shared UI shells ---------- */
@@ -154,7 +204,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
       (x) =>
         isNum(x.price) &&
         toNum(x.price) >= lim &&
-        // keep if we *now* have either change or pct after derivation
+        // keep if we have either change or pct (after hydration/derivation)
         (isNum(x.change) || isNum(x.change_pct))
     );
   }, [normalized, minPrice]);
@@ -231,7 +281,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                const { symbol: sym, price, change, change_pct } = r; // already normalized
+                const { symbol: sym, price, change, change_pct } = r; // already normalized/hydrated
                 const up = isNum(change) ? toNum(change) >= 0 : isNum(change_pct) ? toNum(change_pct) >= 0 : true;
                 const top = i < 3;
                 return (
@@ -377,9 +427,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
   );
 }
 
-function FragmentBlock({ children }) {
-  return <>{children}</>;
-}
+function FragmentBlock({ children }) { return <>{children}</>; }
 
 /* ---------- Main component ---------- */
 export default function HotAndEarnings({ onSelectTicker }) {
@@ -406,23 +454,19 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
-      // Normalize FIRST, then filter by derived values
-      const g = (Array.isArray(mv?.gainers) ? mv.gainers : [])
-        .map(normalizeRow)
-        .filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)));
+      // Normalize first
+      const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
+      const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      const l = (Array.isArray(mv?.losers) ? mv.losers : [])
-        .map(normalizeRow)
-        .filter((x) => isNum(x.price) && (isNum(x.change) || isNum(x.change_pct)));
+      // Hydrate rows where change/% are missing or placeholder-zero
+      const [g, l] = await Promise.all([hydrateMissing(g0), hydrateMissing(l0)]);
 
-      setGainers(g);
-      setLosers(l);
-      setMoverSource(mv?.source || "");
-      // Tiny peek at the feed (helps if a field name is odd)
-      console.debug("[movers] sample source:", mv?.source, {
-        gainers: mv?.gainers?.slice?.(0, 2),
-        losers: mv?.losers?.slice?.(0, 2),
-      });
+      // Keep rows that now have price + (change or pct)
+      const keep = (r) => isNum(r.price) && (isNum(r.change) || isNum(r.change_pct));
+
+      setGainers(g.filter(keep));
+      setLosers(l.filter(keep));
+      setMoverSource(mv?.source ? `${mv.source} + quotes` : "quotes");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
@@ -448,16 +492,12 @@ export default function HotAndEarnings({ onSelectTicker }) {
     }
   };
 
-  useEffect(() => {
-    refresh();
-  }, []);
+  useEffect(() => { refresh(); }, []);
 
   return (
     <div className="he-grid">
       <div className="he-toolbar">
-        <button className="btn ghost" onClick={refresh} title="Refresh sections">
-          ↻ Refresh
-        </button>
+        <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
       </div>
 
       <MoversCard
@@ -476,7 +516,12 @@ export default function HotAndEarnings({ onSelectTicker }) {
         onPick={pick}
         fetchedFrom={moverSource}
       />
-      <EarningsCard items={earnings} loading={loadingEarnings} error={errEarnings} onPick={pick} />
+      <EarningsCard
+        items={earnings}
+        loading={loadingEarnings}
+        error={errEarnings}
+        onPick={pick}
+      />
 
       {/* component-scoped styles */}
       <style>{`
