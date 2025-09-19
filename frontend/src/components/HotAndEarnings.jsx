@@ -1,14 +1,17 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week
 // - strict parsing (no accidental string->0 coercion)
-// - intelligently derives change/% from previousClose or open
-// - hydrates any rows with missing/zero change via fetchQuote (batched)
+// - derives change/% from previousClose or open
+// - fixes sign mismatches (trust % and recompute $)
+// - hydrates rows with missing/zero change via fetchQuote (batched)
 // - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
 import { fetchMovers, fetchEarningsWeek, fetchQuote } from "../api";
 
 /* ---------- strict helpers & formatters ---------- */
+const EPS = 1e-6;
+
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
   if (typeof v === "number") return v;
@@ -21,7 +24,7 @@ const toNum = (v) => {
   return NaN;
 };
 const isNum = (v) => Number.isFinite(toNum(v));
-const nearZero = (v) => Math.abs(toNum(v)) < 1e-9;
+const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
@@ -58,15 +61,17 @@ function firstNum(row, keys) {
   }
   return undefined;
 }
+const signMismatch = (a, b) =>
+  isNum(a) && isNum(b) && !nearZero(a) && !nearZero(b) &&
+  Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
-  // price (last/current)
-  const price =
-    firstNum(row, ["price", "last", "last_price", "current", "close", "Close"]) ?? undefined;
+  // Price (last/current)
+  const price = firstNum(row, ["price", "last", "last_price", "current", "close", "Close"]);
 
-  // possible fields for change and percent
+  // Change and percent (possibly wrong/placeholder)
   let change = firstNum(row, ["change", "chg", "delta", "Change"]);
   let change_pct = firstNum(row, [
     "change_pct",
@@ -79,7 +84,7 @@ function normalizeRow(row) {
     "percentChange",
   ]);
 
-  // reference bases
+  // Bases we can derive from
   const prevClose = firstNum(row, [
     "prev_close",
     "previous_close",
@@ -93,36 +98,44 @@ function normalizeRow(row) {
   ]);
   const open = firstNum(row, ["open", "Open"]);
 
-  // Prefer deriving from prevClose if we have it.
+  // Prefer deriving from prevClose when available
   if (isNum(price) && isNum(prevClose)) {
-    const derivedChange = price - prevClose;
-    const derivedPct = (derivedChange / prevClose) * 100;
+    const derivedChange = toNum(price) - toNum(prevClose);
+    const derivedPct = (derivedChange / toNum(prevClose)) * 100;
 
-    // If feed gives 0/placeholder, override with derived values.
     if (!isNum(change) || nearZero(change)) change = derivedChange;
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
 
-  // Fallback: derive intraday from open
+  // Fallback: intraday from open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
-    const intraday = price - open;
-    const intradayPct = (intraday / open) * 100;
+    const intraday = toNum(price) - toNum(open);
+    const intradayPct = (intraday / toNum(open)) * 100;
     if (!isNum(change) || nearZero(change)) change = intraday;
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
 
-  // If we only have pct + price, back-compute change.
-  if (!isNum(change) && isNum(change_pct) && isNum(price)) {
-    change = (toNum(change_pct) / 100) * toNum(price);
+  // If only pct, back-compute change using best base (prevClose > price)
+  if (!isNum(change) && isNum(change_pct)) {
+    const base = isNum(prevClose) ? prevClose : price;
+    if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // If we only have change, compute pct. Prefer prevClose if known, else price.
+  // If only $, compute pct using best base (prevClose > price)
   if (!isNum(change_pct) && isNum(change)) {
-    const base = isNum(prevClose) ? prevClose : isNum(price) ? price : undefined;
-    if (isNum(base) && !nearZero(base)) {
-      change_pct = (toNum(change) / toNum(base)) * 100;
-    }
+    const base = isNum(prevClose) ? prevClose : price;
+    if (isNum(base) && !nearZero(base)) change_pct = (toNum(change) / toNum(base)) * 100;
   }
+
+  // Final guard: if both exist but signs disagree, trust % and recompute $
+  if (signMismatch(change, change_pct)) {
+    const base = isNum(prevClose) ? prevClose : price;
+    if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
+  }
+
+  // squash -0.00
+  if (isNum(change) && nearZero(change)) change = 0;
+  if (isNum(change_pct) && nearZero(change_pct)) change_pct = 0;
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
 }
@@ -136,7 +149,9 @@ async function hydrateMissing(rows) {
     .map((r, i) => ({
       i,
       sym: r.symbol,
-      missing: !(isNum(r.change) && !nearZero(r.change)) && !(isNum(r.change_pct) && !nearZero(r.change_pct)),
+      missing:
+        (!(isNum(r.change) && !nearZero(r.change)) &&
+         !(isNum(r.change_pct) && !nearZero(r.change_pct))) // both missing/zero
     }))
     .filter((x) => x.missing && x.sym);
 
@@ -146,12 +161,13 @@ async function hydrateMissing(rows) {
       slice.map(async ({ i, sym }) => {
         try {
           const q = await fetchQuote(sym);
+
           const price = isNum(out[i].price) ? out[i].price : toNum(q?.current_price);
           const lastClose = toNum(q?.last_close);
           let change = isNum(q?.change) ? toNum(q.change) : NaN;
           let change_pct = isNum(q?.change_pct) ? toNum(q.change_pct) : NaN;
 
-          // Derive if quote didn't provide
+          // Derive from quote if needed
           if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
             change = toNum(price) - toNum(lastClose);
           }
@@ -159,7 +175,7 @@ async function hydrateMissing(rows) {
             change_pct = (toNum(change) / toNum(lastClose)) * 100;
           }
 
-          // Merge then re-normalize so downstream formatting stays consistent
+          // Normalize to enforce sign consistency & formatting
           out[i] = normalizeRow({
             ...out[i],
             price,
@@ -204,7 +220,6 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
       (x) =>
         isNum(x.price) &&
         toNum(x.price) >= lim &&
-        // keep if we have either change or pct (after hydration/derivation)
         (isNum(x.change) || isNum(x.change_pct))
     );
   }, [normalized, minPrice]);
@@ -427,7 +442,9 @@ function EarningsCard({ items = [], loading, error, onPick }) {
   );
 }
 
-function FragmentBlock({ children }) { return <>{children}</>; }
+function FragmentBlock({ children }) {
+  return <>{children}</>;
+}
 
 /* ---------- Main component ---------- */
 export default function HotAndEarnings({ onSelectTicker }) {
@@ -466,7 +483,11 @@ export default function HotAndEarnings({ onSelectTicker }) {
 
       setGainers(g.filter(keep));
       setLosers(l.filter(keep));
-      setMoverSource(mv?.source ? `${mv.source} + quotes` : "quotes");
+
+      const usedQuotes = g0.some((r, i) => (nearZero(r.change) && isNum(g[i]?.change)) || (nearZero(r.change_pct) && isNum(g[i]?.change_pct)))
+                       || l0.some((r, i) => (nearZero(r.change) && isNum(l[i]?.change)) || (nearZero(r.change_pct) && isNum(l[i]?.change_pct)));
+
+      setMoverSource(mv?.source ? (usedQuotes ? `${mv.source} + quotes` : mv.source) : (usedQuotes ? "quotes" : ""));
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
@@ -492,7 +513,9 @@ export default function HotAndEarnings({ onSelectTicker }) {
     }
   };
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh();
+  }, []);
 
   return (
     <div className="he-grid">
