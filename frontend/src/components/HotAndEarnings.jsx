@@ -1,10 +1,10 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week
-// - strict parsing (no accidental string->0 coercion)
-// - prefers after-hours / extended prices when available (post/pre market)
+// - strict parsing to avoid string -> 0 coercion
+// - prefers after-hours / extended prices when present
 // - derives change/% from previousClose or open
-// - fixes sign mismatches (trust % and recompute $)
-// - hydrates rows with missing/zero change via fetchQuote (batched)
+// - hydrates rows via fetchQuote (batched), with optional "force all"
+// - built-in diagnostics: window.__dumpMovers(), window.__debugQuotes([...])
 // - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
@@ -29,7 +29,7 @@ const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
-  isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}$${Math.abs(toNum(v)).toFixed(2)}` : "—";
+  isNum(v) ? `${toNum(v) >= 0 ? "+" : "-"}$${Math.abs(toNum(v)).toFixed(2)}` : "—";
 const fmtPct = (v) =>
   isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}${toNum(v).toFixed(2)}%` : "—";
 
@@ -69,29 +69,26 @@ const signMismatch = (a, b) =>
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
-  // Price (try extended fields too if the feed already has them)
-  const price =
-    firstNum(row, [
-      "price", "last", "last_price", "current", "close", "Close",
-      "extended_price", "ext_price", "postmarket_price", "postMarketPrice",
-      "after_hours_price", "afterHoursPrice", "premarket_price", "preMarketPrice"
-    ]);
+  // price (try extended if mover feed already has it)
+  const price = firstNum(row, [
+    "price", "last", "last_price", "current", "close", "Close",
+    "extended_price", "ext_price", "postmarket_price", "postMarketPrice",
+    "after_hours_price", "afterHoursPrice", "premarket_price", "preMarketPrice"
+  ]);
 
-  // Change and percent (possibly wrong/placeholder)
   let change = firstNum(row, ["change", "chg", "delta", "Change", "extended_change", "after_hours_change", "postmarket_change"]);
   let change_pct = firstNum(row, [
     "change_pct", "change_percent", "percent_change", "pct_change", "pct", "ChangePercent",
     "changePct", "percentChange", "extended_change_pct", "after_hours_change_pct", "postmarket_change_pct"
   ]);
 
-  // Bases we can derive from
   const prevClose = firstNum(row, [
     "prev_close", "previous_close", "previousClose", "priorClose",
     "last_close", "PrevClose", "PreviousClose", "close_prev", "yesterday_close",
   ]);
   const open = firstNum(row, ["open", "Open"]);
 
-  // Prefer deriving from prevClose when available
+  // derive vs prevClose if possible
   if (isNum(price) && isNum(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
@@ -99,7 +96,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
 
-  // Fallback: intraday from open
+  // fallback: from open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
@@ -107,19 +104,19 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
 
-  // If only pct, back-compute change using best base (prevClose > price)
+  // only pct? -> compute $
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // If only $, compute pct using best base (prevClose > price)
+  // only $? -> compute %
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change_pct = (toNum(change) / toNum(base)) * 100;
   }
 
-  // Final guard: if both exist but signs disagree, trust % and recompute $
+  // consistency: if signs disagree, trust % and recompute $
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
@@ -134,33 +131,30 @@ function normalizeRow(row) {
 
 /* ---------- pick extended fields from a quote, with fallbacks ---------- */
 function pickFromQuote(q) {
-  const lastClose = toNum(
-    firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close"])
-  );
+  const lastClose = toNum(firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]));
 
-  // Prefer after-hours / extended price when present
+  // Prefer extended price if present
   const extPrice = firstNum(q, [
     "extended_price", "ext_price",
     "postmarket_price", "postMarketPrice", "after_hours_price", "afterHoursPrice",
     "premarket_price", "preMarketPrice"
   ]);
-  const curPrice = toNum(firstNum(q, ["current_price", "price", "last", "last_price"]));
-
+  const curPrice = toNum(firstNum(q, [
+    "current_price", "price", "last", "last_price",
+    "regularMarketPrice"
+  ]));
   let price = isNum(extPrice) ? extPrice : curPrice;
 
-  // Change (extended first)
   let change = firstNum(q, [
-    "extended_change", "ext_change",
-    "postmarket_change", "after_hours_change", "premarket_change",
-    "change"
+    "extended_change", "ext_change", "postmarket_change", "after_hours_change", "premarket_change",
+    "change", "regularMarketChange"
   ]);
   let change_pct = firstNum(q, [
-    "extended_change_pct", "ext_change_pct",
-    "postmarket_change_pct", "after_hours_change_pct", "premarket_change_pct",
-    "change_pct", "percent_change"
+    "extended_change_pct", "ext_change_pct", "postmarket_change_pct", "after_hours_change_pct", "premarket_change_pct",
+    "change_pct", "percent_change", "regularMarketChangePercent"
   ]);
 
-  // Derive from price vs lastClose if missing
+  // Derive from price vs lastClose if needed
   if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
@@ -168,29 +162,30 @@ function pickFromQuote(q) {
     change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
-  // If still missing, fall back to curPrice vs lastClose
-  if ((!isNum(change) || !isNum(change_pct)) && isNum(curPrice) && isNum(lastClose) && !nearZero(lastClose)) {
-    if (!isNum(change)) change = toNum(curPrice) - toNum(lastClose);
-    if (!isNum(change_pct)) change_pct = ((toNum(curPrice) - toNum(lastClose)) / toNum(lastClose)) * 100;
-  }
-
-  // Normalize consistency & -0.00
-  const norm = normalizeRow({ symbol: q?.ticker || q?.symbol || "", price, last_close: lastClose, change, change_pct });
-  return norm; // {symbol, price, change, change_pct}
+  // Final normalization
+  return normalizeRow({
+    symbol: q?.ticker || q?.symbol || "",
+    price,
+    last_close: lastClose,
+    change,
+    change_pct,
+  });
 }
 
 /* ---------- quote hydration for missing/zero change ---------- */
 const HYDRATE_BATCH = 6;
 
-async function hydrateMissing(rows) {
+/** When forceAll=true, hydrate every row (diagnostic mode) */
+async function hydrateRows(rows, { forceAll = false } = {}) {
   const out = rows.map((r) => ({ ...r })); // copy
   const need = out
     .map((r, i) => ({
       i,
       sym: r.symbol,
       missing:
-        (!(isNum(r.change) && !nearZero(r.change)) &&
-         !(isNum(r.change_pct) && !nearZero(r.change_pct))) // both missing/zero
+        forceAll ||
+        ( !(isNum(r.change) && !nearZero(r.change)) &&
+          !(isNum(r.change_pct) && !nearZero(r.change_pct)) ),
     }))
     .filter((x) => x.missing && x.sym);
 
@@ -201,21 +196,19 @@ async function hydrateMissing(rows) {
         try {
           const q = await fetchQuote(sym);
           const picked = pickFromQuote(q || {});
-          // merge with original, then normalize once more
           out[i] = normalizeRow({
             ...out[i],
             price: isNum(out[i].price) ? out[i].price : picked.price,
             change: picked.change,
             change_pct: picked.change_pct,
-            last_close: firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close"]),
+            last_close: firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]),
           });
         } catch {
-          // ignore; row stays as-is
+          /* ignore */
         }
       })
     );
   }
-
   return out;
 }
 
@@ -322,7 +315,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                const { symbol: sym, price, change, change_pct } = r; // already normalized/hydrated
+                const { symbol: sym, price, change, change_pct } = r;
                 const up = isNum(change) ? toNum(change) >= 0 : isNum(change_pct) ? toNum(change_pct) >= 0 : true;
                 const top = i < 3;
                 return (
@@ -480,6 +473,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
   const [losers, setLosers] = useState([]);
   const [earnings, setEarnings] = useState([]);
   const [moverSource, setMoverSource] = useState("");
+  const [forceAllHydrate, setForceAllHydrate] = useState(false); // 🔍 diagnostics
 
   const pick = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
@@ -499,12 +493,13 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      // Hydrate rows where change/% are missing or placeholder-zero (uses extended quotes if present)
-      const [g, l] = await Promise.all([hydrateMissing(g0), hydrateMissing(l0)]);
+      // Hydrate (optionally force all rows to use quotes)
+      const [g, l] = await Promise.all([
+        hydrateRows(g0, { forceAll: forceAllHydrate }),
+        hydrateRows(l0, { forceAll: forceAllHydrate }),
+      ]);
 
-      // Keep rows that now have price + (change or pct)
       const keep = (r) => isNum(r.price) && (isNum(r.change) || isNum(r.change_pct));
-
       setGainers(g.filter(keep));
       setLosers(l.filter(keep));
 
@@ -512,7 +507,9 @@ export default function HotAndEarnings({ onSelectTicker }) {
         g0.some((r, i) => (nearZero(r.change) && isNum(g[i]?.change)) || (nearZero(r.change_pct) && isNum(g[i]?.change_pct))) ||
         l0.some((r, i) => (nearZero(r.change) && isNum(l[i]?.change)) || (nearZero(r.change_pct) && isNum(l[i]?.change_pct)));
 
-      setMoverSource(mv?.source ? (usedQuotes ? `${mv.source} + quotes` : mv.source) : (usedQuotes ? "quotes (extended)" : ""));
+      setMoverSource(mv?.source ? (usedQuotes ? `${mv.source} + quotes` : mv.source) : (usedQuotes ? "quotes (extended?)" : ""));
+      // Expose for DevTools
+      window.__lastMovers = { raw: mv, normalized: { g0, l0 }, hydrated: { g, l } };
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
@@ -538,12 +535,58 @@ export default function HotAndEarnings({ onSelectTicker }) {
     }
   };
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    // DevTools helpers
+    window.__dumpMovers = () => {
+      const M = window.__lastMovers;
+      if (!M) { console.warn("No movers loaded yet. Click Refresh first."); return; }
+      const { raw, normalized, hydrated } = M;
+      console.log("• RAW gainers sample:", (raw?.gainers || []).slice(0,10));
+      console.log("• RAW losers  sample:", (raw?.losers  || []).slice(0,10));
+      console.table((normalized.g0 || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
+      console.table((normalized.l0 || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
+      console.table((hydrated.g || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
+      console.table((hydrated.l || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
+    };
+    window.__debugQuotes = async (syms) => {
+      const list = Array.isArray(syms) ? syms : [String(syms||"").toUpperCase()];
+      for (const s of list) {
+        try {
+          const q = await fetchQuote(s);
+          const keys = Object.keys(q||{});
+          console.log(`QUOTE ${s}:`, q);
+          console.log(`keys[${s}]:`, keys.sort());
+          const picked = (q ? pickFromQuote(q) : {});
+          console.log(`picked[${s}]:`, picked);
+        } catch (e) {
+          console.warn("quote failed", s, e?.message);
+        }
+      }
+    };
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forceAllHydrate]);
 
   return (
     <div className="he-grid">
-      <div className="he-toolbar">
+      <div className="he-toolbar" style={{ gap: 8, alignItems: "center" }}>
         <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
+        <label title="Force quote hydration for ALL rows (diagnostics)">
+          <input
+            type="checkbox"
+            checked={forceAllHydrate}
+            onChange={(e) => setForceAllHydrate(e.target.checked)}
+            style={{ marginRight: 6 }}
+          />
+          Force quote hydrate (all)
+        </label>
+        <button
+          className="btn ghost"
+          onClick={() => (window.__dumpMovers ? window.__dumpMovers() : console.warn("Load movers first"))}
+          title="Log raw/normalized/hydrated movers to console"
+        >
+          🧪 Run diagnostics
+        </button>
       </div>
 
       <MoversCard
