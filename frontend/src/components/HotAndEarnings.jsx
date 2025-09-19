@@ -185,17 +185,15 @@ function pickLastTwoCloses(resp) {
   }
   if (!rows.length) return null;
 
-  // sort by time ascending, dedupe by date keeping the last for each day
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
   for (let i = 0; i < rows.length; i++) {
     if (!uniq.length || uniq[uniq.length - 1].d !== rows[i].d) uniq.push(rows[i]);
-    else uniq[uniq.length - 1] = rows[i]; // replace with later close of same day if duplicated
+    else uniq[uniq.length - 1] = rows[i];
   }
   if (uniq.length < 2) return null;
 
   const last = uniq[uniq.length - 1];
-  // find the prior *distinct* date
   let j = uniq.length - 2;
   while (j >= 0 && uniq[j].d === last.d) j--;
   if (j < 0) return null;
@@ -206,8 +204,7 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  // sanity guard: reject absurd % that usually indicate a bad feed or split mismatch
-  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
+  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null; // guard splits/bad feed
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
@@ -263,7 +260,6 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
             const closeResp = await fetchCloses(sym, 10);
             const eod = pickLastTwoCloses(closeResp);
             if (eod) {
-              // price = latest close, last_close = previous close
               out[i] = normalizeRow({
                 ...out[i],
                 price: isNum(out[i].price) ? out[i].price : eod.lastClose,
@@ -311,13 +307,17 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
 
   const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
 
+  // ✅ filter out zero-move rows so the bottom doesn't show 0.00s
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return normalized.filter(
       (x) =>
         isNum(x.price) &&
         toNum(x.price) >= lim &&
-        (isNum(x.change) || isNum(x.change_pct))
+        (
+          (isNum(x.change) && !nearZero(x.change)) ||
+          (isNum(x.change_pct) && !nearZero(x.change_pct))
+        )
     );
   }, [normalized, minPrice]);
 
@@ -576,7 +576,14 @@ export default function HotAndEarnings({ onSelectTicker }) {
         hydrateRows(l0, { forceAll: forceAllHydrate }),
       ]);
 
-      const keep = (r) => isNum(r.price) && (isNum(r.change) || isNum(r.change_pct));
+      // ✅ keep only rows with a *real* (non-zero) move so no 0.00 zombies linger
+      const keep = (r) =>
+        isNum(r.price) &&
+        (
+          (isNum(r.change) && !nearZero(r.change)) ||
+          (isNum(r.change_pct) && !nearZero(r.change_pct))
+        );
+
       setGainers(gRes.rows.filter(keep));
       setLosers(lRes.rows.filter(keep));
 
