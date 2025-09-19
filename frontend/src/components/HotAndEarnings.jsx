@@ -3,12 +3,13 @@
 // - strict parsing to avoid string -> 0 coercion
 // - prefers after-hours / extended prices when present
 // - derives change/% from previousClose or open
-// - hydrates rows via fetchQuote (batched), with optional "force all"
+// - hydrates rows via fetchQuote (batched)
+// - **new**: fallback to day-over-day (last two daily closes) when quotes lack extended deltas
+// - losers sort ascending by default; gainers descending
 // - built-in diagnostics: window.__dumpMovers(), window.__debugQuotes([...])
-// - sticky headers, sort + min price filter
 
 import { useEffect, useMemo, useState } from "react";
-import { fetchMovers, fetchEarningsWeek, fetchQuote } from "../api";
+import { fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
 
 /* ---------- strict helpers & formatters ---------- */
 const EPS = 1e-6;
@@ -53,10 +54,10 @@ const SESSION_BADGE = (s) => {
 };
 
 /* ---------- normalizer + derivations ---------- */
-function firstNum(row, keys) {
+function firstNum(obj, keys) {
   for (const k of keys) {
-    if (k in (row || {})) {
-      const v = row[k];
+    if (obj && k in obj) {
+      const v = obj[k];
       if (isNum(v)) return toNum(v);
     }
   }
@@ -69,24 +70,24 @@ const signMismatch = (a, b) =>
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
-  // price (try extended if mover feed already has it)
+  // price (try extended if mover feed has it)
   const price = firstNum(row, [
-    "price", "last", "last_price", "current", "close", "Close",
-    "extended_price", "ext_price", "postmarket_price", "postMarketPrice",
-    "after_hours_price", "afterHoursPrice", "premarket_price", "preMarketPrice"
+    "price","last","last_price","current","close","Close",
+    "extended_price","ext_price","postmarket_price","postMarketPrice",
+    "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
 
-  let change = firstNum(row, ["change", "chg", "delta", "Change", "extended_change", "after_hours_change", "postmarket_change"]);
+  let change = firstNum(row, ["change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
   let change_pct = firstNum(row, [
-    "change_pct", "change_percent", "percent_change", "pct_change", "pct", "ChangePercent",
-    "changePct", "percentChange", "extended_change_pct", "after_hours_change_pct", "postmarket_change_pct"
+    "change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
+    "changePct","percentChange","extended_change_pct","after_hours_change_pct","postmarket_change_pct",
   ]);
 
   const prevClose = firstNum(row, [
-    "prev_close", "previous_close", "previousClose", "priorClose",
-    "last_close", "PrevClose", "PreviousClose", "close_prev", "yesterday_close",
+    "prev_close","previous_close","previousClose","priorClose",
+    "last_close","PrevClose","PreviousClose","close_prev","yesterday_close",
   ]);
-  const open = firstNum(row, ["open", "Open"]);
+  const open = firstNum(row, ["open","Open"]);
 
   // derive vs prevClose if possible
   if (isNum(price) && isNum(prevClose)) {
@@ -96,7 +97,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback: from open
+  // fallback vs open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
@@ -104,13 +105,13 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
 
-  // only pct? -> compute $
+  // only pct? -> $ from price or prevClose
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // only $? -> compute %
+  // only $? -> % from price or prevClose
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change_pct = (toNum(change) / toNum(base)) * 100;
@@ -131,27 +132,26 @@ function normalizeRow(row) {
 
 /* ---------- pick extended fields from a quote, with fallbacks ---------- */
 function pickFromQuote(q) {
-  const lastClose = toNum(firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]));
+  const lastClose = toNum(firstNum(q, [
+    "last_close","previous_close","previousClose","prev_close","regularMarketPreviousClose"
+  ]));
 
-  // Prefer extended price if present
   const extPrice = firstNum(q, [
-    "extended_price", "ext_price",
-    "postmarket_price", "postMarketPrice", "after_hours_price", "afterHoursPrice",
-    "premarket_price", "preMarketPrice"
+    "extended_price","ext_price","postmarket_price","postMarketPrice",
+    "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
   const curPrice = toNum(firstNum(q, [
-    "current_price", "price", "last", "last_price",
-    "regularMarketPrice"
+    "current_price","price","last","last_price","regularMarketPrice"
   ]));
-  let price = isNum(extPrice) ? extPrice : curPrice;
+  const price = isNum(extPrice) ? extPrice : curPrice;
 
   let change = firstNum(q, [
-    "extended_change", "ext_change", "postmarket_change", "after_hours_change", "premarket_change",
-    "change", "regularMarketChange"
+    "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
+    "change","regularMarketChange",
   ]);
   let change_pct = firstNum(q, [
-    "extended_change_pct", "ext_change_pct", "postmarket_change_pct", "after_hours_change_pct", "premarket_change_pct",
-    "change_pct", "percent_change", "regularMarketChangePercent"
+    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
+    "change_pct","percent_change","regularMarketChangePercent",
   ]);
 
   // Derive from price vs lastClose if needed
@@ -172,10 +172,10 @@ function pickFromQuote(q) {
   });
 }
 
-/* ---------- quote hydration for missing/zero change ---------- */
+/* ---------- quote + **daily close** hydration for missing/zero change ---------- */
 const HYDRATE_BATCH = 6;
 
-/** When forceAll=true, hydrate every row (diagnostic mode) */
+/** Hydrates rows. If quote lacks extended deltas, falls back to last two daily closes. */
 async function hydrateRows(rows, { forceAll = false } = {}) {
   const out = rows.map((r) => ({ ...r })); // copy
   const need = out
@@ -189,27 +189,70 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
     }))
     .filter((x) => x.missing && x.sym);
 
+  let usedQuotes = 0;
+  let usedDaily = 0;
+
   for (let k = 0; k < need.length; k += HYDRATE_BATCH) {
     const slice = need.slice(k, k + HYDRATE_BATCH);
     await Promise.all(
       slice.map(async ({ i, sym }) => {
         try {
+          // 1) Try quote (extended if available)
           const q = await fetchQuote(sym);
           const picked = pickFromQuote(q || {});
-          out[i] = normalizeRow({
+          let merged = normalizeRow({
             ...out[i],
             price: isNum(out[i].price) ? out[i].price : picked.price,
-            change: picked.change,
-            change_pct: picked.change_pct,
+            change: isNum(out[i].change) && !nearZero(out[i].change) ? out[i].change : picked.change,
+            change_pct: isNum(out[i].change_pct) && !nearZero(out[i].change_pct) ? out[i].change_pct : picked.change_pct,
             last_close: firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]),
           });
+
+          const hasValid =
+            (isNum(merged.change) && !nearZero(merged.change)) ||
+            (isNum(merged.change_pct) && !nearZero(merged.change_pct));
+
+          if (hasValid) {
+            out[i] = merged;
+            usedQuotes++;
+            return;
+          }
+
+          // 2) Fallback to day-over-day from last two daily closes
+          try {
+            const closeResp = await fetchCloses(sym, 3);
+            const closes = Array.isArray(closeResp?.closes) ? closeResp.closes.map(toNum).filter(isNum) : [];
+            if (closes.length >= 2) {
+              const prev = closes[closes.length - 2];
+              const last = closes[closes.length - 1];
+              if (isNum(prev) && isNum(last) && !nearZero(prev)) {
+                const ch = toNum(last) - toNum(prev);
+                const pct = (ch / toNum(prev)) * 100;
+                out[i] = normalizeRow({
+                  ...out[i],
+                  price: isNum(out[i].price) ? out[i].price : last,
+                  change: ch,
+                  change_pct: pct,
+                  last_close: last,
+                });
+                usedDaily++;
+                return;
+              }
+            }
+          } catch {
+            /* ignore EOD fallback failure */
+          }
+
+          // nothing worked; keep merged (likely zeros)
+          out[i] = merged;
         } catch {
-          /* ignore */
+          /* ignore total failure */
         }
       })
     );
   }
-  return out;
+
+  return { rows: out, meta: { usedQuotes, usedDaily } };
 }
 
 /* ---------- shared UI shells ---------- */
@@ -226,10 +269,10 @@ function Card({ title, right, children }) {
 }
 
 /* ---------- Movers Table (with filter + sort) ---------- */
-function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
+function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kind = "gainers" }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
-  const [sortDir, setSortDir] = useState("desc");
+  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc"); // losers: most negative first
 
   const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
 
@@ -247,8 +290,8 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
     const arr = [...filtered];
     const key = sortKey;
     arr.sort((a, b) => {
-      const va = isNum(a?.[key]) ? toNum(a[key]) : -Infinity;
-      const vb = isNum(b?.[key]) ? toNum(b[key]) : -Infinity;
+      const va = isNum(a?.[key]) ? toNum(a[key]) : (sortDir === "desc" ? -Infinity : Infinity);
+      const vb = isNum(b?.[key]) ? toNum(b[key]) : (sortDir === "desc" ? -Infinity : Infinity);
       const cmp = vb - va;
       return sortDir === "desc" ? cmp : -cmp;
     });
@@ -258,7 +301,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom }) {
   const onHeaderClick = (key) => {
     if (sortKey !== key) {
       setSortKey(key);
-      setSortDir("desc");
+      // keep current dir
     } else {
       setSortDir((d) => (d === "desc" ? "asc" : "desc"));
     }
@@ -494,22 +537,30 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
       // Hydrate (optionally force all rows to use quotes)
-      const [g, l] = await Promise.all([
+      const [gRes, lRes] = await Promise.all([
         hydrateRows(g0, { forceAll: forceAllHydrate }),
         hydrateRows(l0, { forceAll: forceAllHydrate }),
       ]);
 
       const keep = (r) => isNum(r.price) && (isNum(r.change) || isNum(r.change_pct));
-      setGainers(g.filter(keep));
-      setLosers(l.filter(keep));
+      setGainers(gRes.rows.filter(keep));
+      setLosers(lRes.rows.filter(keep));
 
-      const usedQuotes =
-        g0.some((r, i) => (nearZero(r.change) && isNum(g[i]?.change)) || (nearZero(r.change_pct) && isNum(g[i]?.change_pct))) ||
-        l0.some((r, i) => (nearZero(r.change) && isNum(l[i]?.change)) || (nearZero(r.change_pct) && isNum(l[i]?.change_pct)));
+      // decorate "source" string to show what we used
+      const usedQuotes = (gRes.meta.usedQuotes + lRes.meta.usedQuotes) > 0;
+      const usedDaily = (gRes.meta.usedDaily + lRes.meta.usedDaily) > 0;
+      let src = mv?.source || "";
+      if (usedQuotes) src = src ? `${src} + quotes` : "quotes";
+      if (usedDaily) src = src ? `${src} + EOD` : "EOD";
+      setMoverSource(src);
 
-      setMoverSource(mv?.source ? (usedQuotes ? `${mv.source} + quotes` : mv.source) : (usedQuotes ? "quotes (extended?)" : ""));
-      // Expose for DevTools
-      window.__lastMovers = { raw: mv, normalized: { g0, l0 }, hydrated: { g, l } };
+      // expose for DevTools
+      window.__lastMovers = {
+        raw: mv,
+        normalized: { g0, l0 },
+        hydrated: { g: gRes.rows, l: lRes.rows },
+        meta: { g: gRes.meta, l: lRes.meta },
+      };
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
@@ -540,13 +591,14 @@ export default function HotAndEarnings({ onSelectTicker }) {
     window.__dumpMovers = () => {
       const M = window.__lastMovers;
       if (!M) { console.warn("No movers loaded yet. Click Refresh first."); return; }
-      const { raw, normalized, hydrated } = M;
+      const { raw, normalized, hydrated, meta } = M;
       console.log("• RAW gainers sample:", (raw?.gainers || []).slice(0,10));
       console.log("• RAW losers  sample:", (raw?.losers  || []).slice(0,10));
       console.table((normalized.g0 || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
       console.table((normalized.l0 || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
       console.table((hydrated.g || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
       console.table((hydrated.l || []).slice(0,10).map(r => ({sym:r.symbol, price:r.price, ch:r.change, pct:r.change_pct})));
+      console.log("hydrate meta:", meta);
     };
     window.__debugQuotes = async (syms) => {
       const list = Array.isArray(syms) ? syms : [String(syms||"").toUpperCase()];
@@ -596,6 +648,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         error={errMovers}
         onPick={pick}
         fetchedFrom={moverSource}
+        kind="gainers"
       />
       <MoversCard
         title="Top 25 Losers"
@@ -604,6 +657,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         error={errMovers}
         onPick={pick}
         fetchedFrom={moverSource}
+        kind="losers"
       />
       <EarningsCard
         items={earnings}
