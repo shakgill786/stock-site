@@ -185,6 +185,7 @@ function pickLastTwoCloses(resp) {
   }
   if (!rows.length) return null;
 
+  // sort by time asc; keep last for duplicate dates
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
   for (let i = 0; i < rows.length; i++) {
@@ -204,7 +205,8 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null; // guard splits/bad feed
+  // guard splits/bad feed
+  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
