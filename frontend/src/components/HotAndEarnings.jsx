@@ -4,7 +4,7 @@
 // - prefers after-hours / extended prices when present
 // - derives change/% from previousClose or open
 // - hydrates rows via fetchQuote (batched)
-// - **new**: fallback to day-over-day (last two daily closes) when quotes lack extended deltas
+// - **fixed**: robust EOD fallback (last two *distinct* closes by date) + sanity guards
 // - losers sort ascending by default; gainers descending
 // - built-in diagnostics: window.__dumpMovers(), window.__debugQuotes([...])
 
@@ -172,10 +172,50 @@ function pickFromQuote(q) {
   });
 }
 
+/* ---------- robust EOD fallback: two most-recent distinct closes ---------- */
+function pickLastTwoCloses(resp) {
+  const ds = Array.isArray(resp?.dates) ? resp.dates : [];
+  const cs = Array.isArray(resp?.closes) ? resp.closes : [];
+  const rows = [];
+  for (let i = 0; i < Math.min(ds.length, cs.length); i++) {
+    const d = String(ds[i]).slice(0, 10);
+    const t = Date.parse(d);
+    const c = toNum(cs[i]);
+    if (Number.isFinite(t) && isNum(c)) rows.push({ t, d, c });
+  }
+  if (!rows.length) return null;
+
+  // sort by time ascending, dedupe by date keeping the last for each day
+  rows.sort((a, b) => a.t - b.t);
+  const uniq = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (!uniq.length || uniq[uniq.length - 1].d !== rows[i].d) uniq.push(rows[i]);
+    else uniq[uniq.length - 1] = rows[i]; // replace with later close of same day if duplicated
+  }
+  if (uniq.length < 2) return null;
+
+  const last = uniq[uniq.length - 1];
+  // find the prior *distinct* date
+  let j = uniq.length - 2;
+  while (j >= 0 && uniq[j].d === last.d) j--;
+  if (j < 0) return null;
+  const prev = uniq[j];
+
+  if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
+
+  const ch = toNum(last.c) - toNum(prev.c);
+  const pct = (ch / toNum(prev.c)) * 100;
+
+  // sanity guard: reject absurd % that usually indicate a bad feed or split mismatch
+  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
+
+  return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
+}
+
 /* ---------- quote + **daily close** hydration for missing/zero change ---------- */
 const HYDRATE_BATCH = 6;
 
-/** Hydrates rows. If quote lacks extended deltas, falls back to last two daily closes. */
+/** Hydrates rows. If quote lacks extended deltas, falls back to last two daily closes (guarded). */
 async function hydrateRows(rows, { forceAll = false } = {}) {
   const out = rows.map((r) => ({ ...r })); // copy
   const need = out
@@ -218,26 +258,21 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
             return;
           }
 
-          // 2) Fallback to day-over-day from last two daily closes
+          // 2) Fallback to day-over-day from last two *distinct* daily closes
           try {
-            const closeResp = await fetchCloses(sym, 3);
-            const closes = Array.isArray(closeResp?.closes) ? closeResp.closes.map(toNum).filter(isNum) : [];
-            if (closes.length >= 2) {
-              const prev = closes[closes.length - 2];
-              const last = closes[closes.length - 1];
-              if (isNum(prev) && isNum(last) && !nearZero(prev)) {
-                const ch = toNum(last) - toNum(prev);
-                const pct = (ch / toNum(prev)) * 100;
-                out[i] = normalizeRow({
-                  ...out[i],
-                  price: isNum(out[i].price) ? out[i].price : last,
-                  change: ch,
-                  change_pct: pct,
-                  last_close: last,
-                });
-                usedDaily++;
-                return;
-              }
+            const closeResp = await fetchCloses(sym, 10);
+            const eod = pickLastTwoCloses(closeResp);
+            if (eod) {
+              // price = latest close, last_close = previous close
+              out[i] = normalizeRow({
+                ...out[i],
+                price: isNum(out[i].price) ? out[i].price : eod.lastClose,
+                last_close: eod.prevClose,
+                change: eod.change,
+                change_pct: eod.change_pct,
+              });
+              usedDaily++;
+              return;
             }
           } catch {
             /* ignore EOD fallback failure */
@@ -301,7 +336,6 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
   const onHeaderClick = (key) => {
     if (sortKey !== key) {
       setSortKey(key);
-      // keep current dir
     } else {
       setSortDir((d) => (d === "desc" ? "asc" : "desc"));
     }
@@ -536,7 +570,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      // Hydrate (optionally force all rows to use quotes)
+      // Hydrate (optionally force all rows to use quotes/EOD)
       const [gRes, lRes] = await Promise.all([
         hydrateRows(g0, { forceAll: forceAllHydrate }),
         hydrateRows(l0, { forceAll: forceAllHydrate }),
@@ -548,10 +582,10 @@ export default function HotAndEarnings({ onSelectTicker }) {
 
       // decorate "source" string to show what we used
       const usedQuotes = (gRes.meta.usedQuotes + lRes.meta.usedQuotes) > 0;
-      const usedDaily = (gRes.meta.usedDaily + lRes.meta.usedDaily) > 0;
+      const usedDaily  = (gRes.meta.usedDaily  + lRes.meta.usedDaily ) > 0;
       let src = mv?.source || "";
       if (usedQuotes) src = src ? `${src} + quotes` : "quotes";
-      if (usedDaily) src = src ? `${src} + EOD` : "EOD";
+      if (usedDaily)  src = src ? `${src} + EOD`    : "EOD";
       setMoverSource(src);
 
       // expose for DevTools
@@ -623,7 +657,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     <div className="he-grid">
       <div className="he-toolbar" style={{ gap: 8, alignItems: "center" }}>
         <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
-        <label title="Force quote hydration for ALL rows (diagnostics)">
+        <label title="Force quote hydrate for ALL rows (diagnostics)">
           <input
             type="checkbox"
             checked={forceAllHydrate}
