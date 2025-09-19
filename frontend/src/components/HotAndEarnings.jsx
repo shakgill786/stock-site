@@ -1,15 +1,10 @@
 // frontend/src/components/HotAndEarnings.jsx
-// Movers (Gainers/Losers) + Earnings Week
-// - strict parsing to avoid string -> 0 coercion
-// - prefers after-hours / extended prices when present
-// - derives change/% from previousClose or open
-// - hydrates rows via fetchQuote (batched)
-// - **fixed**: robust EOD fallback (last two *distinct* closes by date) + sanity guards
-// - losers sort ascending by default; gainers descending
-// - built-in diagnostics: window.__dumpMovers(), window.__debugQuotes([...])
+// Movers (Gainers/Losers) + Earnings Week + Top Buys
+// (unchanged comments omitted for brevity)
 
 import { useEffect, useMemo, useState } from "react";
 import { fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
+import TopBuysCard from "./TopBuysCard"; // ⬅️ NEW
 
 /* ---------- strict helpers & formatters ---------- */
 const EPS = 1e-6;
@@ -53,7 +48,7 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
-/* ---------- normalizer + derivations ---------- */
+/* ---------- normalizer + derivations (unchanged) ---------- */
 function firstNum(obj, keys) {
   for (const k of keys) {
     if (obj && k in obj) {
@@ -70,7 +65,6 @@ const signMismatch = (a, b) =>
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
-  // price (try extended if mover feed has it)
   const price = firstNum(row, [
     "price","last","last_price","current","close","Close",
     "extended_price","ext_price","postmarket_price","postMarketPrice",
@@ -89,7 +83,6 @@ function normalizeRow(row) {
   ]);
   const open = firstNum(row, ["open","Open"]);
 
-  // derive vs prevClose if possible
   if (isNum(price) && isNum(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
@@ -97,7 +90,6 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback vs open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
@@ -105,32 +97,28 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
   }
 
-  // only pct? -> $ from price or prevClose
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // only $? -> % from price or prevClose
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change_pct = (toNum(change) / toNum(base)) * 100;
   }
 
-  // consistency: if signs disagree, trust % and recompute $
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // squash -0.00
   if (isNum(change) && nearZero(change)) change = 0;
   if (isNum(change_pct) && nearZero(change_pct)) change_pct = 0;
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
 }
 
-/* ---------- pick extended fields from a quote, with fallbacks ---------- */
+/* ---------- pickFromQuote / EOD fallback / hydrateRows (unchanged) ---------- */
 function pickFromQuote(q) {
   const lastClose = toNum(firstNum(q, [
     "last_close","previous_close","previousClose","prev_close","regularMarketPreviousClose"
@@ -154,7 +142,6 @@ function pickFromQuote(q) {
     "change_pct","percent_change","regularMarketChangePercent",
   ]);
 
-  // Derive from price vs lastClose if needed
   if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
@@ -162,7 +149,6 @@ function pickFromQuote(q) {
     change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
-  // Final normalization
   return normalizeRow({
     symbol: q?.ticker || q?.symbol || "",
     price,
@@ -172,7 +158,6 @@ function pickFromQuote(q) {
   });
 }
 
-/* ---------- robust EOD fallback: two most-recent distinct closes ---------- */
 function pickLastTwoCloses(resp) {
   const ds = Array.isArray(resp?.dates) ? resp.dates : [];
   const cs = Array.isArray(resp?.closes) ? resp.closes : [];
@@ -185,7 +170,6 @@ function pickLastTwoCloses(resp) {
   }
   if (!rows.length) return null;
 
-  // sort by time asc; keep last for duplicate dates
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
   for (let i = 0; i < rows.length; i++) {
@@ -205,18 +189,15 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  // guard splits/bad feed
   if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
 
-/* ---------- quote + **daily close** hydration for missing/zero change ---------- */
 const HYDRATE_BATCH = 6;
 
-/** Hydrates rows. If quote lacks extended deltas, falls back to last two daily closes (guarded). */
 async function hydrateRows(rows, { forceAll = false } = {}) {
-  const out = rows.map((r) => ({ ...r })); // copy
+  const out = rows.map((r) => ({ ...r }));
   const need = out
     .map((r, i) => ({
       i,
@@ -236,7 +217,6 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
     await Promise.all(
       slice.map(async ({ i, sym }) => {
         try {
-          // 1) Try quote (extended if available)
           const q = await fetchQuote(sym);
           const picked = pickFromQuote(q || {});
           let merged = normalizeRow({
@@ -257,7 +237,6 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
             return;
           }
 
-          // 2) Fallback to day-over-day from last two *distinct* daily closes
           try {
             const closeResp = await fetchCloses(sym, 10);
             const eod = pickLastTwoCloses(closeResp);
@@ -272,15 +251,10 @@ async function hydrateRows(rows, { forceAll = false } = {}) {
               usedDaily++;
               return;
             }
-          } catch {
-            /* ignore EOD fallback failure */
-          }
+          } catch {}
 
-          // nothing worked; keep merged (likely zeros)
           out[i] = merged;
-        } catch {
-          /* ignore total failure */
-        }
+        } catch {}
       })
     );
   }
@@ -301,15 +275,14 @@ function Card({ title, right, children }) {
   );
 }
 
-/* ---------- Movers Table (with filter + sort) ---------- */
+/* ---------- Movers table (unchanged except where noted) ---------- */
 function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kind = "gainers" }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
-  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc"); // losers: most negative first
+  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc");
 
   const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
 
-  // ✅ filter out zero-move rows so the bottom doesn't show 0.00s
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return normalized.filter(
@@ -429,7 +402,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
   );
 }
 
-/* ---------- Earnings (grouped by date, sticky headers) ---------- */
+/* ---------- Earnings (unchanged) ---------- */
 function EarningsCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
@@ -552,7 +525,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
   const [losers, setLosers] = useState([]);
   const [earnings, setEarnings] = useState([]);
   const [moverSource, setMoverSource] = useState("");
-  const [forceAllHydrate, setForceAllHydrate] = useState(false); // 🔍 diagnostics
+  const [forceAllHydrate, setForceAllHydrate] = useState(false);
 
   const pick = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
@@ -562,34 +535,27 @@ export default function HotAndEarnings({ onSelectTicker }) {
   };
 
   const refresh = async () => {
-    // Movers
     setLoadingMovers(true);
     setErrMovers("");
     try {
       const mv = await fetchMovers();
 
-      // Normalize first
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      // Hydrate (optionally force all rows to use quotes/EOD)
       const [gRes, lRes] = await Promise.all([
         hydrateRows(g0, { forceAll: forceAllHydrate }),
         hydrateRows(l0, { forceAll: forceAllHydrate }),
       ]);
 
-      // ✅ keep only rows with a *real* (non-zero) move so no 0.00 zombies linger
       const keep = (r) =>
         isNum(r.price) &&
-        (
-          (isNum(r.change) && !nearZero(r.change)) ||
-          (isNum(r.change_pct) && !nearZero(r.change_pct))
-        );
+        ((isNum(r.change) && !nearZero(r.change)) ||
+         (isNum(r.change_pct) && !nearZero(r.change_pct)));
 
       setGainers(gRes.rows.filter(keep));
       setLosers(lRes.rows.filter(keep));
 
-      // decorate "source" string to show what we used
       const usedQuotes = (gRes.meta.usedQuotes + lRes.meta.usedQuotes) > 0;
       const usedDaily  = (gRes.meta.usedDaily  + lRes.meta.usedDaily ) > 0;
       let src = mv?.source || "";
@@ -597,7 +563,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
       if (usedDaily)  src = src ? `${src} + EOD`    : "EOD";
       setMoverSource(src);
 
-      // expose for DevTools
       window.__lastMovers = {
         raw: mv,
         normalized: { g0, l0 },
@@ -613,7 +578,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setLoadingMovers(false);
     }
 
-    // Earnings
     setLoadingEarnings(true);
     setErrEarnings("");
     try {
@@ -630,7 +594,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
   };
 
   useEffect(() => {
-    // DevTools helpers
     window.__dumpMovers = () => {
       const M = window.__lastMovers;
       if (!M) { console.warn("No movers loaded yet. Click Refresh first."); return; }
@@ -661,6 +624,16 @@ export default function HotAndEarnings({ onSelectTicker }) {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceAllHydrate]);
+
+  // Build candidates for TopBuys from current movers; add a small fallback set if needed
+  const topBuyCandidates = useMemo(() => {
+    const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
+    const uniq = Array.from(new Set(fromMovers));
+    if (uniq.length >= 40) return uniq;
+    return Array.from(new Set(uniq.concat([
+      "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","JPM","V","MA","LLY","UNH","HD","PEP","KO"
+    ])));
+  }, [gainers, losers]);
 
   return (
     <div className="he-grid">
@@ -702,6 +675,15 @@ export default function HotAndEarnings({ onSelectTicker }) {
         fetchedFrom={moverSource}
         kind="losers"
       />
+
+      {/* NEW: Top Buys card */}
+      <TopBuysCard
+        title="Top 25 Buys (model)"
+        candidates={topBuyCandidates}
+        onPick={pick}
+        max={25}
+      />
+
       <EarningsCard
         items={earnings}
         loading={loadingEarnings}
@@ -709,13 +691,12 @@ export default function HotAndEarnings({ onSelectTicker }) {
         onPick={pick}
       />
 
-      {/* component-scoped styles */}
       <style>{`
         .he-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; margin-top: 8px; }
         .he-toolbar { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
         @media (min-width: 980px) {
           .he-grid { grid-template-columns: 1fr 1fr; }
-          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; }
+          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; } /* last card full-width */
         }
         .he-card {
           padding: 12px; overflow: hidden; border-radius: 14px;
@@ -723,9 +704,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
           border: 1px solid rgba(255,255,255,0.07); box-shadow: 0 6px 18px rgba(0,0,0,0.25);
         }
         .he-card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
-        .he-card-head h3 { margin: 0; }
-        .he-head-right { display: flex; gap: 10px; align-items: center; }
-        .he-controls { display: flex; gap: 8px; align-items: center; }
+        .he-head-right, .he-controls { display: flex; gap: 8px; align-items: center; }
         .he-source { font-size: 12px; color: #a8b2ff; }
         .he-scroll { max-height: 420px; overflow: auto; border-radius: 12px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); }
         .he-table { width: 100%; table-layout: fixed; font-size: 13px; border-collapse: separate; border-spacing: 0; }

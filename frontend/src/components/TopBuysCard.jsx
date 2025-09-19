@@ -1,192 +1,214 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchMovers, fetchPredict, fetchQuote } from "../api";
+// frontend/src/components/TopBuysCard.jsx
+import { useEffect, useMemo, useState } from "react";
+import { fetchQuote, fetchCloses } from "../api";
 
-const DEFAULT_MODELS = ["LSTM", "ARIMA"]; // falls back if you don't pass modelsHint
-
-// ---- utils (same spirit as App.jsx) ----
-const toNum = (v) => (typeof v === "number" ? v : Number(v));
+/* local helpers (kept minimal so this file is standalone) */
+const EPS = 1e-6;
+const toNum = (v) => (typeof v === "number" ? v : (typeof v === "string" ? Number(v.replace(/[%,$]/g, "").trim()) : NaN));
 const isNum = (v) => Number.isFinite(toNum(v));
+const nearZero = (v) => Math.abs(toNum(v)) < EPS;
+const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
+const fmtScore = (v) => (isNum(v) ? `${toNum(v).toFixed(1)}` : "—");
 
-const normModel = (s) => String(s || "").trim().toUpperCase();
+const firstNum = (obj, keys) => {
+  for (const k of keys) if (obj && k in obj && isNum(obj[k])) return toNum(obj[k]);
+  return undefined;
+};
 
-function computeMetrics({ quote, result }) {
-  // base = last_close (same as App.jsx logic)
-  const base = Number(quote?.last_close) || 0;
-  if (!base || !result?.predictions?.length) return null;
+function pickFromQuote(q) {
+  const lastClose = toNum(firstNum(q, [
+    "last_close","previous_close","previousClose","prev_close","regularMarketPreviousClose"
+  ]));
 
-  const preds = result.predictions.map(Number).filter(Number.isFinite);
-  if (!preds.length) return null;
+  const extPrice = firstNum(q, [
+    "extended_price","ext_price","postmarket_price","postMarketPrice",
+    "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
+  ]);
+  const curPrice = toNum(firstNum(q, [
+    "current_price","price","last","last_price","regularMarketPrice"
+  ]));
+  const price = isNum(extPrice) ? extPrice : curPrice;
 
-  const meanPred = preds.reduce((a, b) => a + b, 0) / preds.length;
-  const avgChangePct = ((meanPred - base) / base) * 100;
+  let change_pct = firstNum(q, [
+    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
+    "change_pct","percent_change","regularMarketChangePercent",
+  ]);
 
-  const mapeProxy =
-    preds.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) / preds.length;
+  // derive % from price vs lastClose if needed
+  if ((!isNum(change_pct) || nearZero(change_pct)) && isNum(price) && isNum(lastClose) && !nearZero(lastClose)) {
+    change_pct = ((toNum(price) - toNum(lastClose)) / toNum(lastClose)) * 100;
+  }
 
-  return { model: result.model, mapeProxy, avgChangePct };
+  return { price, lastClose, change_pct };
 }
 
-function decideAction(avgChangePct) {
-  if (!Number.isFinite(avgChangePct)) return "Hold";
-  if (avgChangePct > 1) return "Buy";
-  if (avgChangePct < -1) return "Sell";
-  return "Hold";
+function pickLastTwoCloses(resp) {
+  const ds = Array.isArray(resp?.dates) ? resp.dates : [];
+  const cs = Array.isArray(resp?.closes) ? resp.closes : [];
+  const rows = [];
+  for (let i = 0; i < Math.min(ds.length, cs.length); i++) {
+    const d = String(ds[i]).slice(0, 10);
+    const t = Date.parse(d);
+    const c = toNum(cs[i]);
+    if (Number.isFinite(t) && isNum(c)) rows.push({ t, d, c });
+  }
+  if (!rows.length) return null;
+
+  rows.sort((a, b) => a.t - b.t);
+  const uniq = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (!uniq.length || uniq[uniq.length - 1].d !== rows[i].d) uniq.push(rows[i]);
+    else uniq[uniq.length - 1] = rows[i];
+  }
+  if (uniq.length < 2) return null;
+
+  const last = uniq[uniq.length - 1];
+  const prev = uniq[uniq.length - 2];
+  if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
+
+  const pct = ((toNum(last.c) - toNum(prev.c)) / toNum(prev.c)) * 100;
+  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
+
+  return { prevClose: prev.c, lastClose: last.c, change_pct: pct, rows: uniq };
 }
 
-// tiny concurrency limiter
-async function mapLimit(items, limit, worker) {
-  const ret = [];
-  let i = 0;
-  let running = 0;
-  let resolveAll;
-  const done = new Promise((res) => (resolveAll = res));
-
-  const launch = () => {
-    while (running < limit && i < items.length) {
-      const idx = i++;
-      running++;
-      Promise.resolve(worker(items[idx], idx))
-        .then((val) => (ret[idx] = val))
-        .catch(() => (ret[idx] = null))
-        .finally(() => {
-          running--;
-          if (ret.length === items.length && running === 0) resolveAll();
-          else launch();
-        });
-    }
-  };
-  launch();
-  await done;
-  return ret;
+function trendPctFromCloses(resp, daysBack = 5) {
+  const picked = pickLastTwoCloses(resp);
+  const rows = picked?.rows || [];
+  if (rows.length < daysBack + 1) return NaN;
+  const last = rows[rows.length - 1].c;
+  const base = rows[rows.length - 1 - daysBack].c;
+  if (!isNum(last) || !isNum(base) || nearZero(base)) return NaN;
+  const pct = ((toNum(last) - toNum(base)) / toNum(base)) * 100;
+  if (!Number.isFinite(pct) || Math.abs(pct) > 50) return NaN;
+  return pct;
 }
 
-export default function TopBuysCard({
-  onPick,
-  modelsHint = DEFAULT_MODELS,
-  // optional: supply your own candidates (e.g., from watchlist); otherwise we use movers
-  candidateSymbols,
-  title = "Top 25 Buys (program rating)",
-  maxCandidates = 60, // scan up to this many symbols
-  concurrency = 5,     // parallel calls to keep it snappy but not abusive
-}) {
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState("");
-  const [rows, setRows] = useState([]);
-  const isAlive = useRef(true);
-
-  useEffect(() => {
-    isAlive.current = true;
-    (async () => {
-      setLoading(true);
-      setErr("");
-      try {
-        // 1) candidate symbols
-        let syms = Array.isArray(candidateSymbols) && candidateSymbols.length
-          ? candidateSymbols
-          : undefined;
-
-        if (!syms) {
-          const mv = await fetchMovers();
-          const g = (mv?.gainers || []).map((r) => String(r.symbol || r.ticker || "").toUpperCase());
-          const l = (mv?.losers  || []).map((r) => String(r.symbol || r.ticker || "").toUpperCase());
-          syms = [...new Set([...g, ...l])];
-        }
-        syms = syms
-          .map((s) => String(s || "").toUpperCase())
-          .filter(Boolean)
-          .slice(0, maxCandidates);
-
-        // 2) evaluate each symbol (quote + predict)
-        const models = (modelsHint || DEFAULT_MODELS).map(normModel);
-
-        const evaluated = await mapLimit(syms, concurrency, async (sym) => {
-          try {
-            const [q, res] = await Promise.all([
-              fetchQuote(sym),
-              fetchPredict({ ticker: sym, models }),
-            ]);
-
-            const results = Array.isArray(res?.results) ? res.results : [];
-            if (!results.length) return null;
-
-            // compute per-model metrics
-            const metricsByModel = results
-              .map((r) => computeMetrics({ quote: q, result: r }))
-              .filter(Boolean);
-
-            if (!metricsByModel.length) return null;
-
-            // pick best by lowest mapeProxy
-            metricsByModel.sort((a, b) => a.mapeProxy - b.mapeProxy);
-            const best = metricsByModel[0];
-            const action = decideAction(best.avgChangePct);
-
-            return {
-              symbol: sym,
-              price: Number(q?.last_close) || Number(q?.current_price) || null,
-              ...best,
-              action,
-            };
-          } catch {
-            return null;
-          }
-        });
-
-        // 3) keep only Buys, sort by upside desc, top 25
-        const buys = (evaluated || [])
-          .filter(Boolean)
-          .filter((x) => x.action === "Buy" && Number.isFinite(x.avgChangePct))
-          .sort((a, b) => b.avgChangePct - a.avgChangePct)
-          .slice(0, 25);
-
-        if (isAlive.current) setRows(buys);
-      } catch (e) {
-        if (isAlive.current) setErr(e?.message || "Failed to build Top Buys.");
-      } finally {
-        if (isAlive.current) setLoading(false);
-      }
-    })();
-
-    return () => {
-      isAlive.current = false;
-    };
-  }, [candidateSymbols, modelsHint, maxCandidates, concurrency]);
-
+/* simple card shell that matches the existing style */
+function Card({ title, right, children }) {
   return (
     <div className="he-card">
       <div className="he-card-head">
         <h3>{title}</h3>
-        <div className="he-head-right">
-          {loading ? <span className="muted">Scanning…</span> : null}
-        </div>
+        <div className="he-head-right">{right}</div>
       </div>
+      {children}
+    </div>
+  );
+}
 
-      {err ? (
-        <div className="muted error">{err}</div>
-      ) : !rows.length ? (
-        <div className="muted">{loading ? "Loading…" : "No current Buy signals."}</div>
+const BATCH = 6;
+
+export default function TopBuysCard({ title = "Top 25 Buys (model)", candidates = [], onPick, max = 25 }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [minPrice, setMinPrice] = useState(1);
+
+  const symbols = useMemo(
+    () => Array.from(new Set((Array.isArray(candidates) ? candidates : []).map((s) => String(s || "").toUpperCase()))).slice(0, 80),
+    [candidates]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      const out = [];
+
+      for (let i = 0; i < symbols.length; i += BATCH) {
+        const slice = symbols.slice(i, i + BATCH);
+        await Promise.all(
+          slice.map(async (sym) => {
+            try {
+              const [q, closes] = await Promise.all([
+                fetchQuote(sym).catch(() => null),
+                fetchCloses(sym, 20).catch(() => null),
+              ]);
+              const picked = q ? pickFromQuote(q) : {};
+              const eod = closes ? pickLastTwoCloses(closes) : null;
+              const trend5 = closes ? trendPctFromCloses(closes, 5) : NaN;
+
+              const parts = [];
+              if (isNum(picked.change_pct)) parts.push({ w: 0.5, v: Math.max(0, toNum(picked.change_pct)) });
+              if (eod && isNum(eod.change_pct)) parts.push({ w: 0.3, v: Math.max(0, toNum(eod.change_pct)) });
+              if (isNum(trend5)) parts.push({ w: 0.2, v: Math.max(0, toNum(trend5)) });
+
+              const wsum = parts.reduce((a, p) => a + p.w, 0);
+              if (wsum <= 0) return;
+
+              let score = parts.reduce((a, p) => a + p.v * (p.w / wsum), 0);
+              score = Math.max(0, Math.min(100, score));
+
+              const rating = score >= 75 ? "Strong Buy" : score >= 60 ? "Buy" : "Watch";
+
+              out.push({
+                symbol: sym,
+                price: picked.price ?? eod?.lastClose ?? NaN,
+                score,
+                rating,
+              });
+            } catch {}
+          })
+        );
+      }
+
+      out.sort((a, b) => b.score - a.score);
+      if (!cancelled) {
+        setRows(out.slice(0, max));
+        setLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [symbols, max]);
+
+  const filtered = useMemo(() => {
+    const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
+    return rows.filter((r) => isNum(r.price) && toNum(r.price) >= lim);
+  }, [rows, minPrice]);
+
+  return (
+    <Card
+      title={title}
+      right={
+        <div className="he-controls">
+          <span className="he-source">source: model (quotes + EOD)</span>
+          <select
+            value={String(minPrice)}
+            onChange={(e) => setMinPrice(Number(e.target.value))}
+            className="btn ghost"
+            title="Filter by minimum price"
+          >
+            <option value="0">All prices</option>
+            <option value="1">≥ $1</option>
+            <option value="5">≥ $5</option>
+          </select>
+          {loading ? <span className="muted">Loading…</span> : null}
+        </div>
+      }
+    >
+      {!filtered.length ? (
+        <div className="muted">{loading ? "Loading…" : "No candidates."}</div>
       ) : (
         <div className="he-scroll">
           <table className="he-table">
             <colgroup>
               <col style={{ width: "10%" }} />
-              <col style={{ width: "25%" }} />
-              <col style={{ width: "20%" }} />
-              <col style={{ width: "20%" }} />
-              <col style={{ width: "25%" }} />
+              <col style={{ width: "30%" }} />
+              <col style={{ width: "30%" }} />
+              <col style={{ width: "30%" }} />
             </colgroup>
             <thead>
               <tr>
                 <th className="num">#</th>
                 <th>Symbol</th>
-                <th className="num">% Upside (avg)</th>
-                <th className="num">Best Model</th>
-                <th className="num">mapeProxy ↓</th>
+                <th className="num">Price</th>
+                <th className="num">Score</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => (
-                <tr key={r.symbol}>
+              {filtered.map((r, i) => (
+                <tr key={`${r.symbol}-${i}`}>
                   <td className="num">{i + 1}</td>
                   <td>
                     <button
@@ -198,39 +220,17 @@ export default function TopBuysCard({
                       }}
                       title={`Load ${r.symbol}`}
                     >
-                      {r.symbol}
+                      {r.symbol} {r.rating !== "Watch" ? <span className="he-badge" style={{ marginLeft: 6 }}>{r.rating}</span> : null}
                     </button>
                   </td>
-                  <td className="num" style={{ color: r.avgChangePct >= 0 ? "#2e7d32" : "#c62828", fontWeight: 600 }}>
-                    {r.avgChangePct.toFixed(2)}%
-                  </td>
-                  <td className="num">{r.model}</td>
-                  <td className="num">{r.mapeProxy.toFixed(4)}</td>
+                  <td className="num">{fmtMoney(r.price)}</td>
+                  <td className="num">{fmtScore(r.score)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-
-      <style>{`
-        .he-card {
-          padding: 12px; overflow: hidden; border-radius: 14px;
-          background: radial-gradient(120% 120% at 100% 0%, rgba(160,170,255,0.06), rgba(25,28,45,0.6) 55%, rgba(17,20,35,0.8));
-          border: 1px solid rgba(255,255,255,0.07); box-shadow: 0 6px 18px rgba(0,0,0,0.25);
-        }
-        .he-card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
-        .he-head-right { display: flex; gap: 10px; align-items: center; }
-        .he-scroll { max-height: 420px; overflow: auto; border-radius: 12px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); }
-        .he-table { width: 100%; table-layout: fixed; font-size: 13px; border-collapse: separate; border-spacing: 0; }
-        .he-table thead th { position: sticky; top: 0; background: rgba(12,14,24,0.85); backdrop-filter: blur(2px); z-index: 2; padding: 8px 10px; }
-        .he-table tbody tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
-        .he-table td, .he-table th { vertical-align: middle; padding: 8px 10px; }
-        .num { text-align: right; font-variant-numeric: tabular-nums; }
-        .ticker-link{ background: transparent; border: none; padding: 0; margin: 0; cursor: pointer; color: #a2c4ff; text-decoration: underline; text-underline-offset: 2px; font: inherit; font-weight: 700; letter-spacing: .2px; }
-        .ticker-link:hover{ color: #d6e3ff; text-shadow: 0 0 6px rgba(110,168,255,.45); text-decoration-thickness: 2px; }
-        .muted { color: #a7adbc; } .muted.error { color: #ff6b6b; }
-      `}</style>
-    </div>
+    </Card>
   );
 }
