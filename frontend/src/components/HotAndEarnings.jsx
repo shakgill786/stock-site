@@ -616,7 +616,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
 
   return (
     <div className="he-grid">
-      <div className="he-toolbar" style={{ display: "flex", justifyContent: "flex-end" }}>
+      <div className="he-toolbar">
         <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
       </div>
 
@@ -656,6 +656,16 @@ export default function HotAndEarnings({ onSelectTicker }) {
       {/* component-scoped styles */}
       <style>{`
         .he-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; margin-top: 8px; }
+
+        .he-toolbar { 
+          grid-column: 1 / -1; 
+          display: flex; 
+          justify-content: flex-end; 
+          align-items: center;     /* 🔧 fixes jumbo Refresh */
+          gap: 8px;
+        }
+        .he-toolbar .btn { align-self: center; } /* guard against any global stretch rules */
+
         @media (min-width: 980px) {
           .he-grid { grid-template-columns: 1fr 1fr; }
           .he-grid > :nth-last-child(1) { grid-column: 1 / -1; } /* last card full-width */
