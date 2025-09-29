@@ -1,3 +1,4 @@
+# app/auth/router.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -11,10 +12,11 @@ from app.auth.utils import (
     get_current_user,
 )
 
-# Namespace all endpoints under /auth
-router = APIRouter(prefix="/auth", tags=["Auth"])
+# ⚠️ No prefix here; we’ll add it in main.py
+router = APIRouter(tags=["Auth"])
 
-@router.post("/register", response_model=schemas.TokenOut, status_code=status.HTTP_201_CREATED, summary="Create account")
+@router.post("/register", response_model=schemas.TokenOut,
+             status_code=status.HTTP_201_CREATED, summary="Create account")
 def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     email = payload.email.lower()
     exists = db.query(User).filter(User.email == email).first()
@@ -23,7 +25,7 @@ def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     user = User(email=email, password_hash=hash_password(payload.password))
     db.add(user)
     db.commit()
-    db.refresh(user)  # ensure we have ID populated
+    db.refresh(user)
     token = create_access_token(sub=user.email)
     return {"access_token": token, "token_type": "bearer"}
 
@@ -32,10 +34,8 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
     email = payload.email.lower()
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid email or password")
     token = create_access_token(sub=user.email)
     return {"access_token": token, "token_type": "bearer"}
 

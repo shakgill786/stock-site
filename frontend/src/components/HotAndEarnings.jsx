@@ -567,8 +567,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setGainers(gHydrated.filter(keep));
       setLosers(lHydrated.filter(keep));
 
-      // decorate "source" string to show what we used
-      // (we no longer track counts; just show base source)
+      // source string (base feed only)
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
@@ -600,7 +599,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Build candidates for TopBuys from current movers; pad with a small, stable list if needed
+  // Candidates for TopBuys from current movers; pad with a small stable list if needed
   const topBuyCandidates = useMemo(() => {
     const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
     const uniq = Array.from(new Set(fromMovers));
@@ -617,7 +616,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
   return (
     <div className="he-grid">
       <div className="he-toolbar">
-        <button className="btn ghost" onClick={refresh} title="Refresh sections">↻ Refresh</button>
+        <button className="btn ghost he-refresh" onClick={refresh} title="Refresh sections">↻ Refresh</button>
       </div>
 
       <MoversCard
@@ -656,20 +655,21 @@ export default function HotAndEarnings({ onSelectTicker }) {
       {/* component-scoped styles */}
       <style>{`
         .he-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; margin-top: 8px; }
-
-        .he-toolbar { 
-          grid-column: 1 / -1; 
-          display: flex; 
-          justify-content: flex-end; 
-          align-items: center;     /* 🔧 fixes jumbo Refresh */
-          gap: 8px;
-        }
-        .he-toolbar .btn { align-self: center; } /* guard against any global stretch rules */
-
         @media (min-width: 980px) {
           .he-grid { grid-template-columns: 1fr 1fr; }
           .he-grid > :nth-last-child(1) { grid-column: 1 / -1; } /* last card full-width */
         }
+
+        .he-toolbar {
+          grid-column: 1 / -1;
+          display: flex;
+          justify-content: flex-end;
+          align-items: center;
+        }
+        /* keep the toolbar button compact even if global .btn sets width:100% */
+        .he-toolbar .btn { width: auto !important; min-width: unset; display: inline-flex; align-items: center; }
+        .he-refresh { padding: 6px 10px; font-size: 12px; }
+
         .he-card {
           padding: 12px; overflow: hidden; border-radius: 14px;
           background: radial-gradient(120% 120% at 100% 0%, rgba(160,170,255,0.06), rgba(25,28,45,0.6) 55%, rgba(17,20,35,0.8));

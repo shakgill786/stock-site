@@ -1,3 +1,4 @@
+# app/routes.py
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
@@ -58,15 +59,15 @@ def _filter_equity_calendar(dates: List[str], closes: List[float]) -> Tuple[List
 
     return out_d, out_c
 
-def _pin_last_close(symbol: str, dates: List[str], closes: List[float]) -> None:
-    """For equities, replace the last close with quote.last_close for consistency."""
+async def _pin_last_close_async(symbol: str, dates: List[str], closes: List[float]) -> None:
+    """For equities, replace the last close with quote.last_close for consistency (non-blocking)."""
     if not dates or not closes or _is_crypto(symbol):
         return
     try:
-        q = get_quote(symbol)
-        last_close = float(q.get("last_close"))
-        if isinstance(last_close, float):
-            closes[-1] = last_close
+        q = await asyncio.to_thread(get_quote, symbol)
+        last_close = q.get("last_close")
+        if last_close is not None:
+            closes[-1] = float(last_close)
     except Exception:
         pass
 
@@ -157,7 +158,7 @@ async def diag(ticker: str = "AAPL"):
     t0 = _time.time()
     q_err = None
     try:
-        q = get_quote(ticker)
+        q = await asyncio.to_thread(get_quote, ticker)
     except Exception as e:
         q, q_err = {}, str(e)
     t1 = _time.time()
@@ -165,7 +166,7 @@ async def diag(ticker: str = "AAPL"):
     prov_dates = prov_closes = []
     prov_err = None
     try:
-        s = get_daily_closes_with_dates(ticker, 7)
+        s = await asyncio.to_thread(get_daily_closes_with_dates, ticker, 7)
         prov_dates = list(s.get("dates") or [])
         prov_closes = list(s.get("closes") or [])
     except Exception as e:
@@ -218,11 +219,11 @@ async def predict(req: PredictRequest):
     # Base price with safe fallback
     base: Optional[float] = None
     try:
-        q = get_quote(symbol)
+        q = await asyncio.to_thread(get_quote, symbol)
         base = float(q.get("current_price"))
     except Exception:
         try:
-            closes = get_daily_closes(symbol, 5)
+            closes = await asyncio.to_thread(get_daily_closes, symbol, 5)
             if closes:
                 base = float(closes[-1])
         except Exception:
@@ -290,7 +291,7 @@ async def predict_history(
     if n < 2:
         return {"ticker": symbol, "models": models, "rows": []}
 
-    _pin_last_close(symbol, dates, closes)
+    await _pin_last_close_async(symbol, dates, closes)
 
     indices = list(range(1, n))
     targets = indices[-days:]
@@ -331,15 +332,15 @@ async def predict_history(
 # ----------------------- Quote / Earnings / Market -----------------------
 @router.get("/quote", summary="Quote Endpoint")
 async def quote_endpoint(ticker: str):
-    return get_quote(ticker)
+    return await asyncio.to_thread(get_quote, ticker)
 
 @router.get("/earnings", summary="Earnings Endpoint")
 async def earnings_endpoint(ticker: str):
-    return get_earnings(ticker)
+    return await asyncio.to_thread(get_earnings, ticker)
 
 @router.get("/market", summary="Market Endpoint")
 async def market_endpoint():
-    return get_market_breadth()
+    return await asyncio.to_thread(get_market_breadth)
 
 # ----------------------- Live quote stream (SSE) -----------------------
 @router.get("/quote_stream", summary="Quote Stream")
@@ -349,7 +350,7 @@ async def quote_stream(ticker: str, interval: float = 5.0):
     async def event_gen():
         try:
             while True:
-                q = get_quote(ticker)
+                q = await asyncio.to_thread(get_quote, ticker)
                 payload = {
                     "ticker": q.get("ticker", str(ticker).upper()),
                     "current_price": q.get("current_price"),
@@ -387,7 +388,7 @@ async def closes_endpoint(ticker: str, days: int = 60):
 
     if not _is_crypto(symbol):
         dates, closes = _filter_equity_calendar(dates, closes)
-        _pin_last_close(symbol, dates, closes)
+        await _pin_last_close_async(symbol, dates, closes)
 
     # Rescue sparse feeds with yfinance
     if len(closes) < 1:
@@ -402,7 +403,7 @@ async def closes_endpoint(ticker: str, days: int = 60):
                 closes = [float(v) for v in s.values]
                 if not _is_crypto(symbol):
                     dates, closes = _filter_equity_calendar(dates, closes)
-                    _pin_last_close(symbol, dates, closes)
+                    await _pin_last_close_async(symbol, dates, closes)
         except Exception:
             pass
 
@@ -419,7 +420,7 @@ async def stats_endpoint(ticker: str):
 
     # Try service first
     try:
-        stats = get_52w_stats(symbol) or {}
+        stats = await asyncio.to_thread(get_52w_stats, symbol) or {}
         hi = stats.get("high_52w"); lo = stats.get("low_52w")
         if isinstance(hi, (int, float)) and isinstance(lo, (int, float)):
             hi = float(hi); lo = float(lo)
