@@ -1,4 +1,10 @@
 // frontend/src/api.js
+// ------------------------------------------------------------
+// Unified API client with resilient auth path probing.
+// - Env-first base URL
+// - Safe strict mode (won’t get stuck on legacy /auth/auth/*)
+// - Legacy /auth/auth/* left as LAST resort only
+// ------------------------------------------------------------
 
 // --- Base URL resolution (env first; safe defaults) ---
 const RAW_ENV_BASE =
@@ -23,39 +29,49 @@ const MOVERS_ENDPOINT = import.meta.env.VITE_MOVERS_ENDPOINT || "/movers";
 const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/earnings_week";
 
 // ---- Auth feature toggles / paths ----
-const AUTH_ENABLED = String(import.meta.env.VITE_AUTH_ENABLED ?? "true").toLowerCase() === "true";
-const AUTH_STRICT = String(import.meta.env.VITE_AUTH_STRICT_PATHS ?? "false").toLowerCase() === "true";
+const AUTH_ENABLED =
+  String(import.meta.env.VITE_AUTH_ENABLED ?? "true").toLowerCase() === "true";
+
+// Support BOTH VITE_AUTH_STRICT and VITE_AUTH_STRICT_PATHS. Default: false.
+const AUTH_STRICT = ["true", "1", "yes"].includes(
+  String(
+    import.meta.env.VITE_AUTH_STRICT ??
+      import.meta.env.VITE_AUTH_STRICT_PATHS ??
+      "false"
+  ).toLowerCase()
+);
 
 const ENV_LOGIN = import.meta.env.VITE_AUTH_LOGIN_PATH || "";
 const ENV_REGISTER = import.meta.env.VITE_AUTH_REGISTER_PATH || "";
 const ENV_ME = import.meta.env.VITE_AUTH_ME_PATH || "";
 
 // Build ordered fallback lists. We’ll try each until we get a non-404.
+// Put correct paths FIRST; park legacy "/auth/auth/*" LAST as a final fallback.
 const LOGIN_PATHS = [
   ENV_LOGIN || null,
   "/auth/login",
-  "/auth/auth/login",
   "/login",
   "/users/login",
   "/signin",
   "/token",
+  "/auth/auth/login", // legacy LAST
 ].filter(Boolean);
 
 const REGISTER_PATHS = [
   ENV_REGISTER || null,
   "/auth/register",
-  "/auth/auth/register",
   "/register",
   "/users/register",
   "/signup",
+  "/auth/auth/register", // legacy LAST
 ].filter(Boolean);
 
 const ME_PATHS = [
   ENV_ME || null,
   "/auth/me",
-  "/auth/auth/me",
   "/me",
   "/users/me",
+  "/auth/auth/me", // legacy LAST
 ].filter(Boolean);
 
 // Warn about common mixed-content misconfig: https page calling http backend
@@ -70,7 +86,14 @@ if (typeof window !== "undefined") {
   console.info("[api] API_BASE =", API_BASE);
   console.info("[api] AUTH_ENABLED =", AUTH_ENABLED, "AUTH_STRICT =", AUTH_STRICT);
   if (AUTH_ENABLED) {
-    console.info("[api] Auth paths (login/register/me) =", LOGIN_PATHS[0], REGISTER_PATHS[0], ME_PATHS[0]);
+    console.info(
+      "[api] Auth paths (first choices) =",
+      LOGIN_PATHS[0],
+      REGISTER_PATHS[0],
+      ME_PATHS[0],
+      "| strict =",
+      AUTH_STRICT
+    );
   }
 }
 
@@ -78,13 +101,21 @@ if (typeof window !== "undefined") {
 const TOKEN_KEY = "AUTH_TOKEN";
 
 export function setAuthToken(token) {
-  try { localStorage.setItem(TOKEN_KEY, token || ""); } catch {}
+  try {
+    localStorage.setItem(TOKEN_KEY, token || "");
+  } catch {}
 }
 export function getAuthToken() {
-  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+  try {
+    return localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
 }
 export function clearAuthToken() {
-  try { localStorage.removeItem(TOKEN_KEY); } catch {}
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {}
 }
 
 // -------- fetch helpers --------
@@ -137,10 +168,18 @@ function withTimeout(fetcher, ms, externalSignal) {
   // Pipe external aborts into our timeout controller (merge)
   if (externalSignal instanceof AbortSignal) {
     if (externalSignal.aborted) {
-      try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
+      try {
+        ctrl.abort(externalSignal.reason);
+      } catch {
+        ctrl.abort();
+      }
     } else {
       const onAbort = () => {
-        try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
+        try {
+          ctrl.abort(externalSignal.reason);
+        } catch {
+          ctrl.abort();
+        }
       };
       externalSignal.addEventListener("abort", onAbort, { once: true });
     }
@@ -189,9 +228,18 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   throw lastErr;
 }
 
+// Pick the probe list for this call.
+// If strict is ON and the first path is NOT the legacy /auth/auth/*, try only the first.
+// If the first is legacy (or strict is OFF), try the full list.
+function firstTryList(paths) {
+  const first = paths[0] || "";
+  if (AUTH_STRICT && !first.includes("/auth/auth/")) return [first];
+  return paths;
+}
+
 // Try multiple paths, skipping 404s
 async function getFirst(paths, headers = defaultGetHeaders) {
-  const list = AUTH_STRICT ? [paths[0]] : paths;
+  const list = firstTryList(paths);
   let lastErr;
   for (const p of list) {
     try {
@@ -207,7 +255,7 @@ async function getFirst(paths, headers = defaultGetHeaders) {
 }
 
 async function postJsonFirst(paths, body, headers = defaultPostHeaders) {
-  const list = AUTH_STRICT ? [paths[0]] : paths;
+  const list = firstTryList(paths);
   let lastErr;
   for (const p of list) {
     try {
@@ -241,7 +289,9 @@ async function handle(res) {
       try {
         const text = await res.text();
         detail = text?.slice?.(0, 300);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     const msg = detail ? `${res.status} ${res.statusText} – ${detail}` : `HTTP ${res.status}`;
     throw new Error(msg);
@@ -255,7 +305,13 @@ async function handle(res) {
 
 export async function ping(opts) {
   const url = buildURL("/diag");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 export async function fetchHello(opts) {
   return ping(opts);
@@ -323,34 +379,68 @@ export async function fetchPredictHistory({ ticker, models, days = 12 }, opts) {
   list.forEach((m) => url.searchParams.append("models", m));
   url.searchParams.set("_ts", Date.now().toString());
 
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchQuote(ticker, opts) {
   const url = buildURL("/quote", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchEarnings(ticker, opts) {
   const url = buildURL("/earnings", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 // (unused but kept)
 export async function fetchDividends(ticker, opts) {
   const url = buildURL("/dividends", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchMarket(opts) {
   const url = buildURL("/market");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchCloses(ticker, days = 7, opts) {
   const url = buildURL("/closes", { ticker, days });
   const payload = await handle(
-    await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) })
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
   );
 
   // Light sanity normalization: ensure arrays exist & lengths match
@@ -358,7 +448,11 @@ export async function fetchCloses(ticker, days = 7, opts) {
   const closes = Array.isArray(payload?.closes) ? payload.closes : [];
   if (dates.length !== closes.length) {
     const n = Math.min(dates.length, closes.length);
-    return { ticker: payload?.ticker || ticker, dates: dates.slice(0, n), closes: closes.slice(0, n) };
+    return {
+      ticker: payload?.ticker || ticker,
+      dates: dates.slice(0, n),
+      closes: closes.slice(0, n),
+    };
   }
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
@@ -366,26 +460,56 @@ export async function fetchCloses(ticker, days = 7, opts) {
 // Quick stats (52w high/low)
 export async function fetchStats(ticker, opts) {
   const url = buildURL("/stats", { ticker });
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 // ---------- Movers / Earnings week ----------
 export async function fetchMovers(opts) {
   const url = buildURL(MOVERS_ENDPOINT);
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchTopGainers(opts) {
   const url = buildURL("/top_gainers");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchTopLosers(opts) {
   const url = buildURL("/top_losers");
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
 
 export async function fetchEarningsWeek(opts) {
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
-  return handle(await fetchWithRetry(url, { headers: maybeAuth(defaultGetHeaders), cache: "no-store", ...(opts || {}) }));
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
 }
