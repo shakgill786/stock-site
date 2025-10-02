@@ -1,84 +1,94 @@
-# backend/app/auth/utils.py
-import os
+# app/auth/utils.py
 from datetime import datetime, timedelta, timezone
-from jose import jwt, JWTError
-from passlib.context import CryptContext
-from fastapi import HTTPException, status, Depends
+import os
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.auth.models import User
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# -------------------- Password hashing --------------------
+# Default to bcrypt_sha256 (safe for long inputs), still accept legacy bcrypt ($2b$)
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],
+    deprecated="auto",
+    # bcrypt impl details / sane defaults:
+    bcrypt__rounds=12,
+    bcrypt__ident="2b",
+    # If someone accidentally passes >72 bytes to *bcrypt*, don't crash.
+    bcrypt__truncate_error=False,
+)
 
-# --- JWT config ---
-# Prefer SECRET_KEY, fall back to JWT_SECRET for backwards compatibility
-SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("JWT_SECRET")
-if not SECRET_KEY:
-    # Fail fast in production so you don't accidentally run with a dev default
-    raise RuntimeError(
-        "SECRET_KEY (or JWT_SECRET) is not set. "
-        "Set a long random value in your service environment."
-    )
+def hash_password(password: str) -> str:
+    """
+    Hash a password for storage. Uses bcrypt_sha256 so there is no 72-byte limit footgun.
+    """
+    if not isinstance(password, str) or not password:
+        raise ValueError("password required")
+    return pwd_context.hash(password)  # default scheme = first in list (bcrypt_sha256)
 
-ALGORITHM = os.getenv("JWT_ALG", "HS256")
-ACCESS_TOKEN_MINUTES = int(os.getenv("JWT_EXPIRE_MIN", "60"))
-ISSUER = os.getenv("JWT_ISS", "stock-backend")  # can be any stable string/URL for your service
+def verify_password(plain_password: str, password_hash: str) -> bool:
+    """
+    Verify a password against a stored hash.
+    - Works for both legacy bcrypt ($2b$…) and new bcrypt_sha256 hashes.
+    - Does NOT append any pepper/secret to the user-entered password.
+    """
+    if not isinstance(plain_password, str) or not password_hash:
+        return False
+    try:
+        return pwd_context.verify(plain_password, password_hash)
+    except Exception:
+        # Any unexpected error should be treated as a simple mismatch
+        # to avoid 500s on login.
+        return False
 
-# This is just for the OpenAPI “Authorize” button; your /auth/login returns a JWT as JSON.
+# -------------------- JWT / Auth --------------------
+SECRET_KEY: str = os.getenv("SECRET_KEY") or "change-me-in-prod"
+ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-def hash_password(p: str) -> str:
-    return pwd_ctx.hash(p)
-
-def verify_password(p: str, h: str) -> bool:
-    return pwd_ctx.verify(p, h)
-
-def create_access_token(sub: str) -> str:
+def create_access_token(*, sub: str, expires_delta: Optional[timedelta] = None) -> str:
     """
-    Create a short-lived access token with standard claims:
-    - sub: subject (user email)
-    - iat: issued at (epoch seconds)
-    - exp: expiration (epoch seconds)
-    - iss: issuer (optional but recommended)
+    Create a short-lived access token with a subject (typically the user's email).
     """
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(minutes=ACCESS_TOKEN_MINUTES)
-    claims = {
-        "sub": sub,
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "iss": ISSUER,
-    }
-    return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
+    to_encode = {"sub": sub}
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def _get_user_by_email(db: Session, email: str) -> Optional[User]:
+    if not email:
+        return None
+    return db.query(User).filter(User.email == email.lower()).first()
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> User:
-    cred_exc = HTTPException(
+    """
+    Bearer token -> current User (raises 401 if invalid).
+    """
+    credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        # Require core claims; also verify issuer
-        payload = jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM],
-            options={"require": ["sub", "exp", "iat"]},
-            issuer=ISSUER,
-        )
-        email: str = payload.get("sub")
-        if not email:
-            raise cred_exc
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        sub: Optional[str] = payload.get("sub")
+        if sub is None:
+            raise credentials_exception
     except JWTError:
-        # Includes ExpiredSignatureError, JWTClaimsError, etc.
-        raise cred_exc
+        raise credentials_exception
 
-    user = db.query(User).filter(User.email == email.lower()).first()
-    if not user:
-        raise cred_exc
+    user = _get_user_by_email(db, sub)
+    if user is None:
+        raise credentials_exception
     return user
