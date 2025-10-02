@@ -1,8 +1,9 @@
 # app/auth/router.py
-import os
-import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+import os, traceback, logging
 
 from app.db import get_db
 from app.auth import schemas
@@ -16,10 +17,18 @@ from app.auth.utils import (
 
 log = logging.getLogger(__name__)
 
-# ⚠️ No prefix here; main.py mounts with prefix="/auth"
+# ⚠️ No prefix here; we add it in main.py with app.include_router(..., prefix="/auth")
 router = APIRouter(tags=["Auth"])
 
+# ---------- Helpers ----------
+def _auth_debug_enabled() -> bool:
+    return str(os.getenv("AUTH_DEBUG", "")).strip() in {"1", "true", "TRUE", "yes", "on"}
 
+def _safe_401(detail: str = "Invalid email or password"):
+    # Always return the same detail in prod to avoid leaking which field failed
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+# ---------- Public auth endpoints ----------
 @router.post(
     "/register",
     response_model=schemas.TokenOut,
@@ -27,90 +36,71 @@ router = APIRouter(tags=["Auth"])
     summary="Create account",
 )
 def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
-    email = (payload.email or "").strip().lower()
-    if not email or not payload.password:
-        raise HTTPException(status_code=400, detail="Email and password required")
-
+    email = payload.email.lower()
     exists = db.query(User).filter(User.email == email).first()
     if exists:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Hash password with guardrails
     try:
-        pw_hash = hash_password(payload.password)
-        if not isinstance(pw_hash, str) or len(pw_hash) < 10:
-            raise RuntimeError("hash_password returned an invalid value")
+        pwd_hash = hash_password(payload.password)
     except Exception as e:
-        log.error("REGISTER: hash_password failed for %s: %r", email, e)
-        raise HTTPException(
-            status_code=500, detail="Unable to create account (password hashing)"
-        )
+        log.exception("hash_password() failed")
+        raise HTTPException(status_code=500, detail="Password hashing failed")
 
-    user = User(email=email, password_hash=pw_hash)
+    user = User(email=email, password_hash=pwd_hash)
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    # Issue token with guardrails
     try:
         token = create_access_token(sub=user.email)
     except Exception as e:
-        log.error("REGISTER: create_access_token failed for %s: %r", email, e)
-        raise HTTPException(status_code=500, detail="Unable to create account (token)")
+        log.exception("create_access_token() failed during register")
+        raise HTTPException(status_code=500, detail="Token mint failed")
 
     return {"access_token": token, "token_type": "bearer"}
 
 
-@router.post(
-    "/login",
-    response_model=schemas.TokenOut,
-    summary="Login (email+password)",
-)
+@router.post("/login", response_model=schemas.TokenOut, summary="Login (email+password)")
 def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
-    email = (payload.email or "").strip().lower()
-    if not email or not payload.password:
-        # Keep user enumeration parity
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
-
+    """
+    Typical failures that would cause 500s here:
+      - bcrypt / passlib not available or misconfigured -> verify_password raises
+      - JWT config missing/mis-typed (SECRET_KEY / ALGORITHM) -> create_access_token raises
+    We catch & downgrade to 401 unless AUTH_DEBUG=1, where we surface the reason.
+    """
+    email = payload.email.lower()
     user = db.query(User).filter(User.email == email).first()
     if not user:
-        # Uniform 401 to avoid leaking which emails exist
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+        _safe_401()
 
-    # Verify password; ensure exceptions don’t bubble as 500s
+    # 1) Password check
     try:
         ok = verify_password(payload.password, user.password_hash)
     except Exception as e:
-        # Common culprit: malformed/legacy hash, backend lib mismatch, etc.
-        log.warning(
-            "LOGIN: verify_password raised for %s (prefix=%s…): %r",
-            email,
-            (user.password_hash or "")[:8],
-            e,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+        # e.g., "Unknown hash algorithm", "bcrypt version mismatch", etc.
+        log.exception("verify_password() raised")
+        if _auth_debug_enabled():
+            raise HTTPException(
+                status_code=500,
+                detail=f"verify_password failed: {e.__class__.__name__}: {str(e)}",
+            )
+        _safe_401()
 
     if not ok:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+        _safe_401()
 
-    # Create JWT; guard against missing SECRET_KEY/ALGORITHM env, etc.
+    # 2) Mint token
     try:
         token = create_access_token(sub=user.email)
     except Exception as e:
-        log.error("LOGIN: create_access_token failed for %s: %r", email, e)
-        raise HTTPException(status_code=500, detail="Unable to issue token")
+        log.exception("create_access_token() raised")
+        if _auth_debug_enabled():
+            raise HTTPException(
+                status_code=500,
+                detail=f"create_access_token failed: {e.__class__.__name__}: {str(e)}",
+            )
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
     return {"access_token": token, "token_type": "bearer"}
 
@@ -119,27 +109,63 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
 def me(current: User = Depends(get_current_user)):
     return {"id": current.id, "email": current.email}
 
+# ---------- Lightweight health ----------
+@router.get("/_health", include_in_schema=False)
+def _health():
+    return {"ok": True}
 
-# -------- TEMP DEBUG (remove after you fix the issue) --------
-@router.get("/_debug_user", include_in_schema=False)
-def _debug_user(email: str, db: Session = Depends(get_db)):
-    """
-    Returns limited, non-sensitive shape info to diagnose login 500s.
-    Only enabled if AUTH_DEBUG=1 is set in the environment.
-    """
-    if os.getenv("AUTH_DEBUG") != "1":
+# ---------- Debug-only endpoints (require AUTH_DEBUG=1) ----------
+class _DbgLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class _DbgMint(BaseModel):
+    email: EmailStr
+    minutes: Optional[int] = None  # overrides ACCESS_TOKEN_EXPIRE_MINUTES if provided
+
+@router.post("/_dbg/check_password", include_in_schema=False)
+def _dbg_check_password(body: _DbgLogin, db: Session = Depends(get_db)):
+    if not _auth_debug_enabled():
         raise HTTPException(status_code=404, detail="Not found")
 
-    e = (email or "").strip().lower()
-    user = db.query(User).filter(User.email == e).first()
+    email = body.email.lower()
+    user = db.query(User).filter(User.email == email).first()
     if not user:
-        return {"exists": False, "email": e}
+        return {"email": email, "exists": False}
 
-    h = user.password_hash or ""
+    try:
+        ok = verify_password(body.password, user.password_hash)
+    except Exception as e:
+        return {
+            "email": email,
+            "exists": True,
+            "hash": user.password_hash,
+            "verify_exception": f"{e.__class__.__name__}: {str(e)}",
+            "trace": traceback.format_exc().splitlines()[-4:],
+        }
+
     return {
+        "email": email,
         "exists": True,
-        "email": user.email,
-        "hash_len": len(h),
-        "hash_prefix": h[:7],      # e.g., "$2b$12", "$argon2"
-        "hash_suffix_len": len(h[7:]),
+        "hash": user.password_hash,
+        "verify_ok": bool(ok),
     }
+
+@router.post("/_dbg/mint", include_in_schema=False)
+def _dbg_mint(body: _DbgMint, db: Session = Depends(get_db)):
+    if not _auth_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.lower()
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        token = create_access_token(sub=user.email, minutes_override=body.minutes)
+        return {"access_token": token, "token_type": "bearer"}
+    except Exception as e:
+        return {
+            "error": f"{e.__class__.__name__}: {str(e)}",
+            "trace": traceback.format_exc().splitlines()[-4:],
+        }
