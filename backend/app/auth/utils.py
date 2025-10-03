@@ -7,49 +7,65 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
+from os import getenv
 
 from app.db import get_db
 from app.auth.models import User
 
-# ---- Password hashing ----
-# Use bcrypt_sha256 to avoid bcrypt's 72-byte password limit.
+# ------------------------------------------------------------------
+# Password hashing
+# ------------------------------------------------------------------
+# Use bcrypt_sha256 as default to avoid bcrypt's 72-byte limit.
+# Accept legacy bcrypt ($2b$...) for existing rows so old users still log in.
 pwd_context = CryptContext(
-    schemes=["bcrypt_sha256", "bcrypt"],  # accept legacy $2b$ too
+    schemes=["bcrypt_sha256", "bcrypt"],
     deprecated="auto",
 )
 
 def hash_password(plain: str) -> str:
+    # bcrypt_sha256 safely handles long/unicode passwords
     return pwd_context.hash(plain or "")
 
 def verify_password(plain: str, hashed: str) -> bool:
-    # bcrypt_sha256 handles long / unicode passwords safely
+    # verify works for both bcrypt_sha256 and legacy bcrypt
     return pwd_context.verify(plain or "", hashed or "")
 
-# ---- JWT settings ----
-from os import getenv
+def needs_rehash(hashed: str) -> bool:
+    """
+    True if the stored hash should be upgraded to our current policy
+    (e.g., it's legacy 'bcrypt' or params outdated).
+    """
+    try:
+        # upgrade if passlib wants update OR the scheme isn't bcrypt_sha256
+        if pwd_context.needs_update(hashed):
+            return True
+        scheme = pwd_context.identify(hashed) or ""
+        return scheme != "bcrypt_sha256"
+    except Exception:
+        # unknown/odd hash → upgrade after a successful verify
+        return True
 
-SECRET_KEY = getenv("SECRET_KEY", "CHANGE_ME_IN_ENV")
+# ------------------------------------------------------------------
+# JWT config
+# ------------------------------------------------------------------
+SECRET_KEY = getenv("SECRET_KEY", "")
 ALGORITHM = getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60") or "60")
 
-def create_access_token(sub: str, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(sub: str, minutes_override: Optional[int] = None) -> str:
+    if not SECRET_KEY:
+        raise RuntimeError("SECRET_KEY missing")
+    minutes = minutes_override if minutes_override is not None else ACCESS_TOKEN_EXPIRE_MINUTES
     now = datetime.now(tz=timezone.utc)
-    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode = {"sub": sub, "iat": int(now.timestamp()), "exp": int(expire.timestamp())}
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    exp = now + timedelta(minutes=minutes)
+    payload = {"sub": sub, "iat": int(now.timestamp()), "exp": int(exp.timestamp())}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-# ---- Auth dependencies ----
-# tokenUrl must match your mounted /auth/login path
+# ------------------------------------------------------------------
+# Auth dependencies
+# ------------------------------------------------------------------
+# tokenUrl must match how the router is mounted (/auth/login)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
-
-async def _token_from_request(request: Request, bearer: Optional[str] = Depends(oauth2_scheme)) -> Optional[str]:
-    """
-    Pull token from Authorization: Bearer ... or from ?token=... (handy for SSE).
-    """
-    if bearer:
-        return bearer
-    q = request.query_params.get("token")
-    return q or None
 
 def _auth_error(detail: str = "Invalid credentials"):
     raise HTTPException(
@@ -57,6 +73,18 @@ def _auth_error(detail: str = "Invalid credentials"):
         detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+async def _token_from_request(
+    request: Request,
+    bearer: Optional[str] = Depends(oauth2_scheme),
+) -> Optional[str]:
+    """
+    Pull token from Authorization: Bearer ... or from ?token=... (handy for SSE).
+    """
+    if bearer:
+        return bearer
+    q = request.query_params.get("token")
+    return q or None
 
 def _decode_token(token: str) -> str:
     try:
@@ -68,7 +96,6 @@ def _decode_token(token: str) -> str:
     except JWTError:
         _auth_error("Invalid token")
 
-# Main dependency your routes use
 async def get_current_user(
     token: Optional[str] = Depends(_token_from_request),
     db: Session = Depends(get_db),
@@ -78,11 +105,12 @@ async def get_current_user(
     email = _decode_token(token)
     user = db.query(User).filter(User.email == email.lower()).first()
     if not user:
-        _auth_error("User not found")
+        _auth_error("Invalid credentials")
     return user
 
-# -------- Optional debug helpers (used by your curl tests) --------
-# Keep these here so router.py can re-export without duplicating logic.
+# ------------------------------------------------------------------
+# Debug helper (used by router _dbg/check_password)
+# ------------------------------------------------------------------
 def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
     out = {"email": email, "exists": False}
     user = db.query(User).filter(User.email == email.lower()).first()
@@ -92,7 +120,9 @@ def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
     out["hash"] = user.password_hash
     try:
         ok = verify_password(password, user.password_hash)
-        out["verify"] = bool(ok)
+        out["verify_ok"] = bool(ok)
+        out["hash_scheme"] = pwd_context.identify(user.password_hash)
+        out["needs_rehash"] = needs_rehash(user.password_hash)
     except Exception as e:
         out["verify_exception"] = f"{type(e).__name__}: {e}"
     return out
