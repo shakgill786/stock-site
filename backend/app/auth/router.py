@@ -174,19 +174,12 @@ def _dbg_mint(
     token = create_access_token(sub=user.email, minutes_override=body.minutes)
     return {"access_token": token, "token_type": "bearer"}
 
-@router.post("/_dbg/reset_password", include_in_schema=False)
-def _dbg_reset_password(
-    body: _DbgReset,
+@router.post("/_dbg/check_password", include_in_schema=False)
+def _dbg_check_password(
+    body: _DbgLogin,
     request: Request,
     db: Session = Depends(get_db),
     x_debug_auth: Optional[str] = Header(default=None, alias="X-Debug-Auth"),
 ):
     _require_debug(request, x_debug_auth)
-    email = body.email.lower()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.password_hash = hash_password(body.new_password)
-    db.add(user)
-    db.commit()
-    return {"ok": True, "email": user.email}
+    return dbg_verify_for_email(db, body.email, body.password)

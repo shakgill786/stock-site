@@ -15,8 +15,8 @@ from app.auth.models import User
 # ------------------------------------------------------------------
 # Password hashing
 # ------------------------------------------------------------------
-# Use bcrypt_sha256 as default to avoid bcrypt's 72-byte limit.
-# Accept legacy bcrypt ($2b$...) for existing rows so old users still log in.
+# Default to bcrypt_sha256 to avoid bcrypt's 72-byte limit.
+# Also accept legacy bcrypt ($2b$...) so existing users can still log in.
 pwd_context = CryptContext(
     schemes=["bcrypt_sha256", "bcrypt"],
     deprecated="auto",
@@ -26,9 +26,36 @@ def hash_password(plain: str) -> str:
     # bcrypt_sha256 safely handles long/unicode passwords
     return pwd_context.hash(plain or "")
 
+def _truncate_to_72_bytes(s: str) -> str:
+    """
+    For legacy bcrypt verification ONLY: bcrypt ignores data past 72 bytes.
+    Some backends error out instead of truncating, so we pre-truncate.
+    """
+    b = (s or "").encode("utf-8")
+    if len(b) <= 72:
+        return s or ""
+    # truncate to 72 bytes, drop partial codepoint if needed
+    b = b[:72]
+    return b.decode("utf-8", errors="ignore")
+
 def verify_password(plain: str, hashed: str) -> bool:
-    # verify works for both bcrypt_sha256 and legacy bcrypt
-    return pwd_context.verify(plain or "", hashed or "")
+    """
+    Verify password against either bcrypt_sha256 (preferred) or legacy bcrypt.
+    If the stored hash is legacy bcrypt, pre-truncate plaintext to 72 bytes.
+    """
+    hashed = hashed or ""
+    scheme = None
+    try:
+        scheme = pwd_context.identify(hashed)
+    except Exception:
+        # Unknown hash → let passlib raise below
+        pass
+
+    candidate = plain or ""
+    if scheme == "bcrypt":
+        candidate = _truncate_to_72_bytes(candidate)
+
+    return pwd_context.verify(candidate, hashed)
 
 def needs_rehash(hashed: str) -> bool:
     """
@@ -36,7 +63,6 @@ def needs_rehash(hashed: str) -> bool:
     (e.g., it's legacy 'bcrypt' or params outdated).
     """
     try:
-        # upgrade if passlib wants update OR the scheme isn't bcrypt_sha256
         if pwd_context.needs_update(hashed):
             return True
         scheme = pwd_context.identify(hashed) or ""
@@ -119,9 +145,10 @@ def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
     out["exists"] = True
     out["hash"] = user.password_hash
     try:
-        ok = verify_password(password, user.password_hash)
-        out["verify_ok"] = bool(ok)
-        out["hash_scheme"] = pwd_context.identify(user.password_hash)
+        scheme = pwd_context.identify(user.password_hash)
+        out["hash_scheme"] = scheme
+        out["passwd_len_bytes"] = len((password or "").encode("utf-8"))
+        out["verify_ok"] = verify_password(password, user.password_hash)
         out["needs_rehash"] = needs_rehash(user.password_hash)
     except Exception as e:
         out["verify_exception"] = f"{type(e).__name__}: {e}"
