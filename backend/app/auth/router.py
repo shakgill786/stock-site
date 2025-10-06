@@ -14,6 +14,7 @@ from app.auth.utils import (
     create_access_token,
     get_current_user,
     dbg_verify_for_email,
+    pwd_context,  # for needs_update()
 )
 
 log = logging.getLogger(__name__)
@@ -26,10 +27,6 @@ def _auth_debug_enabled() -> bool:
 DEBUG_AUTH_TOKEN = (os.getenv("DEBUG_AUTH_TOKEN") or "").strip()
 
 def _require_debug(request: Request, x_debug_auth: Optional[str] = None):
-    """
-    If DEBUG_AUTH_TOKEN is set -> require X-Debug-Auth to match.
-    Else allow when AUTH_DEBUG is truthy.
-    """
     if DEBUG_AUTH_TOKEN:
         if (x_debug_auth or "") != DEBUG_AUTH_TOKEN:
             raise HTTPException(status_code=401, detail="Unauthorized (bad X-Debug-Auth)")
@@ -58,10 +55,10 @@ def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     db.refresh(user)
     try:
         token = create_access_token(sub=user.email)
+        return {"access_token": token, "token_type": "bearer"}
     except Exception:
         log.exception("create_access_token() failed during register")
         raise HTTPException(status_code=500, detail="Token mint failed")
-    return {"access_token": token, "token_type": "bearer"}
 
 @router.post("/login", response_model=schemas.TokenOut)
 def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
@@ -69,6 +66,8 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == email).first()
     if not user:
         _safe_401()
+
+    # verify (with utils’ fallback handling)
     try:
         ok = verify_password(payload.password, user.password_hash)
     except Exception as e:
@@ -78,6 +77,16 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
         _safe_401()
     if not ok:
         _safe_401()
+
+    # Optional: opportunistic rehash to bcrypt_sha256 if the hash is legacy or policy changed
+    try:
+        if user.password_hash and pwd_context.needs_update(user.password_hash):
+            user.password_hash = hash_password(payload.password)
+            db.add(user)
+            db.commit()
+    except Exception:
+        log.warning("needs_update/rehash failed", exc_info=True)
+
     try:
         token = create_access_token(sub=user.email)
         return {"access_token": token, "token_type": "bearer"}
@@ -114,7 +123,7 @@ def _dbg_version(
     x_debug_auth: Optional[str] = Header(default=None, alias="X-Debug-Auth"),
 ):
     _require_debug(request, x_debug_auth)
-    return {"router": "auth-router", "utils_marker": "2025-10-02-truncate72"}
+    return {"router": "auth-router", "utils_marker": "2025-10-02-truncate72+noerr"}
 
 @router.post("/_dbg/check_password", include_in_schema=False)
 def _dbg_check_password(
