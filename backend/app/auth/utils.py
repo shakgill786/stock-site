@@ -12,46 +12,64 @@ from os import getenv
 from app.db import get_db
 from app.auth.models import User
 
+# ================== Utils marker (so we can prove this file is live) ==================
+def get_utils_marker() -> str:
+    return "2025-10-03-bcryptsha256-retry2"
+
 # ================== Password hashing / verification ==================
 
-# IMPORTANT: bcrypt_sha256 *must* be first so Passlib routes $bcrypt-sha256$ hashes to it.
-# Keep bcrypt second to accept old $2b$ hashes.
+# Keep bcrypt_sha256 FIRST so $bcrypt-sha256$ hashes route correctly.
 pwd_context = CryptContext(
     schemes=["bcrypt_sha256", "bcrypt"],
     deprecated="auto",
-    # ensure we're not accidentally using old 2a/2y identifiers
     bcrypt__ident="2b",
 )
+
+def identify_hash(hashed: str) -> str:
+    try:
+        return pwd_context.identify(hashed or "") or "unknown"
+    except Exception:
+        return "unknown"
 
 def hash_password(plain: str) -> str:
     """Hash a password with bcrypt_sha256 (handles long/unicode safely)."""
     return pwd_context.hash(plain or "")
 
-def identify_hash(hashed: str) -> str:
-    """
-    Return the scheme Passlib thinks this hash uses, e.g. 'bcrypt_sha256', 'bcrypt', or None.
-    """
-    try:
-        return pwd_context.identify(hashed) or "unknown"
-    except Exception:
-        return "unknown"
-
 def verify_password(plain: str, hashed: str) -> bool:
     """
     Verify against either $bcrypt-sha256$ or legacy $2b$ hashes.
-    - Prefer native Passlib routing.
-    - If a bcrypt ValueError about 72 bytes ever occurs, retry with truncated input.
+    If some env throws 'longer than 72 bytes' for bcrypt, retry with truncated input.
     """
     plain = plain or ""
     hashed = hashed or ""
     try:
         return pwd_context.verify(plain, hashed)
     except ValueError as e:
-        # Some environments raise for bcrypt when input >72 bytes. Be defensive:
         msg = str(e).lower()
-        if "longer than 72 bytes" in msg or "72 bytes" in msg:
-            return pwd_context.verify(plain[:72], hashed)
+        if "72 bytes" in msg:
+            # Defensive retry: bcrypt backend can complain about input >72 bytes.
+            # bcrypt_sha256 shouldn't, but if the backend raises anyway, retry.
+            try:
+                return pwd_context.verify(plain[:72], hashed)
+            except Exception:
+                pass
         raise
+
+def verify_password_dual(plain: str, hashed: str) -> dict:
+    """
+    Debug helper: run a raw verify and a retry-with-truncation verify, returning details.
+    """
+    out = {"scheme": identify_hash(hashed or ""), "raw_ok": None, "retry_ok": None, "raw_error": None, "retry_error": None}
+    try:
+        out["raw_ok"] = bool(pwd_context.verify(plain or "", hashed or ""))
+    except Exception as e:
+        out["raw_error"] = f"{type(e).__name__}: {e}"
+    # retry path
+    try:
+        out["retry_ok"] = bool(pwd_context.verify((plain or "")[:72], hashed or ""))
+    except Exception as e:
+        out["retry_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 # ================== JWT ==================
 
@@ -105,7 +123,7 @@ async def get_current_user(
         _auth_error("User not found")
     return user
 
-# ============== Small debug helpers (router uses these) ==============
+# ============== Small debug helpers (used by router debug endpoints) ==============
 
 def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
     out = {"email": email, "exists": False}
@@ -115,6 +133,7 @@ def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
     out["exists"] = True
     out["hash"] = user.password_hash
     out["hash_scheme"] = identify_hash(user.password_hash)
+    # Use our normal verify() which includes the safe retry.
     try:
         ok = verify_password(password, user.password_hash)
         out["verify_ok"] = bool(ok)

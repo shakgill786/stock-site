@@ -13,12 +13,13 @@ from app.auth.utils import (
     verify_password,
     create_access_token,
     get_current_user,
-    identify_hash,          # NEW
-    dbg_verify_for_email,   # used by dbg endpoint
+    identify_hash,
+    dbg_verify_for_email,
+    verify_password_dual,   # NEW for deeper debug
+    get_utils_marker,       # marker provided by utils (proves correct file is live)
 )
 
 log = logging.getLogger(__name__)
-
 router = APIRouter(tags=["Auth"])  # prefix applied in main.py
 
 # -------- debug gates --------
@@ -113,14 +114,16 @@ class _DbgReset(BaseModel):
 @router.get("/_dbg/version", include_in_schema=False)
 def _dbg_version(request: Request):
     _require_debug(request)
-    return {"router": "auth-router", "utils_marker": "2025-10-03-bcryptsha256"}
+    return {"router": "auth-router", "utils_marker": get_utils_marker()}
 
 @router.post("/_dbg/check_password", include_in_schema=False)
 def _dbg_check_password(body: _DbgLogin, request: Request, db: Session = Depends(get_db)):
     _require_debug(request)
     info = dbg_verify_for_email(db, body.email, body.password)
-    # also expose scheme Passlib identifies
     info["identified_by"] = identify_hash(info.get("hash", "") or "")
+    # deep dive: show both raw & retry behavior
+    dual = verify_password_dual(body.password, info.get("hash", "") or "")
+    info["dual"] = dual
     return info
 
 @router.post("/_dbg/mint", include_in_schema=False)
