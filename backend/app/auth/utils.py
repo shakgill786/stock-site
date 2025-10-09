@@ -2,10 +2,10 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from os import getenv
-import re
 import hashlib
+import re
 
-import bcrypt  # from passlib[bcrypt] extra
+import bcrypt  # manual verify for bcrypt_sha256
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
@@ -15,155 +15,103 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.auth.models import User
 
-# ---- marker so we can see it's live ----
-def get_utils_marker() -> str:
-    return "2025-10-03-bcryptsha256-retry4-manual"
+# ----- build marker so you can verify deployment -----
+UTILS_MARKER = "2025-10-04-bcryptsha256-manual+identify"
 
-# ---- Passlib context (still used for hashing & non-bcrypt) ----
+# ----- passlib context (hash with bcrypt_sha256; accept legacy bcrypt) -----
 pwd_context = CryptContext(
     schemes=["bcrypt_sha256", "bcrypt"],
     deprecated="auto",
-    bcrypt__ident="2b",
-    bcrypt__truncate_error=False,
-    bcrypt_sha256__truncate_error=False,
 )
 
-# Recognize our bcrypt_sha256 envelope:
-# $bcrypt-sha256$v=2,t=2b,r=12$<22 salt>$<31 checksum>
+# passlib bcrypt_sha256 format:
+# $bcrypt-sha256$v=2,t=2b,r=12$<22char salt>$<31char checksum>
 _BCRYPT_SHA256_RE = re.compile(
-    r"^\$bcrypt-sha256\$v=\d+,t=(?P<t>\w+),r=(?P<r>\d+)\$(?P<salt>[A-Za-z0-9./]{22})\$(?P<chk>[A-Za-z0-9./]{31})$"
+    r"^\$bcrypt-sha256\$v=(?P<v>\d+),t=(?P<ident>2[aby]),r=(?P<rounds>\d+)\$(?P<salt>[A-Za-z0-9./]{22})\$(?P<chk>[A-Za-z0-9./]{31})$"
 )
 
-def identify_hash(hashed: str) -> str:
-    try:
-        return pwd_context.identify(hashed or "") or "unknown"
-    except Exception:
-        return "unknown"
-
-def _verify_bcrypt_sha256_manual(password: str, full_hash: str) -> bool:
+def bcrypt_sha256_manual_verify(plain: str, hashed: str) -> Optional[bool]:
     """
-    Manual verification for $bcrypt-sha256$:
-    1) sha256(password).digest()  (raw 32 bytes)
-    2) bcrypt.checkpw(digest, reconstructed_bcrypt_hash)
+    Manually verify passlib's bcrypt_sha256 using the 'bcrypt' package.
+    Returns True/False if pattern matches, or None if 'hashed' isn't bcrypt_sha256.
     """
-    m = _BCRYPT_SHA256_RE.match(full_hash or "")
+    m = _BCRYPT_SHA256_RE.match(hashed or "")
     if not m:
-        return False
-    t = m.group("t")          # usually '2b'
-    r = int(m.group("r"))     # rounds (e.g. 12)
-    salt = m.group("salt")    # 22 chars
-    chk = m.group("chk")      # 31 chars
+        return None  # not a bcrypt_sha256 hash
 
-    # Build canonical bcrypt string: "$2b$12$" + 22 salt + 31 chk
-    bcrypt_str = f"${t}${r:02d}${salt}{chk}"
-    bcrypt_bytes = bcrypt_str.encode("utf-8")
+    ident  = m.group("ident")   # '2b', '2a', '2y'
+    rounds = int(m.group("rounds"))
+    salt   = m.group("salt")
+    chk    = m.group("chk")
 
-    # Compute digest of the *password*
-    digest = hashlib.sha256((password or "").encode("utf-8")).digest()
+    # Assemble a standard bcrypt MCF so bcrypt.checkpw can evaluate
+    assembled = f"${ident}${rounds:02d}${salt}{chk}".encode("ascii")
+
+    # bcrypt_sha256 pre-hashes the password with SHA-256 (raw 32 bytes)
+    pw32 = hashlib.sha256((plain or "").encode("utf-8")).digest()
+
     try:
-        return bool(bcrypt.checkpw(digest, bcrypt_bytes))
-    except Exception:
-        return False
-
-def _verify_bcrypt_manual(password: str, full_hash: str) -> bool:
-    """
-    Manual verification for classic bcrypt ($2b$...):
-    bcrypt only considers first 72 bytes.
-    """
-    try:
-        return bool(bcrypt.checkpw((password or "")[:72].encode("utf-8"), (full_hash or "").encode("utf-8")))
+        return bool(bcrypt.checkpw(pw32, assembled))
     except Exception:
         return False
 
 def hash_password(plain: str) -> str:
-    # keep Passlib for *hashing* new passwords
     return pwd_context.hash(plain or "")
 
 def verify_password(plain: str, hashed: str) -> bool:
     """
-    Robust verification:
-    - Prefer manual paths for bcrypt_sha256 / bcrypt to avoid the 72-byte exception
-      coming from the environment's bcrypt build.
-    - Fall back to Passlib if the hash isn't one of those.
+    Prefer manual path for bcrypt_sha256. Fall back to passlib otherwise.
     """
-    h = hashed or ""
-    if h.startswith("$bcrypt-sha256$"):
-        ok = _verify_bcrypt_sha256_manual(plain or "", h)
-        if ok is not False:
-            return ok
-        # last-chance fallback to passlib
-        try:
-            return pwd_context.verify(plain or "", h)
-        except Exception:
+    if hashed and hashed.startswith("$bcrypt-sha256$"):
+        manu = bcrypt_sha256_manual_verify(plain, hashed)
+        if manu is True:
+            return True
+        if manu is False:
             return False
+        # manu is None => odd format; let passlib try
 
-    if h.startswith("$2b$") or h.startswith("$2a$") or h.startswith("$2y$"):
-        ok = _verify_bcrypt_manual(plain or "", h)
-        if ok is not False:
-            return ok
-        try:
-            return pwd_context.verify(plain or "", h)
-        except Exception:
-            return False
-
-    # Non-bcrypt scheme: use passlib normally
     try:
-        return pwd_context.verify(plain or "", h)
+        return pwd_context.verify(plain or "", hashed or "")
     except Exception:
         return False
 
-def verify_password_dual(plain: str, hashed: str) -> dict:
-    """
-    Debug helper so our /_dbg/check_password can show both manual & passlib results.
-    """
-    scheme = identify_hash(hashed or "")
-    out = {
-        "scheme": scheme,
-        "manual_ok": None,
-        "passlib_ok": None,
-        "manual_error": None,
-        "passlib_error": None,
-    }
+def identify_hash(hashed: Optional[str]) -> str:
+    if not hashed:
+        return "none"
+    if hashed.startswith("$bcrypt-sha256$"):
+        return "bcrypt_sha256"
+    if hashed.startswith("$2a$") or hashed.startswith("$2b$") or hashed.startswith("$2y$"):
+        return "bcrypt"
+    return "unknown"
 
-    # manual
-    try:
-        if scheme == "bcrypt_sha256" or (hashed or "").startswith("$bcrypt-sha256$"):
-            out["manual_ok"] = _verify_bcrypt_sha256_manual(plain or "", hashed or "")
-        elif scheme == "bcrypt" or (hashed or "").startswith(("$2b$", "$2a$", "$2y$")):
-            out["manual_ok"] = _verify_bcrypt_manual(plain or "", hashed or "")
-    except Exception as e:
-        out["manual_error"] = f"{type(e).__name__}: {e}"
-
-    # passlib
-    try:
-        out["passlib_ok"] = pwd_context.verify(plain or "", hashed or "")
-    except Exception as e:
-        out["passlib_error"] = f"{type(e).__name__}: {e}"
-
-    return out
-
-# ---- JWT ----
+# ----- JWT settings -----
 SECRET_KEY = getenv("SECRET_KEY", "CHANGE_ME_IN_ENV")
 ALGORITHM = getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-def create_access_token(sub: str, expires_delta: Optional[timedelta] = None, minutes_override: Optional[int] = None) -> str:
+def create_access_token(sub: str, expires_delta: Optional[timedelta] = None) -> str:
     now = datetime.now(tz=timezone.utc)
-    minutes = minutes_override if minutes_override is not None else ACCESS_TOKEN_EXPIRE_MINUTES
-    expire = now + (expires_delta or timedelta(minutes=minutes))
+    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     payload = {"sub": sub, "iat": int(now.timestamp()), "exp": int(expire.timestamp())}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-# ---- auth deps ----
+# ----- Auth dependencies -----
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
-async def _token_from_request(request: Request, bearer: Optional[str] = Depends(oauth2_scheme)) -> Optional[str]:
+async def _token_from_request(
+    request: Request, bearer: Optional[str] = Depends(oauth2_scheme)
+) -> Optional[str]:
     if bearer:
         return bearer
-    return request.query_params.get("token")
+    q = request.query_params.get("token")
+    return q or None
 
 def _auth_error(detail: str = "Invalid credentials"):
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail, headers={"WWW-Authenticate": "Bearer"})
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 def _decode_token(token: str) -> str:
     try:
@@ -186,16 +134,3 @@ async def get_current_user(
     if not user:
         _auth_error("User not found")
     return user
-
-# ---- debug used by router ----
-def dbg_verify_for_email(db: Session, email: str, password: str) -> dict:
-    out = {"email": email, "exists": False}
-    user = db.query(User).filter(User.email == email.lower()).first()
-    if not user:
-        return out
-    out["exists"] = True
-    out["hash"] = user.password_hash
-    out["hash_scheme"] = identify_hash(user.password_hash)
-    out["dual"] = verify_password_dual(password, user.password_hash)
-    out["verify_ok"] = verify_password(password, user.password_hash)
-    return out
