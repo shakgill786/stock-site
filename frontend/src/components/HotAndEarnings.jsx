@@ -1,7 +1,7 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
 // - strict parsing (no string->0 coercion)
-// - prefers extended prices when present
+// - prefers backend's display_change_pct when present
 // - derives change/% from previousClose or open
 // - hydrates via fetchQuote; robust EOD fallback (last two distinct closes) with sanity guards
 // - losers sort ascending by default; gainers descending
@@ -75,11 +75,13 @@ function normalizeRow(row) {
     "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
 
-  let change = firstNum(row, ["change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
+  // prefer backend's already clamped/normalized display_change_pct if present
   let change_pct = firstNum(row, [
+    "display_change_pct", // <- preferred
     "change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
     "changePct","percentChange","extended_change_pct","after_hours_change_pct","postmarket_change_pct",
   ]);
+  let change = firstNum(row, ["display_change", "change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
 
   const prevClose = firstNum(row, [
     "prev_close","previous_close","previousClose","priorClose",
@@ -143,13 +145,16 @@ function pickFromQuote(q) {
   ]));
   const price = isNum(extPrice) ? extPrice : curPrice;
 
-  let change = firstNum(q, [
-    "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
-    "change","regularMarketChange",
-  ]);
+  // prefer display_change_pct if provided by backend /quote
   let change_pct = firstNum(q, [
+    "display_change_pct",
     "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
     "change_pct","percent_change","regularMarketChangePercent",
+  ]);
+  let change = firstNum(q, [
+    "display_change",
+    "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
+    "change","regularMarketChange",
   ]);
 
   // Derive from price vs lastClose if needed
@@ -201,7 +206,7 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  // reject absurd % (splits/bad feed)
+  // reject absurd % (splits/bad feed) for fallback
   if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
@@ -552,7 +557,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
-      // Normalize first
+      // Normalize first (prefer backend display_change_pct when present)
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
@@ -567,7 +572,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setGainers(gHydrated.filter(keep));
       setLosers(lHydrated.filter(keep));
 
-      // source string (base feed only)
+      // base feed string
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");

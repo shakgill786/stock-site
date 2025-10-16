@@ -2,13 +2,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchQuote, fetchCloses } from "../api";
 
-/* local helpers (kept minimal so this file is standalone) */
+/* local helpers */
 const EPS = 1e-6;
 const toNum = (v) => (typeof v === "number" ? v : (typeof v === "string" ? Number(v.replace(/[%,$]/g, "").trim()) : NaN));
 const isNum = (v) => Number.isFinite(toNum(v));
 const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtScore = (v) => (isNum(v) ? `${toNum(v).toFixed(1)}` : "—");
+const clampPct = (v, lo = -25, hi = 25) => {
+  const n = toNum(v);
+  return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : NaN;
+};
 
 const firstNum = (obj, keys) => {
   for (const k of keys) if (obj && k in obj && isNum(obj[k])) return toNum(obj[k]);
@@ -29,7 +33,9 @@ function pickFromQuote(q) {
   ]));
   const price = isNum(extPrice) ? extPrice : curPrice;
 
+  // prefer display_change_pct if backend supplies it
   let change_pct = firstNum(q, [
+    "display_change_pct",
     "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
     "change_pct","percent_change","regularMarketChangePercent",
   ]);
@@ -39,7 +45,8 @@ function pickFromQuote(q) {
     change_pct = ((toNum(price) - toNum(lastClose)) / toNum(lastClose)) * 100;
   }
 
-  return { price, lastClose, change_pct };
+  const clamped_pct = clampPct(change_pct);
+  return { price, lastClose, change_pct: clamped_pct };
 }
 
 function pickLastTwoCloses(resp) {
@@ -84,7 +91,7 @@ function trendPctFromCloses(resp, daysBack = 5) {
   return pct;
 }
 
-/* simple card shell that matches the existing style */
+/* simple card shell */
 function Card({ title, right, children }) {
   return (
     <div className="he-card">
@@ -143,7 +150,7 @@ export default function TopBuysCard({ title = "Top 25 Buys (model)", candidates 
 
               out.push({
                 symbol: sym,
-                price: picked.price ?? eod?.lastClose ?? NaN,
+                price: isNum(picked.price) ? picked.price : (eod?.lastClose ?? NaN),
                 score,
                 rating,
               });

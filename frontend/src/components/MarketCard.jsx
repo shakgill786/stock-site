@@ -1,4 +1,5 @@
 // frontend/src/components/MarketCard.jsx
+// Prefers backend's display_change_pct (already clamped/normalized) with graceful fallback.
 
 export default function MarketCard({ market }) {
   const entries = market ? Object.entries(market) : [];
@@ -12,19 +13,33 @@ export default function MarketCard({ market }) {
     );
   }
 
+  const clamp = (v, lo = -25, hi = 25) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return NaN;
+    return Math.max(lo, Math.min(hi, n));
+  };
+
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>📊 Market Snapshot</h3>
 
       <div className="mk-grid">
         {entries.map(([sym, data]) => {
-          const price = Number(data?.current_price);
-          const pct = Number(data?.change_pct);
+          const price = Number(data?.current_price ?? data?.price ?? data?.last);
+          const rawPct = Number(
+            data?.display_change_pct ?? data?.change_pct ?? data?.percent ?? data?.changePercent
+          );
+          const pct = Number.isFinite(rawPct) ? clamp(rawPct) : NaN;
           const hasPct = Number.isFinite(pct);
           const up = hasPct ? pct >= 0 : null;
 
           return (
-            <div key={sym} className="mk-tile" role="group" aria-label={`${sym} ${hasPct ? `${up ? "up" : "down"} ${Math.abs(pct).toFixed(2)} percent` : ""}`}>
+            <div
+              key={sym}
+              className="mk-tile"
+              role="group"
+              aria-label={`${sym} ${hasPct ? `${up ? "up" : "down"} ${Math.abs(pct).toFixed(2)} percent` : ""}`}
+            >
               <div className="mk-head">
                 <div className="mk-sym">{sym}</div>
                 {hasPct ? (

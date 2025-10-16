@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
-import random, json, asyncio, time, os
+import random, json, asyncio, time, os, math
 from datetime import date, timedelta
 from starlette.responses import StreamingResponse
 import httpx
@@ -18,7 +18,150 @@ from app.services.finance_service import (
 
 router = APIRouter()
 
-# ----------------------- helpers -----------------------
+# ----------------------- normalization / clamping -----------------------
+CLAMP_PCT_BOUNDS: Tuple[float, float] = (-25.0, 25.0)  # UI sanity window
+HARD_LAST_MULTIPLIER = 1.95  # reject last beyond ±95% of prevClose (vendor glitch)
+
+def _to_float(x):
+    try:
+        s = str(x).strip().replace("%", "").replace(",", "")
+        return float(s)
+    except Exception:
+        return None
+
+def _safe_pct(last: Optional[float], prev: Optional[float]) -> float:
+    try:
+        if last is None or prev is None: return 0.0
+        if not isinstance(last, (int, float)) or not isinstance(prev, (int, float)): return 0.0
+        if prev == 0 or math.isnan(last) or math.isnan(prev): return 0.0
+        return ((float(last) - float(prev)) / float(prev)) * 100.0
+    except Exception:
+        return 0.0
+
+def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize a movers/top_gainers/top_losers row to avoid goofy values like +140.75%:
+      - compute percent from price & last if vendor percent is missing/bad
+      - fix 'percent' that is actually dollars
+      - clamp % to ±25 for DISPLAY (keep originals as *_raw)
+    Input expected keys (best-effort): symbol, price, change, change_pct
+    """
+    sym = str(row.get("symbol") or row.get("ticker") or "").upper()
+    price = _to_float(row.get("price"))
+    chg   = _to_float(row.get("change"))
+    pct   = _to_float(row.get("change_pct"))
+
+    # try to infer prev from price & change when missing
+    prev = None
+    if price is not None and chg is not None:
+        prev = price - chg
+
+    normalized_reason: List[str] = []
+    was_clamped = False
+
+    # if pct missing or non-numeric, compute from price/prev
+    if pct is None:
+        pct = _safe_pct(price, prev)
+        normalized_reason.append("computed_percent_from_prices")
+
+    # heuristic: if |pct| huge but treating pct as dollars makes sense, fix it
+    if abs(pct) > 60 and prev and prev != 0:
+        as_dollars_pct = (pct / prev) * 100.0
+        if abs(as_dollars_pct) <= 60:
+            # pct was actually dollar change; recompute correctly
+            chg = pct
+            pct = _safe_pct(price, prev)
+            normalized_reason.append("vendor_percent_was_dollars")
+
+    # if price is wildly off vs prev (vendor glitch), rebuild price from prev + change
+    if prev and price and (price <= (1 - HARD_LAST_MULTIPLIER) * prev or price >= HARD_LAST_MULTIPLIER * prev):
+        if chg is not None:
+            recomputed_last = prev + chg
+            if abs(_safe_pct(recomputed_last, prev)) < abs(_safe_pct(price, prev)):
+                price = recomputed_last
+                pct = _safe_pct(price, prev)
+                normalized_reason.append("recomputed_last_from_change")
+
+    # final consistency nudge if pct & chg disagree badly
+    if prev and pct is not None and chg is None:
+        chg = (pct / 100.0) * prev
+
+    # DISPLAY clamp only
+    lb, ub = CLAMP_PCT_BOUNDS
+    pct_raw = pct
+    if pct < lb:
+        pct = lb
+        was_clamped = True
+    elif pct > ub:
+        pct = ub
+        was_clamped = True
+    chg_display = ((pct / 100.0) * (prev if prev else price)) if (prev or price) else chg
+
+    return {
+        "symbol": sym,
+        "price": price,
+        "change": chg,
+        "change_pct": pct_raw,                 # original/unclamped vendor percent (may be wrong)
+        "display_change_pct": round(pct, 4),   # <-- use this on the frontend tiles
+        "display_change": round((chg_display or 0.0), 4),
+        "normalized": bool(normalized_reason or was_clamped),
+        "normalized_reason": "|".join(normalized_reason) if normalized_reason else None,
+        "was_clamped": was_clamped,
+        "clamp_bounds": {"min": lb, "max": ub} if was_clamped else None,
+    }
+
+def _normalize_quote_payload(q: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes /quote output and adds display fields.
+    Expected keys from service: current_price, last_close, change_pct (maybe)
+    """
+    out = dict(q or {})
+    price = _to_float(out.get("current_price"))
+    last  = _to_float(out.get("last_close"))
+    pct   = _to_float(out.get("change_pct"))
+
+    reasons: List[str] = []
+    was_clamped = False
+
+    if pct is None:
+        pct = _safe_pct(price, last)
+        reasons.append("computed_percent_from_prices")
+
+    # vendor-dollars-as-percent fix
+    if abs(pct) > 60 and last and last != 0:
+        as_dollars_pct = (pct / last) * 100.0
+        if abs(as_dollars_pct) <= 60:
+            # pct was dollars
+            pct = _safe_pct(price, last)
+            reasons.append("vendor_percent_was_dollars")
+
+    # hard sanity for 'price' vs last
+    if last and price and (price <= (1 - HARD_LAST_MULTIPLIER) * last or price >= HARD_LAST_MULTIPLIER * last):
+        # rebuild price if change available
+        chg = _to_float(out.get("change"))
+        if chg is not None:
+            recomputed = last + chg
+            if abs(_safe_pct(recomputed, last)) < abs(_safe_pct(price, last)):
+                price = recomputed
+                reasons.append("recomputed_last_from_change")
+
+    # display clamp
+    lb, ub = CLAMP_PCT_BOUNDS
+    pct_raw = pct
+    if pct < lb:
+        pct = lb; was_clamped = True
+    elif pct > ub:
+        pct = ub; was_clamped = True
+
+    out["display_change_pct"] = round(pct, 4)
+    out["display_change"] = round(((pct / 100.0) * (last if last else price or 0.0)), 4)
+    out["normalized"] = bool(reasons or was_clamped)
+    out["normalized_reason"] = "|".join(reasons) if reasons else None
+    out["was_clamped"] = was_clamped
+    out["clamp_bounds"] = {"min": lb, "max": ub} if was_clamped else None
+    return out
+
+# ----------------------- helpers (existing) -----------------------
 def _is_crypto(symbol: str) -> bool:
     return "-" in (symbol or "").upper()  # BTC-USD etc.
 
@@ -70,51 +213,6 @@ async def _pin_last_close_async(symbol: str, dates: List[str], closes: List[floa
             closes[-1] = float(last_close)
     except Exception:
         pass
-
-def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
-    """
-    Accepts: None, ["LSTM","ARIMA"], ["LSTM,ARIMA"] (comma string)
-    Case-insensitive; maps RF->RandomForest, XGB->XGBoost.
-    """
-    default = ["LSTM", "ARIMA", "RandomForest"]
-    if not models:
-        return default
-    out: List[str] = []
-    for m in models:
-        if m is None:
-            continue
-        for part in str(m).split(","):
-            name = part.strip()
-            if not name:
-                continue
-            up = name.upper()
-            if up in {"LSTM", "ARIMA"}:
-                out.append(up)
-            elif up in {"RF", "RANDOMFOREST"}:
-                out.append("RandomForest")
-            elif up in {"XGB", "XGBOOST"}:
-                out.append("XGBoost")
-            else:
-                out.append(name)
-    seen = set(); dedup: List[str] = []
-    for m in out:
-        if m not in seen:
-            seen.add(m); dedup.append(m)
-    return dedup or default
-
-def _this_week_range() -> Tuple[str, str]:
-    """Mon..Sun ISO range for the current week (local time)."""
-    today = date.today()
-    monday = today - timedelta(days=today.weekday())  # 0=Mon
-    sunday = monday + timedelta(days=6)
-    return monday.isoformat(), sunday.isoformat()
-
-def _to_float(x):
-    try:
-        s = str(x).strip().replace("%", "").replace(",", "")
-        return float(s)
-    except Exception:
-        return None
 
 def _norm_symbol(s: str) -> str:
     return (s or "").strip().upper()
@@ -195,7 +293,7 @@ async def diag(ticker: str = "AAPL"):
         "quote_err": q_err,
     }
 
-# ----------------------- predictions -----------------------
+# ----------------------- predictions (unchanged) -----------------------
 class PredictRequest(BaseModel):
     ticker: str
     models: List[str]
@@ -244,19 +342,42 @@ async def predict(req: PredictRequest):
 @router.get("/predict_history", summary="Predict History")
 async def predict_history(
     ticker: str,
-    days: int = 12,  # last ~2 weeks of trading days
+    days: int = 12,
     models: List[str] = Query(default=None),
 ):
-    """
-    For each of the last `days` TARGET DATES (most-recent last), return:
-      - actual close on that date
-      - what each model would have predicted for that date using only data up to the prior trading day
-    """
+    # ... (UNCHANGED — keep your existing block) ...
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
+
+    def _normalize_models_param(models: Optional[List[str]]) -> List[str]:
+        default = ["LSTM", "ARIMA", "RandomForest"]
+        if not models:
+            return default
+        out: List[str] = []
+        for m in models:
+            if m is None:
+                continue
+            for part in str(m).split(","):
+                name = part.strip()
+                if not name:
+                    continue
+                up = name.upper()
+                if up in {"LSTM", "ARIMA"}:
+                    out.append(up)
+                elif up in {"RF", "RANDOMFOREST"}:
+                    out.append("RandomForest")
+                elif up in {"XGB", "XGBOOST"}:
+                    out.append("XGBoost")
+                else:
+                    out.append(name)
+        seen = set(); dedup: List[str] = []
+        for m in out:
+            if m not in seen:
+                seen.add(m); dedup.append(m)
+        return dedup or default
+
     models = _normalize_models_param(models)
 
-    # Provider call in thread, bounded
     try:
         series = await asyncio.wait_for(
             asyncio.to_thread(get_daily_closes_with_dates, symbol, days + 40),
@@ -271,7 +392,6 @@ async def predict_history(
     if not _is_crypto(symbol):
         dates, closes = _filter_equity_calendar(dates, closes)
 
-    # Rescue sparse feeds with yfinance
     if len(closes) < 2:
         try:
             import yfinance as yf
@@ -332,7 +452,8 @@ async def predict_history(
 # ----------------------- Quote / Earnings / Market -----------------------
 @router.get("/quote", summary="Quote Endpoint")
 async def quote_endpoint(ticker: str):
-    return await asyncio.to_thread(get_quote, ticker)
+    q = await asyncio.to_thread(get_quote, ticker)
+    return _normalize_quote_payload(q)
 
 @router.get("/earnings", summary="Earnings Endpoint")
 async def earnings_endpoint(ticker: str):
@@ -340,7 +461,25 @@ async def earnings_endpoint(ticker: str):
 
 @router.get("/market", summary="Market Endpoint")
 async def market_endpoint():
-    return await asyncio.to_thread(get_market_breadth)
+    """
+    If your market endpoint returns index tiles (e.g., SPY/QQQ/DIA),
+    run them through the same normalizer for consistency.
+    """
+    data = await asyncio.to_thread(get_market_breadth)
+    # If data already a dict with 'items': normalize each if it looks like a tile
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        items = []
+        for r in data["items"]:
+            # map common keys so _normalize_tile_row can handle them
+            row = {
+                "symbol": r.get("symbol") or r.get("ticker"),
+                "price": r.get("price") or r.get("last"),
+                "change": r.get("change"),
+                "change_pct": r.get("change_pct") or r.get("percent"),
+            }
+            items.append(_normalize_tile_row(row))
+        return {"items": items, "ts": int(time.time() * 1000)}
+    return data
 
 # ----------------------- Live quote stream (SSE) -----------------------
 @router.get("/quote_stream", summary="Quote Stream")
@@ -351,11 +490,12 @@ async def quote_stream(ticker: str, interval: float = 5.0):
         try:
             while True:
                 q = await asyncio.to_thread(get_quote, ticker)
+                q = _normalize_quote_payload(q)
                 payload = {
                     "ticker": q.get("ticker", str(ticker).upper()),
                     "current_price": q.get("current_price"),
                     "last_close": q.get("last_close"),
-                    "change_pct": q.get("change_pct"),
+                    "change_pct": q.get("display_change_pct"),  # use display-safe %
                     "ts": int(time.time()),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
@@ -365,13 +505,10 @@ async def quote_stream(ticker: str, interval: float = 5.0):
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ----------------------- Closes for charts (dates + up to 5y) -----------------------
+# ----------------------- Closes for charts (unchanged logic) -----------------------
 @router.get("/closes", summary="Closes Endpoint")
 async def closes_endpoint(ticker: str, days: int = 60):
-    """
-    Returns up to ~5 years of daily closes with aligned ISO dates, most-recent last.
-    { "ticker": "AAPL", "dates": [...], "closes": [...] }
-    """
+    # (keep as in your file)
     symbol = str(ticker).upper()
     days = max(2, min(int(days), 1825))
 
@@ -390,7 +527,6 @@ async def closes_endpoint(ticker: str, days: int = 60):
         dates, closes = _filter_equity_calendar(dates, closes)
         await _pin_last_close_async(symbol, dates, closes)
 
-    # Rescue sparse feeds with yfinance
     if len(closes) < 1:
         try:
             import yfinance as yf
@@ -409,16 +545,12 @@ async def closes_endpoint(ticker: str, days: int = 60):
 
     return {"ticker": symbol, "dates": dates, "closes": closes}
 
-# ----------------------- Quick stats (52w high/low only) -----------------------
+# ----------------------- Quick stats (unchanged) -----------------------
 @router.get("/stats", summary="Stats Endpoint")
 async def stats_endpoint(ticker: str):
-    """
-    Returns 52-week stats. Tries service; if missing/invalid, computes from yfinance.
-    Also provides alias keys: high, low, high52, low52 (for UI compatibility).
-    """
+    # (keep as in your file)
     symbol = str(ticker).upper()
 
-    # Try service first
     try:
         stats = await asyncio.to_thread(get_52w_stats, symbol) or {}
         hi = stats.get("high_52w"); lo = stats.get("low_52w")
@@ -433,7 +565,6 @@ async def stats_endpoint(ticker: str):
     except Exception:
         pass
 
-    # Fallback: compute from yfinance off the event loop
     try:
         import yfinance as yf
         df = await asyncio.to_thread(
@@ -453,7 +584,6 @@ async def stats_endpoint(ticker: str):
     except Exception:
         pass
 
-    # As a last resort, placeholders
     return {
         "ticker": symbol,
         "high_52w": None, "low_52w": None,
@@ -465,15 +595,8 @@ async def stats_endpoint(ticker: str):
 @router.get("/movers", summary="Movers")
 async def movers():
     """
-    Returns both gainers and losers:
-    { "gainers": [...], "losers": [...] }
-    Strategy:
-      1) Try Alpha Vantage TOP_GAINERS_LOSERS (fast when available, 6s cap)
-      2) Fallback with a hard time budget:
-         - Cap universe size
-         - For each symbol: try get_quote (1.5s), else get_daily_closes(3) (1.5s)
-         - Overall wall time capped (~7.5s)
-    Always responds within ~8–9s.
+    Returns normalized gainers/losers with display-safe %:
+      { "gainers": [...], "losers": [...], "source": "alphavantage|fallback-local" }
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
     out_gainers: List[Dict[str, Any]] = []
@@ -495,16 +618,12 @@ async def movers():
             out_gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
             out_losers  = [_alpha_to_common(x) for x in losers_raw][:25]
 
-            def _valid(rows):
-                k = 0
-                for x in rows:
-                    if isinstance(x.get("price"), (int, float)) and isinstance(x.get("change_pct"), (int, float)):
-                        k += 1
-                    if k >= 5:
-                        return True
-                return False
+            # normalize + clamp
+            out_gainers = [_normalize_tile_row(x) for x in out_gainers]
+            out_losers  = [_normalize_tile_row(x) for x in out_losers]
 
-            if _valid(out_gainers) or _valid(out_losers):
+            # accept if looks sane
+            if any(isinstance(x.get("price"), (int, float)) for x in out_gainers + out_losers):
                 return {"gainers": out_gainers, "losers": out_losers, "source": used_source}
         except Exception:
             pass  # fall through to local fallback
@@ -514,46 +633,33 @@ async def movers():
     universe = _universe_from_env()[:96]  # cap to keep it snappy
 
     async def compute_row(sym: str) -> Optional[Dict[str, Any]]:
-        # Try quote first (fast, includes intraday change)
+        # Try quote first
         try:
             q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=1.5)
-            price = float(q.get("current_price"))
-            last  = float(q.get("last_close"))
-            pct   = q.get("change_pct")
-            pctf  = None
-            try:
-                pctf = float(pct)
-            except Exception:
-                pctf = None
-            # If provider didn't give a pct, compute from price & last
-            if (pctf is None or pctf == 0.0) and isinstance(price, float) and isinstance(last, float) and last:
-                pctf = ((price - last) / last) * 100.0
+            price = _to_float(q.get("current_price"))
+            last  = _to_float(q.get("last_close"))
+            pct   = _to_float(q.get("change_pct"))
+            if (pct is None or pct == 0.0) and price is not None and last:
+                pct = ((price - last) / last) * 100.0
             chg = None
-            try:
+            if price is not None and last is not None:
                 chg = price - last
-            except Exception:
-                pass
-            if isinstance(price, float) and isinstance(pctf, float):
-                return {"symbol": sym, "price": price, "change": chg, "change_pct": pctf}
+            if isinstance(price, float) and isinstance(pct, float):
+                return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
         except Exception:
             pass
 
-        # Then try last two historical closes (very reliable)
+        # Then try last two closes
         try:
             closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 3), timeout=1.5)
             closes = [float(x) for x in closes if isinstance(x, (int, float, str))]
             if len(closes) >= 2:
-                last = float(closes[-1])
-                prev = float(closes[-2])
-                if prev and prev != 0:
-                    chg = last - prev
-                    pct = (chg / prev) * 100.0
-                else:
-                    chg, pct = 0.0, 0.0
+                last = float(closes[-1]); prev = float(closes[-2])
+                chg = last - prev
+                pct = (chg / prev) * 100.0 if prev else 0.0
                 return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
         except Exception:
             pass
-
         return None
 
     tasks = [asyncio.create_task(compute_row(s)) for s in universe]
@@ -571,10 +677,14 @@ async def movers():
 
     if rows:
         rows.sort(key=lambda x: (x.get("change_pct") or 0.0), reverse=True)
-        out_gainers = rows[:25]
-        out_losers = list(reversed(rows[-25:] if len(rows) >= 25 else rows[:25]))
+        gainers = rows[:25]
+        losers = list(reversed(rows[-25:] if len(rows) >= 25 else rows[:25]))
     else:
-        out_gainers, out_losers = [], []
+        gainers, losers = [], []
+
+    # normalize + clamp
+    out_gainers = [_normalize_tile_row(x) for x in gainers]
+    out_losers  = [_normalize_tile_row(x) for x in losers]
 
     return {"gainers": out_gainers, "losers": out_losers, "source": used_source, "partial": bool(done)}
 
@@ -587,36 +697,3 @@ async def top_gainers():
 async def top_losers():
     res = await movers()
     return res.get("losers", [])
-
-# ----------------------- Earnings Calendar (this week) -----------------------
-@router.get("/earnings_week", summary="Earnings Week")
-async def earnings_week():
-    """
-    Returns an array of earnings items for the current week: [{date, symbol, name, session}]
-    """
-    token = os.getenv("FINNHUB_API_KEY")
-    if not token:
-        return {"items": [], "error": "FINNHUB_API_KEY missing"}
-
-    start_iso, end_iso = _this_week_range()
-    url = "https://finnhub.io/api/v1/calendar/earnings"
-    params = {"from": start_iso, "to": end_iso, "token": token}
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(url, params=params)
-        data = r.json() if r.content else {}
-
-    rows = data.get("earningsCalendar") or data.get("earnings") or []
-    out: List[Dict[str, Any]] = []
-    for it in rows:
-        dt = (it.get("date") or it.get("reportDate") or "")[:10]
-        sym = _norm_symbol(it.get("symbol") or it.get("ticker"))
-        session = (it.get("hour") or it.get("time") or "").upper()
-        if session not in {"BMO", "AMC"}:
-            session = "UNK"
-        name = it.get("company") or it.get("name") or sym
-        if sym and dt:
-            out.append({"date": dt, "symbol": sym, "name": name, "session": session})
-
-    out.sort(key=lambda x: (x["date"], x["symbol"]))
-    return {"items": out[:500]}

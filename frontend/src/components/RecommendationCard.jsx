@@ -1,5 +1,4 @@
 // frontend/src/components/RecommendationCard.jsx
-
 export default function RecommendationCard({ recommendation }) {
   if (!recommendation) {
     return (
@@ -12,7 +11,8 @@ export default function RecommendationCard({ recommendation }) {
 
   const action = String(recommendation.action || "Hold");
   const model = recommendation.model || "—";
-  const avg = Number(recommendation.avgChangePct ?? 0);
+  const avgNum = Number(recommendation.avgChangePct);
+  const avg = Number.isFinite(avgNum) ? avgNum : 0;
 
   const pillClass =
     action === "Buy" ? "pill pill--good" :
@@ -38,7 +38,6 @@ export default function RecommendationCard({ recommendation }) {
         Proxy-MAPE = average |pred − last_close| / last_close
       </div>
 
-      {/* scoped styles */}
       <style>{`
         .rec-row{
           display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -68,11 +67,6 @@ export default function RecommendationCard({ recommendation }) {
         }
         .pill--neutral{
           color: var(--muted);
-        }
-
-        @media (max-width: 720px){
-          .rec-sub{ font-size: 0.9rem }
-          .pill{ padding: 3px 9px }
         }
       `}</style>
     </div>

@@ -3,14 +3,21 @@ import { fetchQuote, fetchPredict, fetchCloses, fetchStats } from "../api";
 import usePerUserStorage from "../hooks/usePerUserStorage";
 import { useAuth } from "../auth/AuthContext";
 
+/* ---------- small helpers ---------- */
+const clampPct = (v, lo = -25, hi = 25) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : 0;
+};
+const fmtMoney = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : "—");
+
 const MAX_TICKERS = 3;
 const SAVE_KEY_BASE = "COMPARE_LAST_V1";
 
 export default function CompareMode({
-  symbols,                     // optional controlled list
-  onSymbolsChange,             // optional setter for controlled list
+  symbols,
+  onSymbolsChange,
   defaultModels = ["LSTM", "ARIMA"],
-  rememberSession = false,     // default OFF so placeholders never sneak in
+  rememberSession = false,
   onExit,
 }) {
   const { user } = useAuth();
@@ -58,25 +65,18 @@ export default function CompareMode({
     };
   }, []);
 
-  // 🔴 CLEAR transient state on user change (prevents cross-account bleed)
+  // 🔴 CLEAR transient state on user change
   useEffect(() => {
-    // cancel any in-flight requests from previous user/scope
     try { abortsRef.current.forEach((c) => c?.abort?.()); } catch {}
     abortsRef.current = [];
-
-    // invalidate any in-flight load() calls from the previous user
     reqVerRef.current++;
-
-    // clear UI state
     upsert([]);
     setRows([]);
     setInput("");
-    // optionally reset strategy:
-    // setWinnerStrategy("long");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope]);
 
-  // 🔁 restore last session (scoped to user) — only if UNCONTROLLED
+  // 🔁 restore last session (UNCONTROLLED only)
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     try {
@@ -91,7 +91,7 @@ export default function CompareMode({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rememberSession, isControlled, SAVE_KEY]);
 
-  // 💾 persist session (scoped to user) — only if UNCONTROLLED
+  // 💾 persist session (UNCONTROLLED only)
   useEffect(() => {
     if (!rememberSession || isControlled) return;
     const payload = { tickers: selected, strategy: winnerStrategy };
@@ -152,7 +152,7 @@ export default function CompareMode({
   const load = useCallback(async () => {
     const myVer = ++reqVerRef.current;
 
-    // new batch: cancel any previous and reset controllers
+    // cancel previous
     try { abortsRef.current.forEach((c) => c?.abort?.()); } catch {}
     abortsRef.current = [];
 
@@ -207,7 +207,7 @@ export default function CompareMode({
 
         return { symbol: t, quote, results, closes, dates, stats, metrics, recommendation, error: null };
       } catch (e) {
-        if (e?.name === "AbortError") return null; // ignore canceled task
+        if (e?.name === "AbortError") return null;
         return {
           symbol: t,
           quote: null,
@@ -355,7 +355,9 @@ function CompareColumn({ row }) {
 
   const prevPriceRef = useRef(null);
   const [blinkClass, setBlinkClass] = useState("");
-  const tweenedChange = useTweenNumber(quote?.change_pct ?? 0, { duration: 450 });
+  // prefer display_change_pct with clamp; fallback to change_pct
+  const pctRaw = quote?.display_change_pct ?? quote?.change_pct ?? 0;
+  const tweenedChange = useTweenNumber(clampPct(pctRaw), { duration: 450 });
 
   useEffect(() => {
     const next = Number(quote?.current_price);
@@ -369,6 +371,11 @@ function CompareColumn({ row }) {
   }, [quote?.current_price]);
 
   const [showBig, setShowBig] = useState(false);
+
+  const lastCloseStr = fmtMoney(quote?.last_close);
+  const nowStr = fmtMoney(quote?.current_price);
+  const isUp = Number(tweenedChange) >= 0;
+  const pctStr = `${isUp ? "▲" : "▼"} ${Math.abs(Number(tweenedChange)).toFixed(2)}%`;
 
   return (
     <div className="card" style={{ position: "relative" }}>
@@ -388,19 +395,19 @@ function CompareColumn({ row }) {
         </div>
         {quote ? (
           <>
-            <div>Last Close: ${Number(quote.last_close).toFixed(2)}</div>
+            <div>Last Close: {lastCloseStr}</div>
             <div style={{ marginTop: 4 }} className={blinkClass}>
-              Now: <strong>${Number(quote.current_price).toFixed(2)}</strong>{" "}
+              Now: <strong>{nowStr}</strong>{" "}
               <span
                 style={{
-                  color: tweenedChange >= 0 ? "#2e7d32" : "#c62828",
+                  color: isUp ? "#2e7d32" : "#c62828",
                   fontWeight: 600,
                   display: "inline-flex",
                   alignItems: "center",
                   gap: 4
                 }}
               >
-                {tweenedChange >= 0 ? "▲" : "▼"} {Math.abs(Number(tweenedChange)).toFixed(2)}%
+                {pctStr}
               </span>
             </div>
             <div style={{ marginTop: 8 }}>
@@ -445,7 +452,7 @@ function CompareColumn({ row }) {
                 {recommendation.action}
               </strong>{" "}
               <span className="muted" style={{ fontSize: 12 }}>
-                (avg change {Number(recommendation.avgChangePct).toFixed(2)}%)
+                (avg change {Number(recommendation.avgChangePct ?? 0).toFixed(2)}%)
               </span>
             </div>
             <div className="muted" style={{ fontSize: 12 }}>
@@ -474,7 +481,7 @@ function CompareColumn({ row }) {
                   <tr key={model}>
                     <td>{model}</td>
                     {predictions.map((v, i) => (
-                      <td key={i}>{Number(v).toFixed(2)}</td>
+                      <td key={i}>{Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "—"}</td>
                     ))}
                   </tr>
                 ))}
@@ -520,7 +527,7 @@ function useTweenNumber(target = 0, { duration = 450 } = {}) {
   return val;
 }
 
-/** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
+/** Interactive SVG line chart with hover and pan/zoom */
 function InteractiveChart({ data = [], labels = [], width = 220, height = 60, big = false }) {
   const pad = 10;
   const w = width - pad * 2;
@@ -649,33 +656,19 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      {/* background */}
       <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-
-      {/* polyline */}
       <polyline
         fill="none"
         stroke={lastUp ? "#2e7d32" : "#c62828"}
         strokeWidth={big ? 2.5 : 2}
         points={points}
       />
-
-      {/* cursor + crosshair */}
       {cursorX != null && (
         <>
           <line x1={showX} x2={showX} y1={pad} y2={pad + h} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
-          {/* tooltip bubble */}
           <g>
-            <rect
-              x={boxX}
-              y={boxY}
-              width={textW}
-              height="22"
-              rx="6"
-              fill="rgba(0,0,0,0.65)"
-              stroke="rgba(255,255,255,0.25)"
-            />
+            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
             <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {hoverLabel}
             </text>
@@ -686,7 +679,6 @@ function InteractiveChart({ data = [], labels = [], width = 220, height = 60, bi
   );
 }
 
-/** Minimal modal (no deps) */
 function MagnifyModal({ title, children, onClose }) {
   return (
     <div
