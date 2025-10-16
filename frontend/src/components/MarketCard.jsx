@@ -1,5 +1,61 @@
 // frontend/src/components/MarketCard.jsx
-// Prefers backend's display_change_pct (already clamped/normalized) with graceful fallback.
+
+// Strict parsing + normalization for market tiles
+const EPS = 1e-6;
+const toNum = (v) => {
+  if (v === null || v === undefined) return NaN;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const s = v.trim().replace(/[%,$]/g, "");
+    if (!s) return NaN;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  return NaN;
+};
+const isNum = (v) => Number.isFinite(toNum(v));
+const nearZero = (v) => Math.abs(toNum(v)) < EPS;
+
+const clampPct = (v, lo = -25, hi = 25) => {
+  const n = toNum(v);
+  return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : NaN;
+};
+const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
+const fmtPct = (v) => (isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}${toNum(v).toFixed(2)}%` : "—");
+
+// derive a sane % change for one tile worth of data
+function derivePct(data = {}) {
+  // 1) explicit normalized value from backend if available
+  if (isNum(data.display_change_pct)) return clampPct(data.display_change_pct);
+
+  // 2) provider % as-is (with clamp)
+  if (isNum(data.change_pct)) return clampPct(data.change_pct);
+
+  // 3) compute from price vs last_close, else vs open
+  const price = toNum(
+    data.extended_price ??
+      data.postmarket_price ??
+      data.after_hours_price ??
+      data.premarket_price ??
+      data.current_price ??
+      data.price
+  );
+  const lastClose = toNum(
+    data.last_close ??
+      data.previous_close ??
+      data.prev_close ??
+      data.regularMarketPreviousClose
+  );
+  const open = toNum(data.open);
+
+  if (isNum(price) && isNum(lastClose) && !nearZero(lastClose)) {
+    return clampPct(((price - lastClose) / lastClose) * 100);
+  }
+  if (isNum(price) && isNum(open) && !nearZero(open)) {
+    return clampPct(((price - open) / open) * 100);
+  }
+  return NaN;
+}
 
 export default function MarketCard({ market }) {
   const entries = market ? Object.entries(market) : [];
@@ -13,49 +69,49 @@ export default function MarketCard({ market }) {
     );
   }
 
-  const clamp = (v, lo = -25, hi = 25) => {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return NaN;
-    return Math.max(lo, Math.min(hi, n));
-  };
-
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>📊 Market Snapshot</h3>
 
       <div className="mk-grid">
-        {entries.map(([sym, data]) => {
-          const price = Number(data?.current_price ?? data?.price ?? data?.last);
-          const rawPct = Number(
-            data?.display_change_pct ?? data?.change_pct ?? data?.percent ?? data?.changePercent
-          );
-          const pct = Number.isFinite(rawPct) ? clamp(rawPct) : NaN;
-          const hasPct = Number.isFinite(pct);
-          const up = hasPct ? pct >= 0 : null;
+        {entries.map(([sym, raw]) => {
+          // normalize each tile
+          const price =
+            toNum(
+              raw.extended_price ??
+                raw.postmarket_price ??
+                raw.after_hours_price ??
+                raw.premarket_price ??
+                raw.current_price ??
+                raw.price
+            );
+          const pct = derivePct(raw);
+          const hasPct = isNum(pct);
+          const up = hasPct ? toNum(pct) >= 0 : null;
 
           return (
             <div
               key={sym}
               className="mk-tile"
               role="group"
-              aria-label={`${sym} ${hasPct ? `${up ? "up" : "down"} ${Math.abs(pct).toFixed(2)} percent` : ""}`}
+              aria-label={`${sym} ${hasPct ? `${up ? "up" : "down"} ${Math.abs(toNum(pct)).toFixed(2)} percent` : ""}`}
             >
               <div className="mk-head">
                 <div className="mk-sym">{sym}</div>
                 {hasPct ? (
                   <span
                     className={`mk-pill ${up ? "mk-pill--up" : "mk-pill--down"}`}
-                    title={`${up ? "Up" : "Down"} ${Math.abs(pct).toFixed(2)}%`}
-                    aria-label={`${up ? "Up" : "Down"} ${Math.abs(pct).toFixed(2)} percent`}
+                    title={`${up ? "Up" : "Down"} ${Math.abs(toNum(pct)).toFixed(2)}%`}
+                    aria-label={`${up ? "Up" : "Down"} ${Math.abs(toNum(pct)).toFixed(2)} percent`}
                   >
-                    {up ? "▲" : "▼"} {Math.abs(pct).toFixed(2)}%
+                    {up ? "▲" : "▼"} {Math.abs(toNum(pct)).toFixed(2)}%
                   </span>
                 ) : (
                   <span className="mk-pill">—</span>
                 )}
               </div>
               <div className="mk-price">
-                {Number.isFinite(price) ? `$${price.toFixed(2)}` : "—"}
+                {fmtMoney(price)}
               </div>
             </div>
           );
