@@ -16,7 +16,7 @@ const toNum = (v) => {
 const isNum = (v) => Number.isFinite(toNum(v));
 const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
-const clampPct = (v, lo = -25, hi = 25) => {
+const clampPct = (v, lo = -60, hi = 60) => {
   const n = toNum(v);
   return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : NaN;
 };

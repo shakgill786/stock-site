@@ -1,13 +1,11 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
-// - strict parsing (no string->0 coercion)
-// - prefers backend's display_change_pct when present
-// - derives change/% from previousClose or open
-// - hydrates via fetchQuote; robust EOD fallback (last two distinct closes) with sanity guards
-// - losers sort ascending by default; gainers descending
+// - fixes AV 25% clamp by recomputing % from $change + price
+// - hydrates any row with |%| >= 24.9
+// - earnings fallback: retry /earnings_week/ on 405
 
 import { useEffect, useMemo, useState } from "react";
-import { fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
+import { API_BASE, fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
 /* ---------- strict helpers & formatters ---------- */
@@ -52,6 +50,17 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
+/* ---------- helpers for clamp fix ---------- */
+const looksClamped = (pct) => isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
+
+/** recompute % from price & $change if we can (base = price - change) */
+const pctFromPriceChange = (price, change) => {
+  if (!isNum(price) || !isNum(change)) return NaN;
+  const base = toNum(price) - toNum(change);
+  if (!isNum(base) || nearZero(base)) return NaN;
+  return (toNum(change) / base) * 100;
+};
+
 /* ---------- normalizer + derivations ---------- */
 function firstNum(obj, keys) {
   for (const k of keys) {
@@ -75,13 +84,11 @@ function normalizeRow(row) {
     "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
 
-  // prefer backend's already clamped/normalized display_change_pct if present
+  let change = firstNum(row, ["change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
   let change_pct = firstNum(row, [
-    "display_change_pct", // <- preferred
     "change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
     "changePct","percentChange","extended_change_pct","after_hours_change_pct","postmarket_change_pct",
   ]);
-  let change = firstNum(row, ["display_change", "change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
 
   const prevClose = firstNum(row, [
     "prev_close","previous_close","previousClose","priorClose",
@@ -89,35 +96,42 @@ function normalizeRow(row) {
   ]);
   const open = firstNum(row, ["open","Open"]);
 
-  // derive vs prevClose if possible
+  // 0) if feed looks "clamped" at ±25 and we have price + $change, recompute % from them
+  if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
+    const p2 = pctFromPriceChange(price, change);
+    if (isNum(p2) && Math.abs(p2) < 24.9) change_pct = p2;
+  }
+
+  // 1) derive vs prevClose if possible
   if (isNum(price) && isNum(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
     if (!isNum(change) || nearZero(change)) change = derivedChange;
-    if (!isNum(change_pct) || nearZero(change_pct)) change_pct = derivedPct;
+    if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback vs open
+  // 2) fallback vs open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
     if (!isNum(change) || nearZero(change)) change = intraday;
-    if (!isNum(change_pct) || nearZero(change_pct)) change_pct = intradayPct;
+    if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
-  // only pct? -> $ from price or prevClose
+  // 3) only pct? -> $ from price or prevClose
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // only $? -> % from price or prevClose
+  // 4) only $? -> % from price or prevClose
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose) ? prevClose : price;
-    if (isNum(base) && !nearZero(base)) change_pct = (toNum(change) / toNum(base)) * 100;
+    const p2 = isNum(base) && !nearZero(base) ? (toNum(change) / toNum(base)) * 100 : NaN;
+    if (isNum(p2)) change_pct = p2;
   }
 
-  // consistency: if signs disagree, trust % and recompute $
+  // 5) if signs disagree, trust % and recompute $
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
@@ -145,23 +159,20 @@ function pickFromQuote(q) {
   ]));
   const price = isNum(extPrice) ? extPrice : curPrice;
 
-  // prefer display_change_pct if provided by backend /quote
-  let change_pct = firstNum(q, [
-    "display_change_pct",
-    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
-    "change_pct","percent_change","regularMarketChangePercent",
-  ]);
   let change = firstNum(q, [
-    "display_change",
     "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
     "change","regularMarketChange",
   ]);
+  let change_pct = firstNum(q, [
+    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
+    "change_pct","percent_change","regularMarketChangePercent",
+  ]);
 
-  // Derive from price vs lastClose if needed
+  // Derive from price vs lastClose if needed or if feed looks clamped
   if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
-  if ((!isNum(change_pct) || nearZero(change_pct)) && isNum(change) && isNum(lastClose) && !nearZero(lastClose)) {
+  if ((!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) && isNum(change) && isNum(lastClose) && !nearZero(lastClose)) {
     change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
@@ -206,8 +217,8 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  // reject absurd % (splits/bad feed) for fallback
-  if (!Number.isFinite(pct) || Math.abs(pct) > 25) return null;
+  // reject absurd % (splits/bad feed)
+  if (!Number.isFinite(pct) || Math.abs(pct) > 60) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
@@ -221,8 +232,11 @@ async function hydrateRows(rows) {
       i,
       sym: r.symbol,
       missing:
-        !(isNum(r.change) && !nearZero(r.change)) &&
-        !(isNum(r.change_pct) && !nearZero(r.change_pct)),
+        // Previously: only when change/percent were zero/missing
+        (!(isNum(r.change) && !nearZero(r.change)) &&
+         !(isNum(r.change_pct) && !nearZero(r.change_pct)))
+        // NEW: also hydrate when the row looks "clamped" at ±25
+        || looksClamped(r.change_pct),
     }))
     .filter((x) => x.missing && x.sym);
 
@@ -238,13 +252,16 @@ async function hydrateRows(rows) {
             ...out[i],
             price: isNum(out[i].price) ? out[i].price : picked.price,
             change: isNum(out[i].change) && !nearZero(out[i].change) ? out[i].change : picked.change,
-            change_pct: isNum(out[i].change_pct) && !nearZero(out[i].change_pct) ? out[i].change_pct : picked.change_pct,
+            change_pct:
+              (isNum(out[i].change_pct) && !nearZero(out[i].change_pct) && !looksClamped(out[i].change_pct))
+                ? out[i].change_pct
+                : picked.change_pct,
             last_close: firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]),
           });
 
           const hasValid =
             (isNum(merged.change) && !nearZero(merged.change)) ||
-            (isNum(merged.change_pct) && !nearZero(merged.change_pct));
+            (isNum(merged.change_pct) && !nearZero(merged.change_pct) && !looksClamped(merged.change_pct));
 
           if (hasValid) {
             out[i] = merged;
@@ -269,7 +286,7 @@ async function hydrateRows(rows) {
             /* ignore EOD fallback failure */
           }
 
-          // nothing worked; keep merged (likely zeros)
+          // nothing worked; keep merged
           out[i] = merged;
         } catch {
           /* ignore total failure */
@@ -557,11 +574,11 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
-      // Normalize first (prefer backend display_change_pct when present)
+      // Normalize first
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      // Hydrate rows that still lack real deltas
+      // Hydrate rows that still lack real deltas OR look clamped at ±25
       const [gHydrated, lHydrated] = await Promise.all([hydrateRows(g0), hydrateRows(l0)]);
 
       // Keep only rows with a real (non-zero) move
@@ -572,7 +589,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setGainers(gHydrated.filter(keep));
       setLosers(lHydrated.filter(keep));
 
-      // base feed string
+      // source string (base feed only)
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
@@ -583,16 +600,40 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setLoadingMovers(false);
     }
 
-    // Earnings
+    // Earnings (GET /earnings_week; if 405, try /earnings_week/)
     setLoadingEarnings(true);
     setErrEarnings("");
     try {
-      const wk = await fetchEarningsWeek();
+      let wk = await fetchEarningsWeek();
+      // retry with trailing slash if proxy returns 405
+      if (!wk && typeof wk !== "object") wk = {};
+      if (!Array.isArray(wk.items) && wk?.error?.includes?.("405")) {
+        throw new Error("405");
+      }
       const items = Array.isArray(wk?.items) ? wk.items : [];
+      // fallback attempt on explicit 405
+      if (!items.length) {
+        try {
+          const res = await fetch(`${API_BASE}/earnings_week/`, {
+            headers: { Accept: "application/json", "Cache-Control": "no-cache", Pragma: "no-cache" },
+            cache: "no-store",
+            method: "GET",
+          });
+          if (res.ok) {
+            const alt = await res.json();
+            if (Array.isArray(alt?.items)) {
+              setEarnings(alt.items.slice(0, 500));
+              if (!alt.items.length && alt?.error) setErrEarnings(alt.error);
+              return;
+            }
+          }
+        } catch {/* ignore */}
+      }
       setEarnings(items.slice(0, 500));
       if (!items.length && wk?.error) setErrEarnings(wk.error);
     } catch (e) {
-      setErrEarnings(e?.message || "Failed to load earnings.");
+      setErrEarnings(e?.message === "405" ? "405 – Method Not Allowed (retrying with trailing slash failed)" :
+        (e?.message || "Failed to load earnings."));
       setEarnings([]);
     } finally {
       setLoadingEarnings(false);
@@ -671,7 +712,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
           justify-content: flex-end;
           align-items: center;
         }
-        /* keep the toolbar button compact even if global .btn sets width:100% */
         .he-toolbar .btn { width: auto !important; min-width: unset; display: inline-flex; align-items: center; }
         .he-refresh { padding: 6px 10px; font-size: 12px; }
 
