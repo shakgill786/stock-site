@@ -503,13 +503,33 @@ export async function fetchTopLosers(opts) {
   );
 }
 
+// 405-proof (retry with trailing slash) for proxies that require it
 export async function fetchEarningsWeek(opts) {
+  // first try as-is
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
-  return handle(
-    await fetchWithRetry(url, {
-      headers: maybeAuth(defaultGetHeaders),
-      cache: "no-store",
-      ...(opts || {}),
-    })
-  );
+  try {
+    return handle(
+      await fetchWithRetry(url, {
+        headers: maybeAuth(defaultGetHeaders),
+        cache: "no-store",
+        ...(opts || {}),
+      })
+    );
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.includes("405")) {
+      const path = EARNINGS_WEEK_ENDPOINT.endsWith("/")
+        ? EARNINGS_WEEK_ENDPOINT
+        : EARNINGS_WEEK_ENDPOINT + "/";
+      const url2 = buildURL(path);
+      return handle(
+        await fetchWithRetry(url2, {
+          headers: maybeAuth(defaultGetHeaders),
+          cache: "no-store",
+          ...(opts || {}),
+        })
+      );
+    }
+    throw e;
+  }
 }

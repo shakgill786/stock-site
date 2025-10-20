@@ -31,9 +31,12 @@ def _to_float(x):
 
 def _safe_pct(last: Optional[float], prev: Optional[float]) -> float:
     try:
-        if last is None or prev is None: return 0.0
-        if not isinstance(last, (int, float)) or not isinstance(prev, (int, float)): return 0.0
-        if prev == 0 or math.isnan(last) or math.isnan(prev): return 0.0
+        if last is None or prev is None:
+            return 0.0
+        if not isinstance(last, (int, float)) or not isinstance(prev, (int, float)):
+            return 0.0
+        if prev == 0 or math.isnan(last) or math.isnan(prev):
+            return 0.0
         return ((float(last) - float(prev)) / float(prev)) * 100.0
     except Exception:
         return 0.0
@@ -82,7 +85,7 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 pct = _safe_pct(price, prev)
                 normalized_reason.append("recomputed_last_from_change")
 
-    # final consistency nudge if pct & chg disagree badly
+    # final consistency: if only pct present, synthesize $ change
     if prev and pct is not None and chg is None:
         chg = (pct / 100.0) * prev
 
@@ -131,13 +134,11 @@ def _normalize_quote_payload(q: Dict[str, Any]) -> Dict[str, Any]:
     if abs(pct) > 60 and last and last != 0:
         as_dollars_pct = (pct / last) * 100.0
         if abs(as_dollars_pct) <= 60:
-            # pct was dollars
             pct = _safe_pct(price, last)
             reasons.append("vendor_percent_was_dollars")
 
     # hard sanity for 'price' vs last
     if last and price and (price <= (1 - HARD_LAST_MULTIPLIER) * last or price >= HARD_LAST_MULTIPLIER * last):
-        # rebuild price if change available
         chg = _to_float(out.get("change"))
         if chg is not None:
             recomputed = last + chg
@@ -161,7 +162,7 @@ def _normalize_quote_payload(q: Dict[str, Any]) -> Dict[str, Any]:
     out["clamp_bounds"] = {"min": lb, "max": ub} if was_clamped else None
     return out
 
-# ----------------------- helpers (existing) -----------------------
+# ----------------------- helpers -----------------------
 def _is_crypto(symbol: str) -> bool:
     return "-" in (symbol or "").upper()  # BTC-USD etc.
 
@@ -225,6 +226,13 @@ def _alpha_to_common(item: dict) -> dict:
     change_pct = _to_float(item.get("change_percentage"))
     name = item.get("ticker") or sym  # AV doesn’t include company name here
     return {"symbol": sym, "price": price, "change": change, "change_pct": change_pct, "name": name}
+
+def _this_week_range() -> Tuple[str, str]:
+    """Mon..Sun ISO range for the current week (local time)."""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())  # 0=Mon
+    sunday = monday + timedelta(days=6)
+    return monday.isoformat(), sunday.isoformat()
 
 # Universe for fallback movers (env POPULAR_TICKERS or this default)
 _FALLBACK_UNIVERSE = [
@@ -293,7 +301,7 @@ async def diag(ticker: str = "AAPL"):
         "quote_err": q_err,
     }
 
-# ----------------------- predictions (unchanged) -----------------------
+# ----------------------- predictions -----------------------
 class PredictRequest(BaseModel):
     ticker: str
     models: List[str]
@@ -345,7 +353,6 @@ async def predict_history(
     days: int = 12,
     models: List[str] = Query(default=None),
 ):
-    # ... (UNCHANGED — keep your existing block) ...
     symbol = str(ticker).upper()
     days = max(1, min(int(days), 60))
 
@@ -470,7 +477,6 @@ async def market_endpoint():
     if isinstance(data, dict) and isinstance(data.get("items"), list):
         items = []
         for r in data["items"]:
-            # map common keys so _normalize_tile_row can handle them
             row = {
                 "symbol": r.get("symbol") or r.get("ticker"),
                 "price": r.get("price") or r.get("last"),
@@ -505,10 +511,9 @@ async def quote_stream(ticker: str, interval: float = 5.0):
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ----------------------- Closes for charts (unchanged logic) -----------------------
+# ----------------------- Closes for charts -----------------------
 @router.get("/closes", summary="Closes Endpoint")
 async def closes_endpoint(ticker: str, days: int = 60):
-    # (keep as in your file)
     symbol = str(ticker).upper()
     days = max(2, min(int(days), 1825))
 
@@ -545,10 +550,9 @@ async def closes_endpoint(ticker: str, days: int = 60):
 
     return {"ticker": symbol, "dates": dates, "closes": closes}
 
-# ----------------------- Quick stats (unchanged) -----------------------
+# ----------------------- Quick stats -----------------------
 @router.get("/stats", summary="Stats Endpoint")
 async def stats_endpoint(ticker: str):
-    # (keep as in your file)
     symbol = str(ticker).upper()
 
     try:
@@ -697,3 +701,41 @@ async def top_gainers():
 async def top_losers():
     res = await movers()
     return res.get("losers", [])
+
+# ----------------------- Earnings Calendar (this week) -----------------------
+@router.get("/earnings_week", summary="Earnings Week")
+async def earnings_week():
+    """
+    Returns an array of earnings items for the current week: [{date, symbol, name, session}]
+    """
+    token = os.getenv("FINNHUB_API_KEY")
+    if not token:
+        return {"items": [], "error": "FINNHUB_API_KEY missing"}
+
+    start_iso, end_iso = _this_week_range()
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {"from": start_iso, "to": end_iso, "token": token}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, params=params)
+        data = r.json() if r.content else {}
+
+    rows = data.get("earningsCalendar") or data.get("earnings") or []
+    out: List[Dict[str, Any]] = []
+    for it in rows:
+        dt = (it.get("date") or it.get("reportDate") or "")[:10]
+        sym = _norm_symbol(it.get("symbol") or it.get("ticker"))
+        session = (it.get("hour") or it.get("time") or "").upper()
+        if session not in {"BMO", "AMC"}:
+            session = "UNK"
+        name = it.get("company") or it.get("name") or sym
+        if sym and dt:
+            out.append({"date": dt, "symbol": sym, "name": name, "session": session})
+
+    out.sort(key=lambda x: (x["date"], x["symbol"]))
+    return {"items": out[:500]}
+
+# Trailing-slash alias to avoid 405s behind some proxies/CDNs
+@router.get("/earnings_week/", summary="Earnings Week (alias)")
+async def earnings_week_alias():
+    return await earnings_week()
