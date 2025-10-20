@@ -38,6 +38,10 @@ yfinance==0.2.65
 lxml==6.0.0
 beautifulsoup4==4.12.3
 
+# --- NLP / ML for sentiment & topics ---
+vaderSentiment==3.3.2
+scikit-learn==1.4.2
+
 # --- Misc / tooling ---
 python-dotenv==1.1.1
 watchfiles==1.1.0

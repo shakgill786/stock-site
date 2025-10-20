@@ -533,3 +533,76 @@ export async function fetchEarningsWeek(opts) {
     throw e;
   }
 }
+
+/* ---------------- Sentiment / News ---------------- */
+
+export async function fetchNewsSentiment(ticker, limit = 80, opts) {
+  const url = new URL(`${API_BASE}/sentiment/news`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchDailySentiment(ticker, limit = 120, opts) {
+  const url = new URL(`${API_BASE}/sentiment/daily`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchSentimentCorrelation(ticker, days = 120, opts) {
+  const url = new URL(`${API_BASE}/sentiment/correlate`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("days", String(days));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchSentimentMatrix(tickers = [], days = 90, opts) {
+  const url = new URL(`${API_BASE}/sentiment/matrix`);
+  (tickers || []).forEach((t) => url.searchParams.append("tickers", t));
+  url.searchParams.set("days", String(days));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchSentimentTopics(ticker, k = 5, limit = 120, opts) {
+  const url = new URL(`${API_BASE}/sentiment/topics`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("k", String(k));
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}

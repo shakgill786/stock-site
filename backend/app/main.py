@@ -10,6 +10,9 @@ from app.auth import schemas
 from app.auth.utils import get_current_user
 from app.auth.models import User
 
+# NEW: mount sentiment endpoints
+from app.routes_sentiment import router as sentiment_router
+
 app = FastAPI(title="Stock & Crypto API", version="1.0.0")
 
 # ---------------- CORS (Token/Bearer mode: no cookies) ----------------
@@ -46,6 +49,7 @@ def health():
 # Auth router has NO prefix inside app/auth/router.py; we mount it once here.
 app.include_router(auth_router, prefix="/auth", tags=["Auth"])
 app.include_router(api_router)
+app.include_router(sentiment_router)  # ← sentiment endpoints (/sentiment/*)
 
 # ---------------- Debug (remove later if you like) ----------------
 @app.get("/__routes", include_in_schema=False)
