@@ -198,7 +198,6 @@ export default function App() {
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
   // Retrospective history rows from backend (for past backtest lines)
-  thead;
   const [historyRows, setHistoryRows] = useState([]);
 
   // Protect against out-of-order async writes

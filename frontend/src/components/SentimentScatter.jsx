@@ -2,85 +2,95 @@
 import { useEffect, useState, useMemo } from "react";
 import { fetchSentimentCorrelation } from "../api";
 import {
-  Chart as ChartJS, LinearScale, PointElement, Tooltip, Legend,
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  Tooltip,
+  Legend,
 } from "chart.js";
 import { Chart } from "react-chartjs-2";
 
-ChartJS.register(LinearScale, PointElement, Tooltip, Legend);
+ChartJS.register(CategoryScale, LinearScale, PointElement, Tooltip, Legend);
 
-export default function SentimentScatter({ ticker, days = 120, height = 260 }) {
-  const [rows, setRows] = useState([]);
-  const [corr, setCorr] = useState({ same_day: null, next_day: null });
-  const [loading, setLoading] = useState(false);
+export default function SentimentScatter({ ticker = "AAPL", days = 120 }) {
+  const [data, setData] = useState(null);
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    let dead = false;
-    const run = async () => {
-      setLoading(true); setErr("");
+    let ok = true;
+    (async () => {
       try {
-        const r = await fetchSentimentCorrelation(ticker, { days });
-        if (!dead) {
-          setRows(Array.isArray(r?.rows) ? r.rows : []);
-          setCorr(r?.corr || {});
-        }
+        setErr("");
+        const res = await fetchSentimentCorrelation(ticker, days);
+        if (!ok) return;
+        setData(res);
       } catch (e) {
-        setErr(String(e?.message || e));
-      } finally {
-        if (!dead) setLoading(false);
+        if (!ok) return;
+        setErr(e?.message || "Failed to load scatter data");
       }
-    };
-    run();
-    return () => { dead = true; };
+    })();
+    return () => { ok = false; };
   }, [ticker, days]);
 
-  const points = useMemo(() => {
-    return rows
-      .filter(r => typeof r.next_day_return_pct === "number" && typeof r.sentiment === "number")
-      .map(r => ({ x: r.sentiment, y: r.next_day_return_pct, d: r.date }));
-  }, [rows]);
-
   if (err) return <div className="muted error">{err}</div>;
+  if (!data) return <div className="muted">Loading scatter…</div>;
 
-  const data = {
+  // pairs: [{date, sent, ret}]
+  const points = (data.correlation?.pairs || []).map((p) => ({
+    x: Number(p.sent),
+    y: Number(p.ret),
+    label: String(p.date),
+  }));
+
+  const chartData = {
     datasets: [
       {
-        label: "Sentiment vs Next-Day Return",
+        type: "scatter",
+        label: "Daily sentiment vs next-day return",
         data: points,
-        pointRadius: 3,
+        pointRadius: 4,
+        pointHoverRadius: 5,
       },
     ],
   };
 
   const options = {
     responsive: true,
-    maintainAspectRatio: false,
     plugins: {
+      legend: { position: "top" },
       tooltip: {
         callbacks: {
-          label: ctx => {
-            const p = ctx.raw;
-            return `${p.d}: sentiment ${p.x.toFixed(2)}, next-day ${p.y.toFixed(2)}%`;
+          label: (ctx) => {
+            const item = ctx.raw;
+            const yPct = (Number(item?.y) * 100).toFixed(2);
+            return `${item?.label}: sent ${Number(item?.x).toFixed(3)}, next-day ${yPct}%`;
           },
         },
       },
-      legend: { display: false },
     },
     scales: {
-      x: { title: { display: true, text: "Daily mean sentiment (compound)" }, min: -1, max: 1 },
-      y: { title: { display: true, text: "Next-day return (%)" } },
+      x: {
+        title: { display: true, text: "Aggregated sentiment (VADER compound mean)" },
+        min: -1, max: 1,
+      },
+      y: {
+        title: { display: true, text: "Next-day return (fraction)" },
+        ticks: { callback: (v) => `${(Number(v) * 100).toFixed(0)}%` },
+      },
     },
   };
 
+  const r = data.correlation?.pearson_r;
   return (
-    <div className="card">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-        <h3 style={{ marginTop: 0 }}>📈 Sentiment vs Next-Day Return — {ticker}</h3>
-        <div className="muted" style={{ fontSize: 12 }}>
-          r (same): {corr?.same_day?.toFixed?.(2) ?? "—"} • r (next): {corr?.next_day?.toFixed?.(2) ?? "—"}
-        </div>
+    <div>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+        <h3 style={{ margin: 0 }}>📊 Sentiment vs Next-Day Return — {ticker}</h3>
+        <div className="muted">Pearson r = {Number.isFinite(r) ? r.toFixed(3) : "n/a"}</div>
       </div>
-      {loading ? <div className="muted">Loading…</div> : <div style={{ height }}><Chart type="scatter" data={data} options={options} /></div>}
+      <div style={{ height: 260 }}>
+        <Chart type="scatter" data={chartData} options={options} />
+      </div>
     </div>
   );
 }
