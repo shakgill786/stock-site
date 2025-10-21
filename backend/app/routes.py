@@ -2,8 +2,8 @@
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
-import random, json, asyncio, time, os, math
-from datetime import date, timedelta
+import random, json, asyncio, time, os, math, statistics
+from datetime import date, timedelta, datetime
 from starlette.responses import StreamingResponse
 import httpx
 
@@ -21,6 +21,7 @@ router = APIRouter()
 # ----------------------- normalization / clamping -----------------------
 CLAMP_PCT_BOUNDS: Tuple[float, float] = (-25.0, 25.0)  # UI sanity window
 HARD_LAST_MULTIPLIER = 1.95  # reject last beyond ±95% of prevClose (vendor glitch)
+SENTIMENT_ALERT_ABS_THRESHOLD = 0.35  # "strong" daily mean VADER score
 
 def _to_float(x):
     try:
@@ -47,7 +48,7 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
       - compute percent from price & last if vendor percent is missing/bad
       - fix 'percent' that is actually dollars
       - clamp % to ±25 for DISPLAY (keep originals as *_raw)
-    Input expected keys (best-effort): symbol, price, change, change_pct
+    Expected keys: symbol, price, change, change_pct (best-effort)
     """
     sym = str(row.get("symbol") or row.get("ticker") or "").upper()
     price = _to_float(row.get("price"))
@@ -67,16 +68,15 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
         pct = _safe_pct(price, prev)
         normalized_reason.append("computed_percent_from_prices")
 
-    # heuristic: if |pct| huge but treating pct as dollars makes sense, fix it
+    # heuristic: vendor returned dollars in percent field
     if abs(pct) > 60 and prev and prev != 0:
         as_dollars_pct = (pct / prev) * 100.0
         if abs(as_dollars_pct) <= 60:
-            # pct was actually dollar change; recompute correctly
             chg = pct
             pct = _safe_pct(price, prev)
             normalized_reason.append("vendor_percent_was_dollars")
 
-    # if price is wildly off vs prev (vendor glitch), rebuild price from prev + change
+    # price vs prev sanity
     if prev and price and (price <= (1 - HARD_LAST_MULTIPLIER) * prev or price >= HARD_LAST_MULTIPLIER * prev):
         if chg is not None:
             recomputed_last = prev + chg
@@ -89,23 +89,26 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if prev and pct is not None and chg is None:
         chg = (pct / 100.0) * prev
 
-    # DISPLAY clamp only
+    # DISPLAY clamp
     lb, ub = CLAMP_PCT_BOUNDS
-    pct_raw = pct
-    if pct < lb:
-        pct = lb
-        was_clamped = True
-    elif pct > ub:
-        pct = ub
-        was_clamped = True
-    chg_display = ((pct / 100.0) * (prev if prev else price)) if (prev or price) else chg
+    pct_raw = pct if pct is not None else 0.0
+    pct_display = pct_raw
+    if pct_display < lb:
+        pct_display = lb; was_clamped = True
+    elif pct_display > ub:
+        pct_display = ub; was_clamped = True
 
+    chg_display = ((pct_display / 100.0) * (prev if prev else price)) if (prev or price) else chg
+
+    # IMPORTANT: we return both:
+    # - change_pct_raw: vendor/original (may be wrong)
+    # - change_pct:     CLAMPED display value for your frontend
     return {
         "symbol": sym,
         "price": price,
         "change": chg,
-        "change_pct": pct_raw,                 # original/unclamped vendor percent (may be wrong)
-        "display_change_pct": round(pct, 4),   # <-- use this on the frontend tiles
+        "change_pct_raw": pct_raw,
+        "change_pct": round(pct_display, 4),  # <-- frontend should read THIS
         "display_change": round((chg_display or 0.0), 4),
         "normalized": bool(normalized_reason or was_clamped),
         "normalized_reason": "|".join(normalized_reason) if normalized_reason else None,
@@ -132,10 +135,8 @@ def _normalize_quote_payload(q: Dict[str, Any]) -> Dict[str, Any]:
 
     # vendor-dollars-as-percent fix
     if abs(pct) > 60 and last and last != 0:
-        as_dollars_pct = (pct / last) * 100.0
-        if abs(as_dollars_pct) <= 60:
-            pct = _safe_pct(price, last)
-            reasons.append("vendor_percent_was_dollars")
+        pct = _safe_pct(price, last)
+        reasons.append("vendor_percent_was_dollars")
 
     # hard sanity for 'price' vs last
     if last and price and (price <= (1 - HARD_LAST_MULTIPLIER) * last or price >= HARD_LAST_MULTIPLIER * last):
@@ -149,13 +150,17 @@ def _normalize_quote_payload(q: Dict[str, Any]) -> Dict[str, Any]:
     # display clamp
     lb, ub = CLAMP_PCT_BOUNDS
     pct_raw = pct
-    if pct < lb:
-        pct = lb; was_clamped = True
-    elif pct > ub:
-        pct = ub; was_clamped = True
+    pct_display = pct_raw
+    if pct_display < lb:
+        pct_display = lb; was_clamped = True
+    elif pct_display > ub:
+        pct_display = ub; was_clamped = True
 
-    out["display_change_pct"] = round(pct, 4)
-    out["display_change"] = round(((pct / 100.0) * (last if last else price or 0.0)), 4)
+    out["current_price"] = price
+    out["last_close"] = last
+    out["change_pct_raw"] = pct_raw
+    out["display_change_pct"] = round(pct_display, 4)
+    out["display_change"] = round(((pct_display / 100.0) * (last if last else price or 0.0)), 4)
     out["normalized"] = bool(reasons or was_clamped)
     out["normalized_reason"] = "|".join(reasons) if reasons else None
     out["was_clamped"] = was_clamped
@@ -253,6 +258,29 @@ def _universe_from_env() -> List[str]:
         if toks:
             return toks[:200]
     return _FALLBACK_UNIVERSE
+
+def _apply_display_mapping(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure downstream cards that read `change_pct` see the display-safe value.
+    Keep the unmodified vendor percent in `change_pct_raw`.
+    """
+    out = []
+    for r in rows:
+        # r already has: change_pct (clamped), change_pct_raw, display_change
+        o = {
+            "symbol": r.get("symbol"),
+            "price": r.get("price"),
+            "change": r.get("change"),
+            "change_pct": r.get("change_pct"),            # clamped for UI
+            "change_pct_raw": r.get("change_pct_raw"),    # original
+            "display_change": r.get("display_change"),
+            "normalized": r.get("normalized"),
+            "normalized_reason": r.get("normalized_reason"),
+            "was_clamped": r.get("was_clamped"),
+            "clamp_bounds": r.get("clamp_bounds"),
+        }
+        out.append(o)
+    return out
 
 # ----------------------- diagnostics -----------------------
 @router.get("/diag", summary="Diag", tags=["Diagnostics"])
@@ -469,11 +497,9 @@ async def earnings_endpoint(ticker: str):
 @router.get("/market", summary="Market Endpoint")
 async def market_endpoint():
     """
-    If your market endpoint returns index tiles (e.g., SPY/QQQ/DIA),
-    run them through the same normalizer for consistency.
+    Normalize market tiles so percent is safe to display.
     """
     data = await asyncio.to_thread(get_market_breadth)
-    # If data already a dict with 'items': normalize each if it looks like a tile
     if isinstance(data, dict) and isinstance(data.get("items"), list):
         items = []
         for r in data["items"]:
@@ -484,7 +510,7 @@ async def market_endpoint():
                 "change_pct": r.get("change_pct") or r.get("percent"),
             }
             items.append(_normalize_tile_row(row))
-        return {"items": items, "ts": int(time.time() * 1000)}
+        return {"items": _apply_display_mapping(items), "ts": int(time.time() * 1000)}
     return data
 
 # ----------------------- Live quote stream (SSE) -----------------------
@@ -501,7 +527,7 @@ async def quote_stream(ticker: str, interval: float = 5.0):
                     "ticker": q.get("ticker", str(ticker).upper()),
                     "current_price": q.get("current_price"),
                     "last_close": q.get("last_close"),
-                    "change_pct": q.get("display_change_pct"),  # use display-safe %
+                    "change_pct": q.get("display_change_pct"),  # display-safe %
                     "ts": int(time.time()),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
@@ -599,7 +625,7 @@ async def stats_endpoint(ticker: str):
 @router.get("/movers", summary="Movers")
 async def movers():
     """
-    Returns normalized gainers/losers with display-safe %:
+    Returns normalized gainers/losers with display-safe % in `change_pct`:
       { "gainers": [...], "losers": [...], "source": "alphavantage|fallback-local" }
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
@@ -619,16 +645,16 @@ async def movers():
             gainers_raw = data.get("top_gainers") or []
             losers_raw  = data.get("top_losers")  or []
 
-            out_gainers = [_alpha_to_common(x) for x in gainers_raw][:25]
-            out_losers  = [_alpha_to_common(x) for x in losers_raw][:25]
-
-            # normalize + clamp
-            out_gainers = [_normalize_tile_row(x) for x in out_gainers]
-            out_losers  = [_normalize_tile_row(x) for x in out_losers]
+            out_gainers = [_normalize_tile_row(_alpha_to_common(x)) for x in gainers_raw][:25]
+            out_losers  = [_normalize_tile_row(_alpha_to_common(x)) for x in losers_raw][:25]
 
             # accept if looks sane
             if any(isinstance(x.get("price"), (int, float)) for x in out_gainers + out_losers):
-                return {"gainers": out_gainers, "losers": out_losers, "source": used_source}
+                return {
+                    "gainers": _apply_display_mapping(out_gainers),
+                    "losers": _apply_display_mapping(out_losers),
+                    "source": used_source
+                }
         except Exception:
             pass  # fall through to local fallback
 
@@ -648,8 +674,8 @@ async def movers():
             chg = None
             if price is not None and last is not None:
                 chg = price - last
-            if isinstance(price, float) and isinstance(pct, float):
-                return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
+            if isinstance(price, float):
+                return _normalize_tile_row({"symbol": sym, "price": price, "change": chg, "change_pct": pct})
         except Exception:
             pass
 
@@ -661,7 +687,7 @@ async def movers():
                 last = float(closes[-1]); prev = float(closes[-2])
                 chg = last - prev
                 pct = (chg / prev) * 100.0 if prev else 0.0
-                return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
+                return _normalize_tile_row({"symbol": sym, "price": last, "change": chg, "change_pct": pct})
         except Exception:
             pass
         return None
@@ -686,11 +712,12 @@ async def movers():
     else:
         gainers, losers = [], []
 
-    # normalize + clamp
-    out_gainers = [_normalize_tile_row(x) for x in gainers]
-    out_losers  = [_normalize_tile_row(x) for x in losers]
-
-    return {"gainers": out_gainers, "losers": out_losers, "source": used_source, "partial": bool(done)}
+    return {
+        "gainers": _apply_display_mapping(gainers),
+        "losers": _apply_display_mapping(losers),
+        "source": used_source,
+        "partial": bool(done)
+    }
 
 @router.get("/top_gainers", summary="Top Gainers")
 async def top_gainers():
@@ -735,7 +762,179 @@ async def earnings_week():
     out.sort(key=lambda x: (x["date"], x["symbol"]))
     return {"items": out[:500]}
 
-# Trailing-slash alias to avoid 405s behind some proxies/CDNs
+# Trailing-slash alias (fixes stray typo in earlier version)
 @router.get("/earnings_week/", summary="Earnings Week (alias)")
 async def earnings_week_alias():
     return await earnings_week()
+
+# ======================= Sentiment =======================
+def _iso_day(ts: str) -> str:
+    # Alpha Vantage: "YYYYMMDDTHHMMSS"
+    try:
+        dt = datetime.strptime(ts[:15], "%Y%m%dT%H%M%S")
+        return dt.date().isoformat()
+    except Exception:
+        try:
+            return datetime.fromisoformat(ts[:10]).date().isoformat()
+        except Exception:
+            return str(ts)[:10]
+
+async def _alpha_news_sentiment_daily_mean(ticker: str, days: int) -> Dict[str, float]:
+    """
+    Pull Alpha Vantage NEWS_SENTIMENT and compute per-day mean ticker_sentiment_score.
+    Returns dict { 'YYYY-MM-DD': mean_score }
+    """
+    key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not key:
+        return {}
+
+    url = "https://www.alphavantage.co/query"
+    # AlphaVantage lets multiple pages via 'limit' (soft). We'll just pull a decent chunk.
+    params = {"function": "NEWS_SENTIMENT", "tickers": ticker, "apikey": key, "limit": 200}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(url, params=params)
+        data = r.json() if r.content else {}
+
+    feed = data.get("feed") or []
+    buckets: Dict[str, List[float]] = {}
+
+    for item in feed:
+        day = _iso_day(item.get("time_published", ""))
+        if not day:
+            continue
+        scores = []
+        for ts in item.get("ticker_sentiment", []) or []:
+            if _norm_symbol(ts.get("ticker")) == _norm_symbol(ticker):
+                sc = _to_float(ts.get("ticker_sentiment_score"))
+                if isinstance(sc, float):
+                    scores.append(sc)
+        if not scores:
+            # fallback to overall_relevance_score as super light signal
+            sc = _to_float(item.get("relevance_score"))
+            if isinstance(sc, float):
+                scores.append(sc * 0.1)
+        if scores:
+            buckets.setdefault(day, []).extend(scores)
+
+    # reduce to mean by day, keep only most recent N days that we care about
+    days_back = max(10, min(days, 365))
+    sorted_days = sorted(buckets.keys())[-days_back:]
+    return {d: float(statistics.mean(buckets[d])) for d in sorted_days if buckets.get(d)}
+
+def _pearson(x: List[float], y: List[float]) -> Optional[float]:
+    xs = [float(v) for v in x]
+    ys = [float(v) for v in y]
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    try:
+        mx = statistics.mean(xs); my = statistics.mean(ys)
+        num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+        denx = math.sqrt(sum((a - mx) ** 2 for a in xs))
+        deny = math.sqrt(sum((b - my) ** 2 for b in ys))
+        if denx == 0 or deny == 0:
+            return None
+        return num / (denx * deny)
+    except Exception:
+        return None
+
+@router.get("/sentiment/correlation", summary="Daily sentiment vs next-day return")
+async def sentiment_correlation(ticker: str, days: int = 120):
+    """
+    Returns:
+    {
+      "ticker": "...",
+      "daily": [{"date": "YYYY-MM-DD", "mean": float}, ...],
+      "closes_dates": [...], "closes": [...],
+      "correlation": {"pearson_r": float|None, "pairs": [{"date", "sent", "ret"}]}
+    }
+    """
+    symbol = _norm_symbol(ticker)
+    days = max(20, min(int(days), 365))
+
+    # 1) Get closes
+    try:
+        series = await asyncio.wait_for(
+            asyncio.to_thread(get_daily_closes_with_dates, symbol, days + 5),
+            timeout=10.0,
+        )
+    except Exception:
+        series = {"dates": [], "closes": []}
+
+    dates: List[str] = list(series.get("dates") or [])
+    closes: List[float] = list(series.get("closes") or [])
+
+    if not _is_crypto(symbol):
+        dates, closes = _filter_equity_calendar(dates, closes)
+
+    # 2) Sentiment per day (Alpha Vantage NEWS_SENTIMENT)
+    sent_by_day = await _alpha_news_sentiment_daily_mean(symbol, days)
+
+    # 3) Build next-day returns aligned to sentiment days
+    pairs = []
+    by_date_to_close = {str(d)[:10]: float(c) for d, c in zip(dates, closes)}
+    for d, s in sent_by_day.items():
+        if d not in by_date_to_close:
+            continue
+        # next trading day = the next date in our closes list
+        try:
+            idx = dates.index(d)
+            if idx + 1 < len(closes):
+                prev = closes[idx]
+                nxt = closes[idx + 1]
+                ret = (nxt - prev) / prev if prev else 0.0
+                pairs.append({"date": d, "sent": float(s), "ret": float(ret)})
+        except ValueError:
+            continue
+
+    pearson_r = None
+    if pairs:
+        pearson_r = _pearson([p["sent"] for p in pairs], [p["ret"] for p in pairs])
+
+    daily_rows = [{"date": d, "mean": float(m)} for d, m in sorted(sent_by_day.items())]
+    return {
+        "ticker": symbol,
+        "daily": daily_rows,
+        "closes_dates": dates,
+        "closes": closes,
+        "correlation": {"pearson_r": pearson_r, "pairs": pairs},
+    }
+
+# Minimal SSE alerts: emits when daily mean sentiment |score| >= threshold
+@router.get("/sentiment/alerts_stream", summary="Sentiment alerts stream (SSE)")
+async def sentiment_alerts_stream(ticker: str, days: int = 60, interval: float = 30.0):
+    symbol = _norm_symbol(ticker)
+    interval = max(10.0, min(float(interval), 120.0))
+
+    async def gen():
+        try:
+            last_emitted_day = None
+            while True:
+                data = await sentiment_correlation(symbol, days)  # reuse handler
+                daily = data.get("daily") or []
+                if daily:
+                    last = daily[-1]  # most recent day present
+                    score = float(last.get("mean") or 0.0)
+                    day = str(last.get("date"))
+                    level = "strong" if abs(score) >= SENTIMENT_ALERT_ABS_THRESHOLD else "normal"
+                    payload = {
+                        "ticker": symbol,
+                        "date": day,
+                        "score": score,
+                        "level": level,
+                        "ts": int(time.time()),
+                    }
+                    # emit only if new day or strong reading
+                    if day != last_emitted_day or level == "strong":
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        last_emitted_day = day
+                    else:
+                        # keep-alive ping
+                        yield f"data: {json.dumps({'ticker': symbol, 'keepalive': True, 'ts': int(time.time())})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'ticker': symbol, 'error': 'no sentiment', 'ts': int(time.time())})}\n\n"
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
