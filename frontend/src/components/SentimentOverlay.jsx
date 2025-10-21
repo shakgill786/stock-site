@@ -1,12 +1,19 @@
 // frontend/src/components/SentimentOverlay.jsx
 import { useEffect, useMemo, useState } from "react";
 import { fetchSentimentCorrelation } from "../api";
-import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, BarElement, Tooltip, Legend } from "chart.js";
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  BarElement,
+  Tooltip,
+  Legend,
+} from "chart.js";
 import { Chart } from "react-chartjs-2";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, Tooltip, Legend);
-
-function toPct(x) { return (Number(x) * 100); }
 
 export default function SentimentOverlay({ ticker = "AAPL", days = 120 }) {
   const [data, setData] = useState(null);

@@ -21,6 +21,7 @@ import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
 import AuthModal from "./components/AuthModal";
 import { useAuth } from "./auth/AuthContext";
+import SentimentOverlay from "./components/SentimentOverlay"; // 🟣 added
 import "./App.css";
 
 import {
@@ -197,6 +198,7 @@ export default function App() {
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
   // Retrospective history rows from backend (for past backtest lines)
+  thead;
   const [historyRows, setHistoryRows] = useState([]);
 
   // Protect against out-of-order async writes
@@ -399,7 +401,6 @@ export default function App() {
   const streamUrl = live ? buildQuoteStreamURL(ticker, 5) : null;
 
   useEventSource(streamUrl, {
-    enabled: !!streamUrl,
     onMessage: (payload) => {
       const prev = prevPriceRef.current;
       const next = Number(payload.current_price);
@@ -854,6 +855,11 @@ export default function App() {
               <MarketCard market={market} />
             </div>
           )}
+
+          {/* 📰 Sentiment overlay */}
+          <div className="card" style={{ marginTop: 12 }}>
+            <SentimentOverlay ticker={ticker} days={120} />
+          </div>
 
           {/* Metrics list */}
           {!!metrics.length && (

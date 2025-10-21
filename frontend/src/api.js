@@ -345,6 +345,20 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
   return url.toString();
 }
 
+/** SSE URL for sentiment alerts (optional UI) */
+export function buildSentimentStreamURL({ tickers = [], neg = -0.6, pos = 0.7, interval = 60 } = {}) {
+  const joined = Array.isArray(tickers) ? tickers.join(",") : String(tickers || "");
+  const url = new URL(`${API_BASE}/sentiment/alerts_stream`);
+  url.searchParams.set("tickers", joined);
+  url.searchParams.set("neg_thresh", String(neg));
+  url.searchParams.set("pos_thresh", String(pos));
+  url.searchParams.set("interval", String(interval));
+  url.searchParams.set("_ts", Date.now().toString());
+  const tok = getAuthToken();
+  if (tok) url.searchParams.set("token", tok);
+  return url.toString();
+}
+
 // --- Predictions & data ---
 export async function fetchPredict({ ticker, models }, opts) {
   const url = buildURL("/predict");
