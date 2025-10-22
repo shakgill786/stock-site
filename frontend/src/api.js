@@ -6,7 +6,6 @@
 // - Legacy /auth/auth/* left as LAST resort only
 // ------------------------------------------------------------
 
-// --- Base URL resolution (env first; safe defaults) ---
 const RAW_ENV_BASE =
   import.meta.env.VITE_API_BASE ||
   import.meta.env.VITE_API_BASE_URL ||
@@ -32,7 +31,6 @@ const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/
 const AUTH_ENABLED =
   String(import.meta.env.VITE_AUTH_ENABLED ?? "true").toLowerCase() === "true";
 
-// Support BOTH VITE_AUTH_STRICT and VITE_AUTH_STRICT_PATHS. Default: false.
 const AUTH_STRICT = ["true", "1", "yes"].includes(
   String(
     import.meta.env.VITE_AUTH_STRICT ??
@@ -45,8 +43,6 @@ const ENV_LOGIN = import.meta.env.VITE_AUTH_LOGIN_PATH || "";
 const ENV_REGISTER = import.meta.env.VITE_AUTH_REGISTER_PATH || "";
 const ENV_ME = import.meta.env.VITE_AUTH_ME_PATH || "";
 
-// Build ordered fallback lists. We’ll try each until we get a non-404.
-// Put correct paths FIRST; park legacy "/auth/auth/*" LAST as a final fallback.
 const LOGIN_PATHS = [
   ENV_LOGIN || null,
   "/auth/login",
@@ -74,7 +70,6 @@ const ME_PATHS = [
   "/auth/auth/me", // legacy LAST
 ].filter(Boolean);
 
-// Warn about common mixed-content misconfig: https page calling http backend
 if (typeof window !== "undefined") {
   const isHttpsPage = window.location.protocol === "https:";
   if (isHttpsPage && API_BASE.startsWith("http://")) {
@@ -119,9 +114,9 @@ export function clearAuthToken() {
 }
 
 // -------- fetch helpers --------
-const DEFAULT_RETRIES = 1; // extra attempts after the first
+const DEFAULT_RETRIES = 1;
 const RETRY_DELAY_MS = 350;
-const REQUEST_TIMEOUT_MS = 10000; // 10s network timeout
+const REQUEST_TIMEOUT_MS = 10000;
 
 const defaultGetHeaders = {
   "Cache-Control": "no-cache",
@@ -147,57 +142,34 @@ function sleep(ms) {
 
 function buildURL(path, params) {
   const url = new URL(`${API_BASE}${path.startsWith("/") ? path : `/${path}`}`);
-  // query params
   if (params && typeof params === "object") {
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     });
   }
-  // cache-buster to avoid stale edge caches
   url.searchParams.set("_ts", Date.now().toString());
   return url;
 }
 
-/**
- * Run a fetcher with a timeout, but also honor an *external* AbortSignal if provided.
- * We create our own controller for the timeout and pipe external aborts into it.
- */
 function withTimeout(fetcher, ms, externalSignal) {
   const ctrl = new AbortController();
 
-  // Pipe external aborts into our timeout controller (merge)
   if (externalSignal instanceof AbortSignal) {
     if (externalSignal.aborted) {
-      try {
-        ctrl.abort(externalSignal.reason);
-      } catch {
-        ctrl.abort();
-      }
+      try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
     } else {
-      const onAbort = () => {
-        try {
-          ctrl.abort(externalSignal.reason);
-        } catch {
-          ctrl.abort();
-        }
-      };
+      const onAbort = () => { try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); } };
       externalSignal.addEventListener("abort", onAbort, { once: true });
     }
   }
 
   const id = setTimeout(() => {
-    try {
-      ctrl.abort(new DOMException("Timeout", "TimeoutError"));
-    } catch {
-      ctrl.abort();
-    }
+    try { ctrl.abort(new DOMException("Timeout", "TimeoutError")); } catch { ctrl.abort(); }
   }, ms);
 
   return fetcher(ctrl.signal).finally(() => clearTimeout(id));
 }
 
-// Wrap fetch with small retry on network/5xx/429 + timeout
-// Accepts options.signal to allow external cancellation.
 async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -205,9 +177,8 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
       const res = await withTimeout(
         (signal) => fetch(url, { ...options, signal }),
         REQUEST_TIMEOUT_MS,
-        options.signal // <- merge external signal with timeout
+        options.signal
       );
-      // Retry on 429/5xx
       if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
         lastErr = new Error(`HTTP ${res.status}`);
         if (attempt < retries) {
@@ -218,7 +189,7 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
       return res;
     } catch (e) {
       lastErr = e;
-      if (e?.name === "AbortError") throw e; // surface cancellation
+      if (e?.name === "AbortError") throw e;
       if (attempt < retries) {
         await sleep(RETRY_DELAY_MS * (attempt + 1));
         continue;
@@ -228,16 +199,12 @@ async function fetchWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
   throw lastErr;
 }
 
-// Pick the probe list for this call.
-// If strict is ON and the first path is NOT the legacy /auth/auth/*, try only the first.
-// If the first is legacy (or strict is OFF), try the full list.
 function firstTryList(paths) {
   const first = paths[0] || "";
   if (AUTH_STRICT && !first.includes("/auth/auth/")) return [first];
   return paths;
 }
 
-// Try multiple paths, skipping 404s
 async function getFirst(paths, headers = defaultGetHeaders) {
   const list = firstTryList(paths);
   let lastErr;
@@ -275,7 +242,6 @@ async function postJsonFirst(paths, body, headers = defaultPostHeaders) {
   throw lastErr || new Error("All endpoints returned 404");
 }
 
-// Consistent JSON handling + better error messages
 async function handle(res) {
   if (!res || typeof res.ok !== "boolean") {
     throw new Error("Network error (no response)");
@@ -289,14 +255,11 @@ async function handle(res) {
       try {
         const text = await res.text();
         detail = text?.slice?.(0, 300);
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     }
     const msg = detail ? `${res.status} ${res.statusText} – ${detail}` : `HTTP ${res.status}`;
     throw new Error(msg);
   }
-  // parse JSON (tolerate empty body)
   const txt = await res.text();
   return txt ? JSON.parse(txt) : {};
 }
@@ -345,13 +308,11 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
   return url.toString();
 }
 
-/** SSE URL for sentiment alerts (optional UI) */
-export function buildSentimentStreamURL({ tickers = [], neg = -0.6, pos = 0.7, interval = 60 } = {}) {
-  const joined = Array.isArray(tickers) ? tickers.join(",") : String(tickers || "");
+/** SSE URL for sentiment alerts (server expects single `ticker`) */
+export function buildSentimentStreamURL({ ticker, days = 60, interval = 60 } = {}) {
   const url = new URL(`${API_BASE}/sentiment/alerts_stream`);
-  url.searchParams.set("tickers", joined);
-  url.searchParams.set("neg_thresh", String(neg));
-  url.searchParams.set("pos_thresh", String(pos));
+  if (ticker) url.searchParams.set("ticker", String(ticker));
+  url.searchParams.set("days", String(days));
   url.searchParams.set("interval", String(interval));
   url.searchParams.set("_ts", Date.now().toString());
   const tok = getAuthToken();
@@ -377,9 +338,6 @@ export async function fetchPredict({ ticker, models }, opts) {
   );
 }
 
-/**
- * Retrospective “next-day” history for the last N trading days.
- */
 export async function fetchPredictHistory({ ticker, models, days = 12 }, opts) {
   const url = new URL(`${API_BASE}/predict_history`);
   url.searchParams.set("ticker", ticker);
@@ -424,7 +382,6 @@ export async function fetchEarnings(ticker, opts) {
   );
 }
 
-// (unused but kept)
 export async function fetchDividends(ticker, opts) {
   const url = buildURL("/dividends", { ticker });
   return handle(
@@ -457,7 +414,6 @@ export async function fetchCloses(ticker, days = 7, opts) {
     })
   );
 
-  // Light sanity normalization: ensure arrays exist & lengths match
   const dates = Array.isArray(payload?.dates) ? payload.dates : [];
   const closes = Array.isArray(payload?.closes) ? payload.closes : [];
   if (dates.length !== closes.length) {
@@ -471,7 +427,6 @@ export async function fetchCloses(ticker, days = 7, opts) {
   return { ticker: payload?.ticker || ticker, dates, closes };
 }
 
-// Quick stats (52w high/low)
 export async function fetchStats(ticker, opts) {
   const url = buildURL("/stats", { ticker });
   return handle(
@@ -519,7 +474,6 @@ export async function fetchTopLosers(opts) {
 
 // 405-proof (retry with trailing slash) for proxies that require it
 export async function fetchEarningsWeek(opts) {
-  // first try as-is
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
   try {
     return handle(
@@ -549,37 +503,9 @@ export async function fetchEarningsWeek(opts) {
 }
 
 /* ---------------- Sentiment / News ---------------- */
-
-export async function fetchNewsSentiment(ticker, limit = 80, opts) {
-  const url = new URL(`${API_BASE}/sentiment/news`);
-  url.searchParams.set("ticker", ticker);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("_ts", Date.now().toString());
-  return handle(
-    await fetchWithRetry(url, {
-      headers: maybeAuth(defaultGetHeaders),
-      cache: "no-store",
-      ...(opts || {}),
-    })
-  );
-}
-
-export async function fetchDailySentiment(ticker, limit = 120, opts) {
-  const url = new URL(`${API_BASE}/sentiment/daily`);
-  url.searchParams.set("ticker", ticker);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("_ts", Date.now().toString());
-  return handle(
-    await fetchWithRetry(url, {
-      headers: maybeAuth(defaultGetHeaders),
-      cache: "no-store",
-      ...(opts || {}),
-    })
-  );
-}
-
+/** Align with backend route name (/sentiment/correlation) */
 export async function fetchSentimentCorrelation(ticker, days = 120, opts) {
-  const url = new URL(`${API_BASE}/sentiment/correlate`);
+  const url = new URL(`${API_BASE}/sentiment/correlation`);
   url.searchParams.set("ticker", ticker);
   url.searchParams.set("days", String(days));
   url.searchParams.set("_ts", Date.now().toString());
@@ -592,31 +518,8 @@ export async function fetchSentimentCorrelation(ticker, days = 120, opts) {
   );
 }
 
-export async function fetchSentimentMatrix(tickers = [], days = 90, opts) {
-  const url = new URL(`${API_BASE}/sentiment/matrix`);
-  (tickers || []).forEach((t) => url.searchParams.append("tickers", t));
-  url.searchParams.set("days", String(days));
-  url.searchParams.set("_ts", Date.now().toString());
-  return handle(
-    await fetchWithRetry(url, {
-      headers: maybeAuth(defaultGetHeaders),
-      cache: "no-store",
-      ...(opts || {}),
-    })
-  );
-}
-
-export async function fetchSentimentTopics(ticker, k = 5, limit = 120, opts) {
-  const url = new URL(`${API_BASE}/sentiment/topics`);
-  url.searchParams.set("ticker", ticker);
-  url.searchParams.set("k", String(k));
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("_ts", Date.now().toString());
-  return handle(
-    await fetchWithRetry(url, {
-      headers: maybeAuth(defaultGetHeaders),
-      cache: "no-store",
-      ...(opts || {}),
-    })
-  );
-}
+/* Optional stubs (not used by current UI) */
+export async function fetchNewsSentiment() { return { items: [] }; }
+export async function fetchDailySentiment() { return { daily: [] }; }
+export async function fetchSentimentMatrix() { return { matrix: [] }; }
+export async function fetchSentimentTopics() { return { topics: [] }; }

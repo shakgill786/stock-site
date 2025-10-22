@@ -1,7 +1,7 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
-// - fixes AV 25% clamp by recomputing % from $change + price
-// - hydrates any row with |%| >= 24.9
+// - server-side clamp/sign fixes for movers
+// - client hydrates rows that look clamped / incomplete
 // - earnings fallback: retry /earnings_week/ on 405
 
 import { useEffect, useMemo, useState } from "react";
@@ -52,8 +52,6 @@ const SESSION_BADGE = (s) => {
 
 /* ---------- helpers for clamp fix ---------- */
 const looksClamped = (pct) => isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
-
-/** recompute % from price & $change if we can (base = price - change) */
 const pctFromPriceChange = (price, change) => {
   if (!isNum(price) || !isNum(change)) return NaN;
   const base = toNum(price) - toNum(change);
@@ -84,9 +82,9 @@ function normalizeRow(row) {
     "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
 
-  let change = firstNum(row, ["change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
+  let change = firstNum(row, ["display_change","change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
   let change_pct = firstNum(row, [
-    "change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
+    "change_pct","display_change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
     "changePct","percentChange","extended_change_pct","after_hours_change_pct","postmarket_change_pct",
   ]);
 
@@ -160,15 +158,14 @@ function pickFromQuote(q) {
   const price = isNum(extPrice) ? extPrice : curPrice;
 
   let change = firstNum(q, [
-    "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
+    "display_change","extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
     "change","regularMarketChange",
   ]);
   let change_pct = firstNum(q, [
-    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
+    "display_change_pct","extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
     "change_pct","percent_change","regularMarketChangePercent",
   ]);
 
-  // Derive from price vs lastClose if needed or if feed looks clamped
   if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
@@ -176,7 +173,6 @@ function pickFromQuote(q) {
     change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
-  // Final normalization
   return normalizeRow({
     symbol: q?.ticker || q?.symbol || "",
     price,
@@ -217,7 +213,6 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  // reject absurd % (splits/bad feed)
   if (!Number.isFinite(pct) || Math.abs(pct) > 60) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
@@ -226,16 +221,14 @@ function pickLastTwoCloses(resp) {
 const HYDRATE_BATCH = 6;
 
 async function hydrateRows(rows) {
-  const out = rows.map((r) => ({ ...r })); // copy
+  const out = rows.map((r) => ({ ...r }));
   const need = out
     .map((r, i) => ({
       i,
       sym: r.symbol,
       missing:
-        // Previously: only when change/percent were zero/missing
         (!(isNum(r.change) && !nearZero(r.change)) &&
          !(isNum(r.change_pct) && !nearZero(r.change_pct)))
-        // NEW: also hydrate when the row looks "clamped" at ±25
         || looksClamped(r.change_pct),
     }))
     .filter((x) => x.missing && x.sym);
@@ -245,7 +238,6 @@ async function hydrateRows(rows) {
     await Promise.all(
       slice.map(async ({ i, sym }) => {
         try {
-          // 1) Try quote (extended if available)
           const q = await fetchQuote(sym);
           const picked = pickFromQuote(q || {});
           let merged = normalizeRow({
@@ -268,7 +260,6 @@ async function hydrateRows(rows) {
             return;
           }
 
-          // 2) Fallback to day-over-day from last two *distinct* daily closes
           try {
             const closeResp = await fetchCloses(sym, 10);
             const eod = pickLastTwoCloses(closeResp);
@@ -282,15 +273,10 @@ async function hydrateRows(rows) {
               });
               return;
             }
-          } catch {
-            /* ignore EOD fallback failure */
-          }
+          } catch { /* ignore */ }
 
-          // nothing worked; keep merged
           out[i] = merged;
-        } catch {
-          /* ignore total failure */
-        }
+        } catch { /* ignore total failure */ }
       })
     );
   }
@@ -315,11 +301,10 @@ function Card({ title, right, children }) {
 function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kind = "gainers" }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
-  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc"); // losers: most negative first
+  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc");
 
   const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
 
-  // filter out zero-move rows (avoid lingering 0.00s)
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return normalized.filter(
@@ -589,7 +574,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setGainers(gHydrated.filter(keep));
       setLosers(lHydrated.filter(keep));
 
-      // source string (base feed only)
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
@@ -605,13 +589,11 @@ export default function HotAndEarnings({ onSelectTicker }) {
     setErrEarnings("");
     try {
       let wk = await fetchEarningsWeek();
-      // retry with trailing slash if proxy returns 405
       if (!wk && typeof wk !== "object") wk = {};
       if (!Array.isArray(wk.items) && wk?.error?.includes?.("405")) {
         throw new Error("405");
       }
       const items = Array.isArray(wk?.items) ? wk.items : [];
-      // fallback attempt on explicit 405
       if (!items.length) {
         try {
           const res = await fetch(`${API_BASE}/earnings_week/`, {
@@ -645,7 +627,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Candidates for TopBuys from current movers; pad with a small stable list if needed
   const topBuyCandidates = useMemo(() => {
     const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
     const uniq = Array.from(new Set(fromMovers));
@@ -698,12 +679,11 @@ export default function HotAndEarnings({ onSelectTicker }) {
         onPick={pick}
       />
 
-      {/* component-scoped styles */}
       <style>{`
         .he-grid { display: grid; grid-template-columns: 1fr; gap: 12px; width: 100%; margin-top: 8px; }
         @media (min-width: 980px) {
           .he-grid { grid-template-columns: 1fr 1fr; }
-          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; } /* last card full-width */
+          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; }
         }
 
         .he-toolbar {
