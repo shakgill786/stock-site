@@ -11,23 +11,18 @@ const RAW_ENV_BASE =
   import.meta.env.VITE_API_BASE_URL ||
   "";
 
-// optional hardcoded fallback for production hosting (edit if helpful)
 const HARDCODE_BACKEND =
   typeof window !== "undefined" && window.location.hostname.includes("onrender.com")
     ? "https://stock-backend-ddfx.onrender.com"
     : "";
 
-// If no env base provided, try the hardcoded; else fall back to localhost (dev)
 const RAW_BASE = RAW_ENV_BASE || HARDCODE_BACKEND || "http://127.0.0.1:8000";
 
-// Normalize: strip trailing slashes
 export const API_BASE = String(RAW_BASE).replace(/\/+$/, "");
 
-// Optional env overrides for special endpoints
 const MOVERS_ENDPOINT = import.meta.env.VITE_MOVERS_ENDPOINT || "/movers";
 const EARNINGS_WEEK_ENDPOINT = import.meta.env.VITE_EARNINGS_WEEK_ENDPOINT || "/earnings_week";
 
-// ---- Auth feature toggles / paths ----
 const AUTH_ENABLED =
   String(import.meta.env.VITE_AUTH_ENABLED ?? "true").toLowerCase() === "true";
 
@@ -50,7 +45,7 @@ const LOGIN_PATHS = [
   "/users/login",
   "/signin",
   "/token",
-  "/auth/auth/login", // legacy LAST
+  "/auth/auth/login",
 ].filter(Boolean);
 
 const REGISTER_PATHS = [
@@ -59,7 +54,7 @@ const REGISTER_PATHS = [
   "/register",
   "/users/register",
   "/signup",
-  "/auth/auth/register", // legacy LAST
+  "/auth/auth/register",
 ].filter(Boolean);
 
 const ME_PATHS = [
@@ -67,7 +62,7 @@ const ME_PATHS = [
   "/auth/me",
   "/me",
   "/users/me",
-  "/auth/auth/me", // legacy LAST
+  "/auth/auth/me",
 ].filter(Boolean);
 
 if (typeof window !== "undefined") {
@@ -92,7 +87,6 @@ if (typeof window !== "undefined") {
   }
 }
 
-// -------- auth token helpers --------
 const TOKEN_KEY = "AUTH_TOKEN";
 
 export function setAuthToken(token) {
@@ -113,7 +107,6 @@ export function clearAuthToken() {
   } catch {}
 }
 
-// -------- fetch helpers --------
 const DEFAULT_RETRIES = 1;
 const RETRY_DELAY_MS = 350;
 const REQUEST_TIMEOUT_MS = 10000;
@@ -156,15 +149,31 @@ function withTimeout(fetcher, ms, externalSignal) {
 
   if (externalSignal instanceof AbortSignal) {
     if (externalSignal.aborted) {
-      try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); }
+      try {
+        ctrl.abort(externalSignal.reason);
+      } catch {
+        ctrl.abort();
+      }
     } else {
-      const onAbort = () => { try { ctrl.abort(externalSignal.reason); } catch { ctrl.abort(); } };
+      const onAbort = () => {
+        try {
+          ctrl.abort(externalSignal.reason);
+        } catch {
+          ctrl.abort();
+        }
+      };
       externalSignal.addEventListener("abort", onAbort, { once: true });
     }
   }
 
   const id = setTimeout(() => {
-    try { ctrl.abort(new DOMException("Timeout", "TimeoutError")); } catch { ctrl.abort(); }
+    try {
+      const err = new Error("Request timed out");
+      err.name = "TimeoutError";
+      ctrl.abort(err);
+    } catch {
+      ctrl.abort();
+    }
   }, ms);
 
   return fetcher(ctrl.signal).finally(() => clearTimeout(id));
@@ -255,7 +264,7 @@ async function handle(res) {
       try {
         const text = await res.text();
         detail = text?.slice?.(0, 300);
-      } catch {}
+      } catch { /* ignore */ }
     }
     const msg = detail ? `${res.status} ${res.statusText} – ${detail}` : `HTTP ${res.status}`;
     throw new Error(msg);
@@ -263,8 +272,6 @@ async function handle(res) {
   const txt = await res.text();
   return txt ? JSON.parse(txt) : {};
 }
-
-// -------- API functions --------
 
 export async function ping(opts) {
   const url = buildURL("/diag");
@@ -308,12 +315,28 @@ export function buildQuoteStreamURL(ticker, interval = 5) {
   return url.toString();
 }
 
-/** SSE URL for sentiment alerts (server expects single `ticker`) */
-export function buildSentimentStreamURL({ ticker, days = 60, interval = 60 } = {}) {
+/** SSE URL for sentiment alerts
+ * Back-compat: supports either {tickers, neg, pos, interval} (old)
+ * or {ticker, days, interval} (new). Backend expects a single `ticker`.
+ */
+export function buildSentimentStreamURL(params = {}) {
   const url = new URL(`${API_BASE}/sentiment/alerts_stream`);
-  if (ticker) url.searchParams.set("ticker", String(ticker));
-  url.searchParams.set("days", String(days));
-  url.searchParams.set("interval", String(interval));
+  const hasOld = typeof params.tickers !== "undefined";
+  const hasNew = typeof params.ticker !== "undefined";
+  if (hasNew) {
+    url.searchParams.set("ticker", String(params.ticker || ""));
+    url.searchParams.set("days", String(params.days ?? 60));
+    url.searchParams.set("interval", String(params.interval ?? 60));
+  } else if (hasOld) {
+    const joined = Array.isArray(params.tickers) ? params.tickers.join(",") : String(params.tickers || "");
+    const first = joined.split(",").map(s => s.trim()).filter(Boolean)[0] || "";
+    url.searchParams.set("ticker", first);
+    url.searchParams.set("days", "60");
+    url.searchParams.set("interval", String(params.interval ?? 60));
+  } else {
+    url.searchParams.set("days", "60");
+    url.searchParams.set("interval", "60");
+  }
   url.searchParams.set("_ts", Date.now().toString());
   const tok = getAuthToken();
   if (tok) url.searchParams.set("token", tok);
@@ -438,7 +461,6 @@ export async function fetchStats(ticker, opts) {
   );
 }
 
-// ---------- Movers / Earnings week ----------
 export async function fetchMovers(opts) {
   const url = buildURL(MOVERS_ENDPOINT);
   return handle(
@@ -472,7 +494,7 @@ export async function fetchTopLosers(opts) {
   );
 }
 
-// 405-proof (retry with trailing slash) for proxies that require it
+// 405-proof
 export async function fetchEarningsWeek(opts) {
   const url = buildURL(EARNINGS_WEEK_ENDPOINT);
   try {
@@ -503,7 +525,37 @@ export async function fetchEarningsWeek(opts) {
 }
 
 /* ---------------- Sentiment / News ---------------- */
-/** Align with backend route name (/sentiment/correlation) */
+
+// keep these if you wire up the endpoints later
+export async function fetchNewsSentiment(ticker, limit = 80, opts) {
+  const url = new URL(`${API_BASE}/sentiment/news`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchDailySentiment(ticker, limit = 120, opts) {
+  const url = new URL(`${API_BASE}/sentiment/daily`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+/** ✅ correct backend path */
 export async function fetchSentimentCorrelation(ticker, days = 120, opts) {
   const url = new URL(`${API_BASE}/sentiment/correlation`);
   url.searchParams.set("ticker", ticker);
@@ -518,8 +570,31 @@ export async function fetchSentimentCorrelation(ticker, days = 120, opts) {
   );
 }
 
-/* Optional stubs (not used by current UI) */
-export async function fetchNewsSentiment() { return { items: [] }; }
-export async function fetchDailySentiment() { return { daily: [] }; }
-export async function fetchSentimentMatrix() { return { matrix: [] }; }
-export async function fetchSentimentTopics() { return { topics: [] }; }
+export async function fetchSentimentMatrix(tickers = [], days = 90, opts) {
+  const url = new URL(`${API_BASE}/sentiment/matrix`);
+  (tickers || []).forEach((t) => url.searchParams.append("tickers", t));
+  url.searchParams.set("days", String(days));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}
+
+export async function fetchSentimentTopics(ticker, k = 5, limit = 120, opts) {
+  const url = new URL(`${API_BASE}/sentiment/topics`);
+  url.searchParams.set("ticker", ticker);
+  url.searchParams.set("k", String(k));
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", Date.now().toString());
+  return handle(
+    await fetchWithRetry(url, {
+      headers: maybeAuth(defaultGetHeaders),
+      cache: "no-store",
+      ...(opts || {}),
+    })
+  );
+}

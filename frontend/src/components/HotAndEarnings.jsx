@@ -1,14 +1,13 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
-// - server-side clamp/sign fixes for movers
-// - client hydrates rows that look clamped / incomplete
+// - fixes AV 25% clamp by recomputing % from $change + price
+// - hydrates any row with |%| >= 24.9
 // - earnings fallback: retry /earnings_week/ on 405
 
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE, fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
-/* ---------- strict helpers & formatters ---------- */
 const EPS = 1e-6;
 
 const toNum = (v) => {
@@ -50,8 +49,8 @@ const SESSION_BADGE = (s) => {
   return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
-/* ---------- helpers for clamp fix ---------- */
 const looksClamped = (pct) => isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
+
 const pctFromPriceChange = (price, change) => {
   if (!isNum(price) || !isNum(change)) return NaN;
   const base = toNum(price) - toNum(change);
@@ -59,7 +58,6 @@ const pctFromPriceChange = (price, change) => {
   return (toNum(change) / base) * 100;
 };
 
-/* ---------- normalizer + derivations ---------- */
 function firstNum(obj, keys) {
   for (const k of keys) {
     if (obj && k in obj) {
@@ -82,9 +80,9 @@ function normalizeRow(row) {
     "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
   ]);
 
-  let change = firstNum(row, ["display_change","change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
+  let change = firstNum(row, ["change","chg","delta","Change","extended_change","after_hours_change","postmarket_change"]);
   let change_pct = firstNum(row, [
-    "change_pct","display_change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
+    "change_pct","change_percent","percent_change","pct_change","pct","ChangePercent",
     "changePct","percentChange","extended_change_pct","after_hours_change_pct","postmarket_change_pct",
   ]);
 
@@ -94,13 +92,11 @@ function normalizeRow(row) {
   ]);
   const open = firstNum(row, ["open","Open"]);
 
-  // 0) if feed looks "clamped" at ±25 and we have price + $change, recompute % from them
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const p2 = pctFromPriceChange(price, change);
     if (isNum(p2) && Math.abs(p2) < 24.9) change_pct = p2;
   }
 
-  // 1) derive vs prevClose if possible
   if (isNum(price) && isNum(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
@@ -108,7 +104,6 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // 2) fallback vs open
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
@@ -116,33 +111,28 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
-  // 3) only pct? -> $ from price or prevClose
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // 4) only $? -> % from price or prevClose
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose) ? prevClose : price;
     const p2 = isNum(base) && !nearZero(base) ? (toNum(change) / toNum(base)) * 100 : NaN;
     if (isNum(p2)) change_pct = p2;
   }
 
-  // 5) if signs disagree, trust % and recompute $
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  // squash -0.00
   if (isNum(change) && nearZero(change)) change = 0;
   if (isNum(change_pct) && nearZero(change_pct)) change_pct = 0;
 
   return { symbol, price, change, change_pct, name: row?.name ?? "" };
 }
 
-/* ---------- pickFromQuote / EOD fallback / hydrateRows ---------- */
 function pickFromQuote(q) {
   const lastClose = toNum(firstNum(q, [
     "last_close","previous_close","previousClose","prev_close","regularMarketPreviousClose"
@@ -158,11 +148,11 @@ function pickFromQuote(q) {
   const price = isNum(extPrice) ? extPrice : curPrice;
 
   let change = firstNum(q, [
-    "display_change","extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
+    "extended_change","ext_change","postmarket_change","after_hours_change","premarket_change",
     "change","regularMarketChange",
   ]);
   let change_pct = firstNum(q, [
-    "display_change_pct","extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
+    "extended_change_pct","ext_change_pct","postmarket_change_pct","after_hours_change_pct","premarket_change_pct",
     "change_pct","percent_change","regularMarketChangePercent",
   ]);
 
@@ -276,7 +266,7 @@ async function hydrateRows(rows) {
           } catch { /* ignore */ }
 
           out[i] = merged;
-        } catch { /* ignore total failure */ }
+        } catch { /* ignore */ }
       })
     );
   }
@@ -284,7 +274,6 @@ async function hydrateRows(rows) {
   return out;
 }
 
-/* ---------- shared UI shells ---------- */
 function Card({ title, right, children }) {
   return (
     <div className="he-card">
@@ -297,7 +286,6 @@ function Card({ title, right, children }) {
   );
 }
 
-/* ---------- Movers Table ---------- */
 function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kind = "gainers" }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
@@ -421,7 +409,6 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
   );
 }
 
-/* ---------- Earnings ---------- */
 function EarningsCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
@@ -534,7 +521,6 @@ function EarningsCard({ items = [], loading, error, onPick }) {
 
 function FragmentBlock({ children }) { return <>{children}</>; }
 
-/* ---------- Main component ---------- */
 export default function HotAndEarnings({ onSelectTicker }) {
   const [loadingMovers, setLoadingMovers] = useState(true);
   const [loadingEarnings, setLoadingEarnings] = useState(true);
@@ -553,27 +539,22 @@ export default function HotAndEarnings({ onSelectTicker }) {
   };
 
   const refresh = async () => {
-    // Movers
     setLoadingMovers(true);
     setErrMovers("");
     try {
       const mv = await fetchMovers();
 
-      // Normalize first
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
-      // Hydrate rows that still lack real deltas OR look clamped at ±25
       const [gHydrated, lHydrated] = await Promise.all([hydrateRows(g0), hydrateRows(l0)]);
 
-      // Keep only rows with a real (non-zero) move
       const keep = (r) =>
         isNum(r.price) &&
         ((isNum(r.change) && !nearZero(r.change)) || (isNum(r.change_pct) && !nearZero(r.change_pct)));
 
       setGainers(gHydrated.filter(keep));
       setLosers(lHydrated.filter(keep));
-
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
@@ -584,7 +565,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
       setLoadingMovers(false);
     }
 
-    // Earnings (GET /earnings_week; if 405, try /earnings_week/)
     setLoadingEarnings(true);
     setErrEarnings("");
     try {
