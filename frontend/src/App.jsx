@@ -214,7 +214,6 @@ export default function App() {
     const handler = (e) => {
       const sym = String(e?.detail || "").toUpperCase().trim();
       if (sym) setTicker(sym);
-      // let any DOM updates paint, then scroll
       requestAnimationFrame(() => requestAnimationFrame(scrollMainInfoNow));
     };
     window.addEventListener("ticker:set", handler);
@@ -371,7 +370,6 @@ export default function App() {
         if (reqVer.current !== myVer) return;
         const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map((r) => ({
           ...r,
-          // make sure "actual" is numeric and fallback to r.close
           actual: Number.isFinite(+r?.actual) ? +r.actual : Number.isFinite(+r?.close) ? +r.close : null,
         }));
         setHistoryRows(dropDupTailHistory(safeRows));
@@ -457,6 +455,17 @@ export default function App() {
     setTicker(t);
     const go = () => scrollToTarget(mainSectionRef.current);
     requestAnimationFrame(() => requestAnimationFrame(go));
+  };
+
+  // ✅ define and use this; fixes the ReferenceError
+  const handleAddToCompare = (sym) => {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return;
+    setCompareSymbols((prev) => {
+      const next = [...new Set([...(prev || []), s])];
+      return next.slice(0, 3);
+    });
+    setCompareOpen(true);
   };
 
   // Client-side metrics & recommendation
@@ -615,7 +624,6 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
-    // last past day: force to official last_close to avoid early/late-day drift
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -687,7 +695,7 @@ export default function App() {
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            text-align: center;
+            text-align: center.
           }
           .hero--center .hero-right { margin-top: 8px; }
 

@@ -3,8 +3,13 @@ import { useEffect, useMemo, useState } from "react";
 import usePerUserStorage from "../hooks/usePerUserStorage";
 import { useAuth } from "../auth/AuthContext";
 
+/**
+ * Props:
+ *  - current: string (currently viewed ticker)
+ *  - onLoad(symbol): fn to load a ticker into the main view
+ *  - onAddToCompare(symbol): fn to push a ticker into Compare (optional)
+ */
 export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
-  // who’s signed in (for resetting transient UI state on switch)
   const { user } = useAuth();
   const scope = String((user?.id || user?.email || "guest")).toLowerCase();
 
@@ -167,7 +172,7 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
                 <button
                   type="button"
                   className="btn ghost"
-                  onClick={() => onAddToCompare?.(s)}
+                  onClick={() => onAddToCompare?.(s)}  // ✅ uses prop; no global reference
                   title="Add to Compare"
                   aria-label={`Add ${s} to Compare`}
                   style={{ width: 38, height: 32, padding: 0 }}

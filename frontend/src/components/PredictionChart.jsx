@@ -57,10 +57,10 @@ export default function PredictionChart({ results = [] }) {
       ? r.confidence.map((n) => (Number.isFinite(+n) ? +n : null))
       : null;
 
-    const modelName = r?.model ?? "Model";
+    const name = r?.model ?? "Model";
     const out = [
       {
-        label: `${modelName} Forecast`,
+        label: `${name} Forecast`,
         type: "line",
         data: preds,
         borderWidth: 2,
@@ -75,7 +75,7 @@ export default function PredictionChart({ results = [] }) {
 
     if (confs && confs.some((v) => Number.isFinite(v))) {
       out.push({
-        label: `${modelName} Confidence`,
+        label: `${name} Confidence`,
         type: "bar",
         data: confs,
         backgroundColor: barTint,    // <- explicit tint
