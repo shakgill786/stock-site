@@ -21,7 +21,7 @@ import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
 import AuthModal from "./components/AuthModal";
 import { useAuth } from "./auth/AuthContext";
-import SentimentOverlay from "./components/SentimentOverlay"; // 🟣 added
+import SentimentOverlay from "./components/SentimentOverlay"; // 🟣
 import "./App.css";
 
 import {
@@ -182,7 +182,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [diagnostic, setDiagnostic] = useState("");
 
-  // Predictions
+  // Predictions (forward)
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
 
@@ -197,11 +197,14 @@ export default function App() {
   const [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
-  // Retrospective history rows from backend (for past backtest lines)
+  // Retrospective history rows from backend (for “Actual” and backtests)
   const [historyRows, setHistoryRows] = useState([]);
 
   // Protect against out-of-order async writes
   const reqVer = useRef(0);
+
+  // Abort stale in-flight fetches (so old responses can't overwrite)
+  const abortRef = useRef(null);
 
   // Where to scroll when a symbol is chosen from the movers table
   const mainSectionRef = useRef(null);
@@ -233,10 +236,10 @@ export default function App() {
     return cleaned.length >= 2 ? cleaned : [];
   };
 
-  const fetchClosesSafe = async (tkr) => {
+  const fetchClosesSafe = async (tkr, signal) => {
     const tryOnce = async (days) => {
       try {
-        const r = await fetchCloses(tkr, days);
+        const r = await fetchCloses(tkr, days, { signal });
         const c = normalizeCloses(r?.closes);
         const d = Array.isArray(r?.dates) ? r.dates : [];
         if (c.length >= 2 && d.length === c.length) return { dates: d, closes: c };
@@ -260,7 +263,10 @@ export default function App() {
     const byDateModel = {};
     (historyRows || []).forEach((r) => {
       const dk = dkey(r.date);
-      byDate[dk] = r;
+      byDate[dk] = {
+        ...r,
+        actual: Number.isFinite(+r.actual) ? +r.actual : Number.isFinite(+r.close) ? +r.close : null,
+      };
       const perModel = {};
       Object.entries(r.pred || {}).forEach(([m, v]) => {
         perModel[normModel(m)] = Number(v);
@@ -279,6 +285,11 @@ export default function App() {
   const loadData = useCallback(async () => {
     const myVer = ++reqVer.current; // this run's token
 
+    // cancel any in-flight request from the previous run
+    try { abortRef.current?.abort?.(); } catch {}
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     // Reset errors (keep existing data visible during refresh)
     setError("");
     setDiagnostic("");
@@ -288,10 +299,10 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // 1) Quote — awaitable
+    // 1) Quote — awaited, used by closes sanitization
     const pQuote = (async () => {
       try {
-        const q = await fetchQuote(t);
+        const q = await fetchQuote(t, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return null;
         setQuote(q);
         prevPriceRef.current = q.current_price;
@@ -308,7 +319,7 @@ export default function App() {
     // 2) Earnings
     const pEarn = (async () => {
       try {
-        const e = await fetchEarnings(t);
+        const e = await fetchEarnings(t, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         setEarnings(e);
       } catch {
@@ -320,7 +331,7 @@ export default function App() {
     // 3) Market
     const pMkt = (async () => {
       try {
-        const m = await fetchMarket();
+        const m = await fetchMarket({ signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         setMarket(m);
       } catch {
@@ -331,7 +342,7 @@ export default function App() {
     // 3.5) Closes (align with quote + drop duplicate tail)
     const pCloses = (async () => {
       try {
-        const raw = await fetchClosesSafe(t);
+        const raw = await fetchClosesSafe(t, ctrl.signal);
         if (reqVer.current !== myVer) return;
         const q = await pQuote.catch(() => null);
 
@@ -356,10 +367,14 @@ export default function App() {
     // 4) Past backtest rows (drop duplicate tail if backend repeats it)
     const pHist = (async () => {
       try {
-        const hist = await fetchPredictHistory({ ticker: t, models, days: 15 });
+        const hist = await fetchPredictHistory({ ticker: t, models, days: 15 }, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
-        const safeRows = dropDupTailHistory(hist?.rows || []);
-        setHistoryRows(safeRows);
+        const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map((r) => ({
+          ...r,
+          // make sure "actual" is numeric and fallback to r.close
+          actual: Number.isFinite(+r?.actual) ? +r.actual : Number.isFinite(+r?.close) ? +r.close : null,
+        }));
+        setHistoryRows(dropDupTailHistory(safeRows));
       } catch {
         if (reqVer.current !== myVer) return;
         setHistoryRows([]);
@@ -369,7 +384,7 @@ export default function App() {
     // 5) Current forward predictions
     const pPredict = (async () => {
       try {
-        const res = await fetchPredict({ ticker: t, models });
+        const res = await fetchPredict({ ticker: t, models }, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         const got = Array.isArray(res?.results) ? res.results : [];
         setResults(got);
@@ -385,15 +400,19 @@ export default function App() {
       }
     })();
 
-    await Promise.all([pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
+    await Promise.all([pQuote, pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
 
     if (reqVer.current === myVer) {
       setLoading(false);
     }
   }, [ticker, models, live]);
 
+  // kick off loads and abort on unmount
   useEffect(() => {
     loadData();
+    return () => {
+      try { abortRef.current?.abort?.(); } catch {}
+    };
   }, [loadData]);
 
   // Live SSE: only updates the quote card smoothly
@@ -440,27 +459,16 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // ➕ from Watchlist into Compare
-  const handleAddToCompare = (sym) => {
-    const s = String(sym || "").toUpperCase().trim();
-    if (!s) return;
-    setCompareSymbols((prev) => {
-      const next = [...new Set([...(prev || []), s])];
-      return next.slice(0, 3);
-    });
-    setCompareOpen(true);
-  };
-
   // Client-side metrics & recommendation
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
     const base = Number(quote.last_close) || 0;
     if (base <= 0) return [];
     return results.map((r) => {
-      const mapeProxy =
-        r.predictions.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
-        r.predictions.length;
-      const meanPred = r.predictions.reduce((a, b) => a + b, 0) / r.predictions.length;
+      const preds = (Array.isArray(r.predictions) ? r.predictions : []).map(Number).filter(Number.isFinite);
+      if (!preds.length) return { model: r.model, mapeProxy: Infinity, avgChangePct: 0 };
+      const mapeProxy = preds.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) / preds.length;
+      const meanPred = preds.reduce((a, b) => a + b, 0) / preds.length;
       const avgChangePct = ((meanPred - base) / base) * 100;
       return { model: r.model, mapeProxy, avgChangePct };
     });
@@ -495,11 +503,13 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
+  // “Actual” from closes; fallback to historyRows only if needed
   const actualForPastLabelsRaw = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
     return idx >= 0 ? closes[idx] : histByDate[iso]?.actual ?? null;
   });
 
+  // pin the last “actual” to quote.last_close for stability
   const actualForPastLabels = (() => {
     const arr = [...actualForPastLabelsRaw];
     const lastIdx = arr.length - 1;
@@ -605,6 +615,7 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
+    // last past day: force to official last_close to avoid early/late-day drift
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
