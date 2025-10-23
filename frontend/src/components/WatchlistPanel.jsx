@@ -3,31 +3,22 @@ import { useEffect, useMemo, useState } from "react";
 import usePerUserStorage from "../hooks/usePerUserStorage";
 import { useAuth } from "../auth/AuthContext";
 
-/**
- * Props:
- *  - current: string (currently viewed ticker)
- *  - onLoad(symbol): fn to load a ticker into the main view
- *  - onAddToCompare(symbol): fn to push a ticker into Compare (optional)
- */
 export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
   const { user } = useAuth();
   const scope = String((user?.id || user?.email || "guest")).toLowerCase();
 
-  // Per-user watchlist (key is namespaced by the hook)
   const [watchlist, setWatchlist] = usePerUserStorage("WATCHLIST_V1", []);
 
   const [symbol, setSymbol] = useState("");
   const [tag, setTag] = useState("no tag");
   const [filter, setFilter] = useState("all");
 
-  // Reset inputs whenever the account changes
   useEffect(() => {
     setSymbol("");
     setTag("no tag");
     setFilter("all");
   }, [scope]);
 
-  // Collapsible on mobile
   const [collapsed, setCollapsed] = useState(false);
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1060px)");
@@ -45,7 +36,7 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
   const add = () => {
     const s = symbol.trim().toUpperCase();
     if (!s) return;
-    if (!/^[A-Z0-9.\-]{1,15}$/.test(s)) return; // light sanity gate
+    if (!/^[A-Z0-9.\-]{1,15}$/.test(s)) return;
     if (!watchlist.some((w) => w.symbol === s)) {
       setWatchlist([...(watchlist || []), { symbol: s, tag }]);
     }
@@ -64,7 +55,6 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
 
   return (
     <div className={`card watchlist ${collapsed ? "wl-collapsed" : "wl-open"}`}>
-      {/* Mobile toggle */}
       <button
         type="button"
         className="wl-toggle"
@@ -81,14 +71,12 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
         <span className="chev">{collapsed ? "▸" : "▾"}</span>
       </button>
 
-      {/* Desktop header */}
       <h3 className="hide-on-mobile" style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}>
         <span>⭐</span> Watchlist
         <span className="muted" style={{ fontSize: 12 }}>({watchlist.length})</span>
       </h3>
 
       <div id="wl-content" className="wl-content">
-        {/* Header row — no overlap */}
         <div className="watchlist-header">
           <input
             type="text"
@@ -172,7 +160,7 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
                 <button
                   type="button"
                   className="btn ghost"
-                  onClick={() => onAddToCompare?.(s)}  // ✅ uses prop; no global reference
+                  onClick={() => onAddToCompare?.(s)}
                   title="Add to Compare"
                   aria-label={`Add ${s} to Compare`}
                   style={{ width: 38, height: 32, padding: 0 }}
@@ -194,7 +182,6 @@ export default function WatchlistPanel({ current, onLoad, onAddToCompare }) {
           {filtered.length === 0 && <div className="muted">No symbols.</div>}
         </div>
 
-        {/* Desktop-only clear */}
         {watchlist.length > 0 && (
           <div className="hide-on-mobile" style={{ marginTop: 8, textAlign: "right" }}>
             <button type="button" className="btn ghost" onClick={clearAll} title="Clear all">

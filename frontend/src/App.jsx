@@ -15,13 +15,13 @@ import EarningsCard from "./components/EarningsCard";
 import RecommendationCard from "./components/RecommendationCard";
 import MetricsList from "./components/MetricsList";
 import WatchlistPanel from "./components/WatchlistPanel";
-import useEventSource from "./hooks/useEventSource";
+// ⛔️ removed custom useEventSource to avoid hook-order issues
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
 import AuthModal from "./components/AuthModal";
 import { useAuth } from "./auth/AuthContext";
-import SentimentOverlay from "./components/SentimentOverlay"; // 🟣
+import SentimentOverlay from "./components/SentimentOverlay";
 import "./App.css";
 
 import {
@@ -93,8 +93,8 @@ const dropDupTailSeries = (dates = [], closes = []) => {
 const dropDupTailHistory = (rows = []) => {
   const n = rows.length;
   if (n >= 2) {
-    const a = Number(rows[n - 1]?.actual);
-    const b = Number(rows[n - 2]?.actual);
+    const a = Number(rows[n - 1]?.actual ?? rows[n - 1]?.close);
+    const b = Number(rows[n - 2]?.actual ?? rows[n - 2]?.close);
     const dA = String(rows[n - 1]?.date || "");
     const dB = String(rows[n - 2]?.date || "");
     if (dA !== dB && Number.isFinite(a) && Number.isFinite(b) && a === b) {
@@ -158,6 +158,31 @@ function scrollMainInfoNow() {
     const top = el.getBoundingClientRect().top + window.pageYOffset - 8;
     window.scrollTo({ top, behavior: "smooth" });
   }
+}
+
+/** Simple error boundary so a runtime error never blanks the whole app */
+function ErrorBoundary({ children }) {
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    const handler = (e) => setErr(e?.error || e);
+    window.addEventListener("error", handler);
+    window.addEventListener("unhandledrejection", handler);
+    return () => {
+      window.removeEventListener("error", handler);
+      window.removeEventListener("unhandledrejection", handler);
+    };
+  }, []);
+  if (err) {
+    return (
+      <div className="card" style={{ margin: 16, borderLeft: "4px solid #ff6b6b" }}>
+        <h3 style={{ marginTop: 0 }}>Something went wrong</h3>
+        <div className="muted" style={{ whiteSpace: "pre-wrap" }}>
+          {String(err?.message || err)}
+        </div>
+      </div>
+    );
+  }
+  return children;
 }
 
 export default function App() {
@@ -413,32 +438,49 @@ export default function App() {
     };
   }, [loadData]);
 
-  // Live SSE: only updates the quote card smoothly
-  const streamUrl = live ? buildQuoteStreamURL(ticker, 5) : null;
-
-  useEventSource(streamUrl, {
-    onMessage: (payload) => {
-      const prev = prevPriceRef.current;
-      const next = Number(payload.current_price);
-      if (typeof next === "number" && !Number.isNaN(next)) {
-        setQuote((q) =>
-          q
-            ? { ...q, current_price: next, change_pct: payload.change_pct }
-            : {
-                ticker: payload.ticker,
-                current_price: next,
-                last_close: payload.last_close,
-                change_pct: payload.change_pct,
-              }
-        );
-        if (typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
-          setBlinkClass(next > prev ? "blink-up" : "blink-down");
-          setTimeout(() => setBlinkClass(""), 520);
+  // 🔄 Inline SSE (replaces useEventSource). Hook order is stable across renders.
+  useEffect(() => {
+    if (!live || !ticker) return;
+    const url = buildQuoteStreamURL(ticker, 5);
+    let es;
+    try {
+      es = new EventSource(url);
+    } catch {
+      return;
+    }
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const prev = prevPriceRef.current;
+        const next = Number(payload.current_price);
+        if (typeof next === "number" && !Number.isNaN(next)) {
+          setQuote((q) =>
+            q
+              ? { ...q, current_price: next, change_pct: payload.change_pct }
+              : {
+                  ticker: payload.ticker,
+                  current_price: next,
+                  last_close: payload.last_close,
+                  change_pct: payload.change_pct,
+                }
+          );
+          if (typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
+            setBlinkClass(next > prev ? "blink-up" : "blink-down");
+            setTimeout(() => setBlinkClass(""), 520);
+          }
+          prevPriceRef.current = next;
         }
-        prevPriceRef.current = next;
+      } catch {
+        /* ignore parse issues */
       }
-    },
-  });
+    };
+    es.onerror = () => {
+      try { es.close(); } catch {}
+    };
+    return () => {
+      try { es.close(); } catch {}
+    };
+  }, [live, ticker]);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -457,7 +499,7 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // ✅ define and use this; fixes the ReferenceError
+  // ➕ Add from Watchlist into Compare (was missing earlier → crash)
   const handleAddToCompare = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
@@ -624,6 +666,7 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
+    // last past day: force to official last_close to avoid early/late-day drift
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -641,395 +684,396 @@ export default function App() {
   });
 
   return (
-    <div className="app-root">
-      {/* Hero header (centered) */}
-      <div className="hero-wrap">
-        <div className="hero hero--center">
-          <div>
-            <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
-            <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
-          </div>
-          <div className="hero-right" style={{ display: "flex", gap: 8 }}>
-            {user ? (
-              <>
-                <span className="muted" style={{ fontSize: 14 }}>
-                  👋 {user?.name || user?.email}
-                </span>
-                <button className="btn ghost" onClick={logout} title="Sign out">
-                  Sign out
+    <ErrorBoundary>
+      <div className="app-root">
+        {/* Hero header (centered) */}
+        <div className="hero-wrap">
+          <div className="hero hero--center">
+            <div>
+              <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
+              <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
+            </div>
+            <div className="hero-right" style={{ display: "flex", gap: 8 }}>
+              {user ? (
+                <>
+                  <span className="muted" style={{ fontSize: 14 }}>
+                    👋 {user?.name || user?.email}
+                  </span>
+                  <button className="btn ghost" onClick={logout} title="Sign out">
+                    Sign out
+                  </button>
+                </>
+              ) : (
+                <button className="btn" onClick={() => setShowAuth(true)}>
+                  Sign in / Create account
                 </button>
-              </>
-            ) : (
-              <button className="btn" onClick={() => setShowAuth(true)}>
-                Sign in / Create account
+              )}
+              <button className="btn ghost" onClick={() => window.location.reload()}>
+                ↻ Refresh
               </button>
-            )}
-            <button className="btn ghost" onClick={() => window.location.reload()}>
-              ↻ Refresh
-            </button>
+            </div>
           </div>
+
+          {/* Scoped hero styles */}
+          <style>{`
+            .hero-wrap { margin: 6px 0 12px; }
+            .hero {
+              display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
+              padding: 18px 16px;
+              border-radius: 16px;
+              background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
+              border: 1px solid rgba(255,255,255,0.08);
+              box-shadow: 0 8px 22px rgba(0,0,0,0.28);
+            }
+            .hero-title {
+              margin: 0;
+              font-size: clamp(22px, 3.6vw, 36px);
+              letter-spacing: .3px;
+              line-height: 1.15;
+            }
+            .hero-sub { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
+            .hero-right { display: flex; align-items: center; gap: 8px; }
+
+            /* Centered variant */
+            .hero--center {
+              flex-direction: column;
+              align-items: center;
+              justify-content: center;
+              text-align: center;
+            }
+            .hero--center .hero-right { margin-top: 8px; }
+
+            @media (max-width: 720px) {
+              .hero { flex-direction: column; align-items: flex-start; }
+              .hero--center { align-items: center; }
+              .hero-right { width: 100%; justify-content: center; }
+            }
+          `}</style>
         </div>
 
-        {/* Scoped hero styles */}
-        <style>{`
-          .hero-wrap { margin: 6px 0 12px; }
-          .hero {
-            display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
-            padding: 18px 16px;
-            border-radius: 16px;
-            background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
-            border: 1px solid rgba(255,255,255,0.08);
-            box-shadow: 0 8px 22px rgba(0,0,0,0.28);
-          }
-          .hero-title {
-            margin: 0;
-            font-size: clamp(22px, 3.6vw, 36px);
-            letter-spacing: .3px;
-            line-height: 1.15;
-          }
-          .hero-sub { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
-          .hero-right { display: flex; align-items: center; gap: 8px; }
+        <main className="container grid-2col">
+          {/* LEFT: Watchlist */}
+          <aside className="left-rail">
+            <WatchlistPanel
+              current={ticker}
+              onLoad={(s) => setTicker(s)}
+              onAddToCompare={handleAddToCompare}
+            />
+            <div style={{ marginTop: 12 }}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={live}
+                  onChange={() => setLive((v) => !v)}
+                />{" "}
+                Live price updates (SSE)
+              </label>
+            </div>
+          </aside>
 
-          /* Centered variant */
-          .hero--center {
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            text-align: center.
-          }
-          .hero--center .hero-right { margin-top: 8px; }
+          {/* RIGHT: Main content */}
+          <section>
+            {/* Compare Mode Toggle */}
+            <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+              <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
+                {compareOpen ? "Close Compare" : "Open Compare"}
+              </button>
+            </div>
 
-          @media (max-width: 720px) {
-            .hero { flex-direction: column; align-items: flex-start; }
-            .hero--center { align-items: center; }
-            .hero-right { width: 100%; justify-content: center; }
-          }
-        `}</style>
-      </div>
+            {compareOpen && (
+              <CompareMode
+                symbols={compareSymbols}
+                onSymbolsChange={setCompareSymbols}
+                defaultModels={models}
+                rememberSession={false}
+                onExit={() => setCompareOpen(false)}
+              />
+            )}
 
-      <main className="container grid-2col">
-        {/* LEFT: Watchlist */}
-        <aside className="left-rail">
-          <WatchlistPanel
-            current={ticker}
-            onLoad={(s) => setTicker(s)}
-            onAddToCompare={handleAddToCompare}
-          />
-          <div style={{ marginTop: 12 }}>
-            <label>
+            {/* Hot movers + Earnings next 7d */}
+            <HotAndEarnings onSelectTicker={handleSelectTicker} />
+
+            <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
               <input
-                type="checkbox"
-                checked={live}
-                onChange={() => setLive((v) => !v)}
-              />{" "}
-              Live price updates (SSE)
-            </label>
-          </div>
-        </aside>
+                value={ticker}
+                onChange={(e) => setTicker(e.target.value.toUpperCase())}
+                placeholder="Ticker (e.g. AAPL or BTC-USD)"
+                required
+                type="text"
+                style={{ flex: "1 1 180px" }}
+              />
+              <button className="btn" disabled={loading}>
+                {loading ? "Loading…" : "Load Data"}
+              </button>
+            </form>
 
-        {/* RIGHT: Main content */}
-        <section>
-          {/* Compare Mode Toggle */}
-          <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-            <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
-              {compareOpen ? "Close Compare" : "Open Compare"}
-            </button>
-          </div>
-
-          {compareOpen && (
-            <CompareMode
-              symbols={compareSymbols}
-              onSymbolsChange={setCompareSymbols}
-              defaultModels={models}
-              rememberSession={false}
-              onExit={() => setCompareOpen(false)}
+            {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
+            <div
+              id="main-stock-info"
+              ref={mainSectionRef}
+              style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
+              aria-hidden
             />
-          )}
 
-          {/* Hot movers + Earnings next 7d */}
-          <HotAndEarnings onSelectTicker={handleSelectTicker} />
+            {/* Top info row */}
+            <div className="row" style={{ gap: 16, marginBottom: 12 }}>
+              {/* Quote Card */}
+              <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+                  <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+                  {closes.length > 0 && (
+                    <button
+                      className="btn ghost"
+                      onClick={() => setShowBigPriceChart(true)}
+                      style={{ padding: "2px 8px", fontSize: 12 }}
+                      title="Magnify chart"
+                    >
+                      🔍 Magnify
+                    </button>
+                  )}
+                </div>
 
-          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
-            <input
-              value={ticker}
-              onChange={(e) => setTicker(e.target.value.toUpperCase())}
-              placeholder="Ticker (e.g. AAPL or BTC-USD)"
-              required
-              type="text"
-              style={{ flex: "1 1 180px" }}
-            />
-            <button className="btn" disabled={loading}>
-              {loading ? "Loading…" : "Load Data"}
-            </button>
-          </form>
+                {quoteErr ? (
+                  <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
+                    Error loading quote
+                  </p>
+                ) : quote ? (
+                  <>
+                    <p style={{ margin: 0 }}>
+                      Last Close: ${Number(quote.last_close).toFixed(2)}
+                    </p>
+                    <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
+                      <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
+                        ${tweenPrice.toFixed(2)}
+                      </span>
+                      {Number.isFinite(Number(quote?.change_pct)) && (
+                        <span
+                          style={{
+                            color: Number(quote.change_pct) >= 0 ? "#2e7d32" : "#c62828",
+                            fontWeight: 600,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 4,
+                            fontSize: "0.9em",
+                          }}
+                          aria-label={`${
+                            Number(quote.change_pct) >= 0 ? "Up" : "Down"
+                          } ${Math.abs(Number(quote.change_pct)).toFixed(2)} percent`}
+                          title={`${
+                            Number(quote.change_pct) >= 0 ? "Up" : "Down"
+                          } ${Math.abs(Number(quote.change_pct)).toFixed(2)}%`}
+                        >
+                          {Number(quote.change_pct) >= 0 ? "▲" : "▼"}{" "}
+                          {(Number(quote.current_price) - Number(quote.last_close)).toFixed(2)}{" "}
+                          ({Math.abs(Number(quote.change_pct)).toFixed(2)}%)
+                        </span>
+                      )}
+                    </p>
 
-          {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
-          <div
-            id="main-stock-info"
-            ref={mainSectionRef}
-            style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
-            aria-hidden
-          />
-
-          {/* Top info row */}
-          <div className="row" style={{ gap: 16, marginBottom: 12 }}>
-            {/* Quote Card */}
-            <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-                <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
-                {closes.length > 0 && (
-                  <button
-                    className="btn ghost"
-                    onClick={() => setShowBigPriceChart(true)}
-                    style={{ padding: "2px 8px", fontSize: 12 }}
-                    title="Magnify chart"
-                  >
-                    🔍 Magnify
-                  </button>
+                    {/* mini interactive chart (clipped) */}
+                    <div style={{ marginTop: 6 }}>
+                      {closes.length >= 2 ? (
+                        <div style={{ borderRadius: 10, overflow: "hidden" }}>
+                          <InteractivePriceChart
+                            data={closes}
+                            labels={closeDates}
+                            width={320}
+                            height={80}
+                          />
+                        </div>
+                      ) : (
+                        <div className="muted" style={{ fontSize: 12 }}>
+                          no chart data
+                        </div>
+                      )}
+                    </div>
+                    {closes.length >= 2 && (
+                      <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                        drag to pan • wheel to zoom • double-click to reset
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="muted" style={{ margin: 0 }}>
+                    N/A
+                  </p>
                 )}
               </div>
 
-              {quoteErr ? (
-                <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
-                  Error loading quote
-                </p>
-              ) : quote ? (
-                <>
-                  <p style={{ margin: 0 }}>
-                    Last Close: ${Number(quote.last_close).toFixed(2)}
-                  </p>
-                  <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
-                    <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
-                      ${tweenPrice.toFixed(2)}
-                    </span>
-                    {Number.isFinite(Number(quote?.change_pct)) && (
-                      <span
-                        style={{
-                          color: Number(quote.change_pct) >= 0 ? "#2e7d32" : "#c62828",
-                          fontWeight: 600,
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 4,
-                          fontSize: "0.9em",
-                        }}
-                        aria-label={`${
-                          Number(quote.change_pct) >= 0 ? "Up" : "Down"
-                        } ${Math.abs(Number(quote.change_pct)).toFixed(2)} percent`}
-                        title={`${
-                          Number(quote.change_pct) >= 0 ? "Up" : "Down"
-                        } ${Math.abs(Number(quote.change_pct)).toFixed(2)}%`}
-                      >
-                        {Number(quote.change_pct) >= 0 ? "▲" : "▼"}{" "}
-                        {(Number(quote.current_price) - Number(quote.last_close)).toFixed(2)}{" "}
-                        ({Math.abs(Number(quote.change_pct)).toFixed(2)}%)
-                      </span>
-                    )}
-                  </p>
+              {/* Earnings */}
+              <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+                <EarningsCard earnings={earnings} />
+              </div>
 
-                  {/* mini interactive chart (clipped) */}
-                  <div style={{ marginTop: 6 }}>
-                    {closes.length >= 2 ? (
-                      <div style={{ borderRadius: 10, overflow: "hidden" }}>
-                        <InteractivePriceChart
-                          data={closes}
-                          labels={closeDates}
-                          width={320}
-                          height={80}
-                        />
-                      </div>
-                    ) : (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        no chart data
-                      </div>
-                    )}
-                  </div>
-                  {closes.length >= 2 && (
-                    <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-                      drag to pan • wheel to zoom • double-click to reset
-                    </div>
-                  )}
-                </>
-              ) : (
-                <p className="muted" style={{ margin: 0 }}>
-                  N/A
-                </p>
-              )}
+              {/* Recommendation */}
+              <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+                <RecommendationCard recommendation={recommendation} />
+              </div>
             </div>
 
-            {/* Earnings */}
-            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <EarningsCard earnings={earnings} />
-            </div>
+            {/* Market Breadth */}
+            {market && (
+              <div className="card">
+                <MarketCard market={market} />
+              </div>
+            )}
 
-            {/* Recommendation */}
-            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <RecommendationCard recommendation={recommendation} />
-            </div>
-          </div>
-
-          {/* Market Breadth */}
-          {market && (
-            <div className="card">
-              <MarketCard market={market} />
-            </div>
-          )}
-
-          {/* 📰 Sentiment overlay */}
-          <div className="card" style={{ marginTop: 12 }}>
-            <SentimentOverlay ticker={ticker} days={120} />
-          </div>
-
-          {/* Metrics list */}
-          {!!metrics.length && (
-            <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
-              <MetricsList metrics={metrics} />
-            </div>
-          )}
-
-          {/* --- Actual vs Predicted (chart + table) --- */}
-          {results.length > 0 && closes.length >= 2 && (
+            {/* 📰 Sentiment overlay */}
             <div className="card" style={{ marginTop: 12 }}>
-              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
+              <SentimentOverlay ticker={ticker} days={120} />
+            </div>
 
-              <div
-                style={{
-                  height: 260,
-                  borderRadius: 12,
-                  overflow: "hidden",
-                  background: "rgba(255,255,255,0.03)",
-                  padding: 8,
-                }}
-              >
-                <Chart type="line" data={avpChartData} options={avpChartOptions} />
+            {/* Metrics list */}
+            {!!metrics.length && (
+              <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
+                <MetricsList metrics={metrics} />
               </div>
+            )}
 
-              <div className="table-wrap" style={{ marginTop: 12 }}>
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th style={{ whiteSpace: "nowrap" }}>Date</th>
-                      <th>Actual</th>
-                      {results.map((r) => (
-                        <th key={r.model}>
-                          {r.model}
-                          <span className="muted" style={{ fontSize: 11, display: "block" }}>
-                            <em>past: backtest • future: current</em>
-                          </span>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...pastRows, ...futureRows].map((row, i) => (
-                      <tr key={`${row.kind}-${row.date || i}`}>
-                        <td>
-                          {row.date
-                            ? row.kind === "future"
-                              ? `${row.date} (+${i - pastRows.length + 1}d)`
-                              : row.date
-                            : ""}
-                        </td>
-                        <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
-                        {row.perModel.map((v, j) => (
-                          <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
+            {/* --- Actual vs Predicted (chart + table) --- */}
+            {results.length > 0 && closes.length >= 2 && (
+              <div className="card" style={{ marginTop: 12 }}>
+                <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
+
+                <div
+                  style={{
+                    height: 260,
+                    borderRadius: 12,
+                    overflow: "hidden",
+                    background: "rgba(255,255,255,0.03)",
+                    padding: 8,
+                }}>
+                  <Chart type="line" data={avpChartData} options={avpChartOptions} />
+                </div>
+
+                <div className="table-wrap" style={{ marginTop: 12 }}>
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th style={{ whiteSpace: "nowrap" }}>Date</th>
+                        <th>Actual</th>
+                        {results.map((r) => (
+                          <th key={r.model}>
+                            {r.model}
+                            <span className="muted" style={{ fontSize: 11, display: "block" }}>
+                              <em>past: backtest • future: current</em>
+                            </span>
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {!!diagnostic && (
-                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-                  Note: {diagnostic}
-                </div>
-              )}
-            </div>
-          )}
-
-          {diagnostic && (
-            <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
-              <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
-              <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
-            </div>
-          )}
-
-          {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
-
-          {/* Model selector */}
-          <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
-            {MODEL_OPTIONS.map((m) => (
-              <label key={m} style={{ marginRight: 12 }}>
-                <input
-                  type="checkbox"
-                  checked={models.includes(m)}
-                  onChange={() => toggleModel(m)}
-                />{" "}
-                {m}
-              </label>
-            ))}
-          </div>
-
-          {/* Forecast Table */}
-          {results.length > 0 && (
-            <div className="card table-card">
-              <div className="table-wrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Model</th>
-                      {results[0].predictions.map((_, i) => (
-                        <th key={i}>{`+${i + 1}d`}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.map(({ model, predictions, confidence }) => (
-                      <tr key={model}>
-                        <td>{model}</td>
-                        {predictions.map((val, i) => (
-                          <td key={i}>
-                            {Number(val).toFixed(2)}
-                            {Array.isArray(confidence) && confidence[i] != null && (
-                              <div className="muted" style={{ fontSize: 11 }}>
-                                conf {Number(confidence[i]).toFixed(2)}
-                              </div>
-                            )}
+                    </thead>
+                    <tbody>
+                      {[...pastRows, ...futureRows].map((row, i) => (
+                        <tr key={`${row.kind}-${row.date || i}`}>
+                          <td>
+                            {row.date
+                              ? row.kind === "future"
+                                ? `${row.date} (+${i - pastRows.length + 1}d)`
+                                : row.date
+                              : ""}
                           </td>
+                          <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
+                          {row.perModel.map((v, j) => (
+                            <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {!!diagnostic && (
+                  <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                    Note: {diagnostic}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {diagnostic && (
+              <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
+                <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
+              </div>
+            )}
+
+            {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
+
+            {/* Model selector */}
+            <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
+              {MODEL_OPTIONS.map((m) => (
+                <label key={m} style={{ marginRight: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={models.includes(m)}
+                    onChange={() => toggleModel(m)}
+                  />{" "}
+                  {m}
+                </label>
+              ))}
+            </div>
+
+            {/* Forecast Table */}
+            {results.length > 0 && (
+              <div className="card table-card">
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        {results[0].predictions.map((_, i) => (
+                          <th key={i}>{`+${i + 1}d`}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {!!diagnostic && (
-                <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
-                  Note: {diagnostic}
+                    </thead>
+                    <tbody>
+                      {results.map(({ model, predictions, confidence }) => (
+                        <tr key={model}>
+                          <td>{model}</td>
+                          {predictions.map((val, i) => (
+                            <td key={i}>
+                              {Number(val).toFixed(2)}
+                              {Array.isArray(confidence) && confidence[i] != null && (
+                                <div className="muted" style={{ fontSize: 11 }}>
+                                  conf {Number(confidence[i]).toFixed(2)}
+                                </div>
+                              )}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-              )}
+                {!!diagnostic && (
+                  <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
+                    Note: {diagnostic}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </main>
+
+        {/* Big chart modal */}
+        {showBigPriceChart && (
+          <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
+            <div style={{ borderRadius: 12, overflow: "hidden" }}>
+              <InteractivePriceChart
+                data={closes || []}
+                labels={closeDates || []}
+                width={800}
+                height={300}
+                big
+              />
             </div>
-          )}
-        </section>
-      </main>
+          </MagnifyModal>
+        )}
 
-      {/* Big chart modal */}
-      {showBigPriceChart && (
-        <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
-          <div style={{ borderRadius: 12, overflow: "hidden" }}>
-            <InteractivePriceChart
-              data={closes || []}
-              labels={closeDates || []}
-              width={800}
-              height={300}
-              big
-            />
-          </div>
-        </MagnifyModal>
-      )}
-
-      {/* 🔐 Auth modal mount */}
-      <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
-    </div>
+        {/* 🔐 Auth modal mount */}
+        <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
+      </div>
+    </ErrorBoundary>
   );
 }
 

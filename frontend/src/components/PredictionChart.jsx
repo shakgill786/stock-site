@@ -23,7 +23,7 @@ ChartJS.register(
   Legend
 );
 
-// explicit palette so we never fall back to pure black on dark backgrounds
+// Explicit palette so we never fall back to pure black on dark backgrounds
 const palette = [
   "#8fb9ff", // blue
   "#ffd166", // amber
@@ -57,10 +57,10 @@ export default function PredictionChart({ results = [] }) {
       ? r.confidence.map((n) => (Number.isFinite(+n) ? +n : null))
       : null;
 
-    const name = r?.model ?? "Model";
+    const modelName = r?.model ?? "Model";
     const out = [
       {
-        label: `${name} Forecast`,
+        label: `${modelName} Forecast`,
         type: "line",
         data: preds,
         borderWidth: 2,
@@ -75,7 +75,7 @@ export default function PredictionChart({ results = [] }) {
 
     if (confs && confs.some((v) => Number.isFinite(v))) {
       out.push({
-        label: `${name} Confidence`,
+        label: `${modelName} Confidence`,
         type: "bar",
         data: confs,
         backgroundColor: barTint,    // <- explicit tint
