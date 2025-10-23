@@ -704,7 +704,7 @@ async def earnings_week():
 async def earnings_week_alias():
     return await earnings_week()
 
-# ======================= Sentiment (news → daily mean → correlation) =======================
+# ======================= Sentiment =======================
 def _iso_date(s: str) -> str:
     return str(s)[:10]
 
@@ -721,7 +721,7 @@ async def _fetch_av_news_sentiment(symbol: str, days: int) -> List[Dict[str, Any
         return []
 
     # Alpha Vantage wants time_from like 20240101T0000
-    start = _utc_now() - timedelta(days=max(1, days + 2))
+    start = _utc_now() - timedelta(days=max(1, days + 14))  # widen to catch weekends/holidays
     time_from = start.strftime("%Y%m%dT0000")
 
     params = {
@@ -777,6 +777,54 @@ async def _fetch_av_news_sentiment(symbol: str, days: int) -> List[Dict[str, Any
     out.sort(key=lambda x: x["date"])
     return out[-days:] if days and len(out) > days else out
 
+async def _fetch_av_news_raw(symbol: str, limit: int = 80) -> List[Dict[str, Any]]:
+    """
+    Minimal raw news fetch/normalize from Alpha Vantage NEWS_SENTIMENT feed.
+    """
+    key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not key:
+        return []
+
+    start = _utc_now() - timedelta(days=30)
+    time_from = start.strftime("%Y%m%dT0000")
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": symbol.upper(),
+        "time_from": time_from,
+        "sort": "LATEST",
+        "apikey": key,
+        "limit": max(1, min(int(limit), 2000)),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://www.alphavantage.co/query", params=params)
+            data = r.json() if r.content else {}
+    except Exception:
+        return []
+
+    feed = data.get("feed") or []
+    out = []
+    for it in feed:
+        ts = it.get("time_published") or ""
+        d_iso = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else None
+        score = _to_float(it.get("overall_sentiment_score"))
+        # pick per-ticker score if available
+        tscore = None
+        for t in it.get("ticker_sentiment", []) or []:
+            if _norm_symbol(t.get("ticker")) == symbol.upper():
+                tscore = _to_float(t.get("ticker_sentiment_score"))
+                break
+        out.append({
+            "title": it.get("title"),
+            "url": it.get("url"),
+            "source": it.get("source"),
+            "published": d_iso,
+            "overall_score": score,
+            "ticker_score": tscore,
+        })
+    return out
+
 def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
     n = min(len(xs), len(ys))
     if n < 3:
@@ -789,6 +837,18 @@ def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
     if denx == 0 or deny == 0:
         return None
     return num / (denx * deny)
+
+@router.get("/sentiment/daily", summary="Daily mean sentiment")
+async def sentiment_daily(ticker: str, limit: int = 120):
+    symbol = _norm_symbol(ticker)
+    daily = await _fetch_av_news_sentiment(symbol, limit)
+    return {"ticker": symbol, "daily": daily}
+
+@router.get("/sentiment/news", summary="Raw news (simplified) for ticker")
+async def sentiment_news(ticker: str, limit: int = 80):
+    symbol = _norm_symbol(ticker)
+    items = await _fetch_av_news_raw(symbol, limit)
+    return {"ticker": symbol, "items": items}
 
 @router.get("/sentiment/correlation", summary="Sentiment vs next-day return")
 async def sentiment_correlation(ticker: str, days: int = 120):
@@ -816,25 +876,38 @@ async def sentiment_correlation(ticker: str, days: int = 120):
     # 2) News sentiment, daily mean
     daily_sent = await _fetch_av_news_sentiment(symbol, days)
 
-    # 3) Build next-day returns aligned to price dates
-    idx_by_date = {str(d)[:10]: i for i, d in enumerate(dates)}
+    # 3) Build next-day returns aligned to price dates (same-or-next trading day)
+    def first_index_on_or_after(target_iso: str) -> int:
+        lo, hi = 0, len(dates) - 1
+        ans = -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cur = str(dates[mid])[:10]
+            if cur >= target_iso:
+                ans = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        return ans
+
     pairs: List[Dict[str, Any]] = []
     for row in daily_sent:
         d = _iso_date(row["date"])
-        i = idx_by_date.get(d)
-        if i is None:
+        j = first_index_on_or_after(d)
+        if j is None or j < 0:
             continue
-        if i + 1 >= len(closes):
+        if j + 1 >= len(closes):
             continue
-        c0 = float(closes[i]); c1 = float(closes[i + 1])
+        c0 = float(closes[j]); c1 = float(closes[j + 1])
         if c0 <= 0:
             continue
         ret = (c1 - c0) / c0
-        pairs.append({"date": d, "sent": float(row["mean"]), "ret": float(ret)})
+        pairs.append({"date": d, "price_date": str(dates[j])[:10], "sent": float(row["mean"]), "ret": float(ret)})
 
     if not pairs:
         return {
             "ticker": symbol,
+            "days": days,
             "daily": daily_sent,
             "closes_dates": [str(d)[:10] for d in dates],
             "closes": closes,
@@ -853,6 +926,10 @@ async def sentiment_correlation(ticker: str, days: int = 120):
         "closes": closes,
         "correlation": {"pearson_r": r, "n": len(pairs), "pairs": pairs},
     }
+
+@router.get("/sentiment/correlate", summary="Alias to /sentiment/correlation")
+async def sentiment_correlate(ticker: str, days: int = 120):
+    return await sentiment_correlation(ticker=ticker, days=days)
 
 # ----------------------- Sentiment alerts SSE -----------------------
 @router.get("/sentiment/alerts_stream", summary="Sentiment Alerts (SSE)")
