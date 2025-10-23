@@ -1,5 +1,5 @@
 // frontend/src/App.jsx
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   fetchPredict,
   fetchQuote,
@@ -8,14 +8,14 @@ import {
   fetchCloses,
   fetchPredictHistory,
   buildQuoteStreamURL,
-  ping, // 🔔 pre-warm backend
+  ping,
 } from "./api";
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
 import RecommendationCard from "./components/RecommendationCard";
 import MetricsList from "./components/MetricsList";
 import WatchlistPanel from "./components/WatchlistPanel";
-// ⛔️ removed custom useEventSource to avoid hook-order issues
+// intentionally NOT using custom useEventSource to keep hook order stable
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
@@ -49,6 +49,55 @@ ChartJS.register(
 );
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
+
+// ===== Debug helpers: disable segments via URL ?disable=A,B,C =====
+function useDisabledSegments() {
+  const [disabled] = useState(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const list = (params.get("disable") || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      return new Set(list);
+    } catch {
+      return new Set();
+    }
+  });
+  return disabled;
+}
+const isDisabled = (disabledSet, name) => disabledSet.has(name);
+
+// ===== Real class-based error boundary per segment =====
+class SegmentBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    // eslint-disable-next-line no-console
+    console.error(`🧯 Segment crashed: ${this.props.name}`, error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="card" style={{ borderLeft: "4px solid #ff6b6b", marginTop: 8 }}>
+          <div style={{ fontWeight: 700 }}>Segment failed: {this.props.name}</div>
+          <div className="muted" style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
+            {String(this.state.error?.message || this.state.error)}
+          </div>
+          <div className="muted" style={{ fontSize: 12 }}>
+            Tip: add <code>?disable={this.props.name}</code> to the URL to bypass this section.
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ----- Date helpers (timezone-safe) -----
 const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
@@ -111,12 +160,10 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   if (!outDates.length || outDates.length !== outCloses.length) {
     return { dates: [], closes: [] };
   }
-
   const lastIdx = outCloses.length - 1;
   if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
     outCloses[lastIdx] = Number(quote.last_close);
   }
-
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
 }
@@ -160,32 +207,9 @@ function scrollMainInfoNow() {
   }
 }
 
-/** Simple error boundary so a runtime error never blanks the whole app */
-function ErrorBoundary({ children }) {
-  const [err, setErr] = useState(null);
-  useEffect(() => {
-    const handler = (e) => setErr(e?.error || e);
-    window.addEventListener("error", handler);
-    window.addEventListener("unhandledrejection", handler);
-    return () => {
-      window.removeEventListener("error", handler);
-      window.removeEventListener("unhandledrejection", handler);
-    };
-  }, []);
-  if (err) {
-    return (
-      <div className="card" style={{ margin: 16, borderLeft: "4px solid #ff6b6b" }}>
-        <h3 style={{ marginTop: 0 }}>Something went wrong</h3>
-        <div className="muted" style={{ whiteSpace: "pre-wrap" }}>
-          {String(err?.message || err)}
-        </div>
-      </div>
-    );
-  }
-  return children;
-}
-
 export default function App() {
+  const disabled = useDisabledSegments();
+
   const { user, logout } = useAuth();
   const [showAuth, setShowAuth] = useState(false);
 
@@ -499,7 +523,7 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // ➕ Add from Watchlist into Compare (was missing earlier → crash)
+  // ➕ Add from Watchlist into Compare (explicit; avoids earlier crash)
   const handleAddToCompare = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
@@ -516,7 +540,9 @@ export default function App() {
     const base = Number(quote.last_close) || 0;
     if (base <= 0) return [];
     return results.map((r) => {
-      const preds = (Array.isArray(r.predictions) ? r.predictions : []).map(Number).filter(Number.isFinite);
+      const preds = (Array.isArray(r.predictions) ? r.predictions : [])
+        .map(Number)
+        .filter(Number.isFinite);
       if (!preds.length) return { model: r.model, mapeProxy: Infinity, avgChangePct: 0 };
       const mapeProxy = preds.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) / preds.length;
       const meanPred = preds.reduce((a, b) => a + b, 0) / preds.length;
@@ -684,103 +710,71 @@ export default function App() {
   });
 
   return (
-    <ErrorBoundary>
-      <div className="app-root">
-        {/* Hero header (centered) */}
-        <div className="hero-wrap">
-          <div className="hero hero--center">
-            <div>
-              <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
-              <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
-            </div>
-            <div className="hero-right" style={{ display: "flex", gap: 8 }}>
-              {user ? (
-                <>
-                  <span className="muted" style={{ fontSize: 14 }}>
-                    👋 {user?.name || user?.email}
-                  </span>
-                  <button className="btn ghost" onClick={logout} title="Sign out">
-                    Sign out
-                  </button>
-                </>
-              ) : (
-                <button className="btn" onClick={() => setShowAuth(true)}>
-                  Sign in / Create account
+    <div className="app-root">
+      {/* Hero header (centered) */}
+      <div className="hero-wrap">
+        <div className="hero hero--center">
+          <div>
+            <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
+            <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
+          </div>
+          <div className="hero-right" style={{ display: "flex", gap: 8 }}>
+            {user ? (
+              <>
+                <span className="muted" style={{ fontSize: 14 }}>
+                  👋 {user?.name || user?.email}
+                </span>
+                <button className="btn ghost" onClick={logout} title="Sign out">
+                  Sign out
                 </button>
-              )}
-              <button className="btn ghost" onClick={() => window.location.reload()}>
-                ↻ Refresh
+              </>
+            ) : (
+              <button className="btn" onClick={() => setShowAuth(true)}>
+                Sign in / Create account
               </button>
-            </div>
+            )}
+            <button className="btn ghost" onClick={() => window.location.reload()}>
+              ↻ Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <main className="container grid-2col">
+        {/* LEFT: Watchlist */}
+        <aside className="left-rail">
+          {!isDisabled(disabled, "WatchlistPanel") && (
+            <SegmentBoundary name="WatchlistPanel">
+              <WatchlistPanel
+                current={ticker}
+                onLoad={(s) => setTicker(s)}
+                onAddToCompare={handleAddToCompare}
+              />
+            </SegmentBoundary>
+          )}
+          <div style={{ marginTop: 12 }}>
+            <label>
+              <input
+                type="checkbox"
+                checked={live}
+                onChange={() => setLive((v) => !v)}
+              />{" "}
+              Live price updates (SSE)
+            </label>
+          </div>
+        </aside>
+
+        {/* RIGHT: Main content */}
+        <section>
+          {/* Compare Mode Toggle */}
+          <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+            <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
+              {compareOpen ? "Close Compare" : "Open Compare"}
+            </button>
           </div>
 
-          {/* Scoped hero styles */}
-          <style>{`
-            .hero-wrap { margin: 6px 0 12px; }
-            .hero {
-              display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
-              padding: 18px 16px;
-              border-radius: 16px;
-              background: radial-gradient(140% 160% at 100% 0%, rgba(160,170,255,0.10), rgba(25,28,45,0.65) 55%, rgba(17,20,35,0.85));
-              border: 1px solid rgba(255,255,255,0.08);
-              box-shadow: 0 8px 22px rgba(0,0,0,0.28);
-            }
-            .hero-title {
-              margin: 0;
-              font-size: clamp(22px, 3.6vw, 36px);
-              letter-spacing: .3px;
-              line-height: 1.15;
-            }
-            .hero-sub { margin: 4px 0 0; color: #a7adbc; font-size: 13px; }
-            .hero-right { display: flex; align-items: center; gap: 8px; }
-
-            /* Centered variant */
-            .hero--center {
-              flex-direction: column;
-              align-items: center;
-              justify-content: center;
-              text-align: center;
-            }
-            .hero--center .hero-right { margin-top: 8px; }
-
-            @media (max-width: 720px) {
-              .hero { flex-direction: column; align-items: flex-start; }
-              .hero--center { align-items: center; }
-              .hero-right { width: 100%; justify-content: center; }
-            }
-          `}</style>
-        </div>
-
-        <main className="container grid-2col">
-          {/* LEFT: Watchlist */}
-          <aside className="left-rail">
-            <WatchlistPanel
-              current={ticker}
-              onLoad={(s) => setTicker(s)}
-              onAddToCompare={handleAddToCompare}
-            />
-            <div style={{ marginTop: 12 }}>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={live}
-                  onChange={() => setLive((v) => !v)}
-                />{" "}
-                Live price updates (SSE)
-              </label>
-            </div>
-          </aside>
-
-          {/* RIGHT: Main content */}
-          <section>
-            {/* Compare Mode Toggle */}
-            <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-              <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
-                {compareOpen ? "Close Compare" : "Open Compare"}
-              </button>
-            </div>
-
-            {compareOpen && (
+          {compareOpen && !isDisabled(disabled, "CompareMode") && (
+            <SegmentBoundary name="CompareMode">
               <CompareMode
                 symbols={compareSymbols}
                 onSymbolsChange={setCompareSymbols}
@@ -788,36 +782,42 @@ export default function App() {
                 rememberSession={false}
                 onExit={() => setCompareOpen(false)}
               />
-            )}
+            </SegmentBoundary>
+          )}
 
-            {/* Hot movers + Earnings next 7d */}
-            <HotAndEarnings onSelectTicker={handleSelectTicker} />
+          {/* Hot movers + Earnings next 7d */}
+          {!isDisabled(disabled, "HotAndEarnings") && (
+            <SegmentBoundary name="HotAndEarnings">
+              <HotAndEarnings onSelectTicker={handleSelectTicker} />
+            </SegmentBoundary>
+          )}
 
-            <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
-              <input
-                value={ticker}
-                onChange={(e) => setTicker(e.target.value.toUpperCase())}
-                placeholder="Ticker (e.g. AAPL or BTC-USD)"
-                required
-                type="text"
-                style={{ flex: "1 1 180px" }}
-              />
-              <button className="btn" disabled={loading}>
-                {loading ? "Loading…" : "Load Data"}
-              </button>
-            </form>
-
-            {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
-            <div
-              id="main-stock-info"
-              ref={mainSectionRef}
-              style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
-              aria-hidden
+          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
+            <input
+              value={ticker}
+              onChange={(e) => setTicker(e.target.value.toUpperCase())}
+              placeholder="Ticker (e.g. AAPL or BTC-USD)"
+              required
+              type="text"
+              style={{ flex: "1 1 180px" }}
             />
+            <button className="btn" disabled={loading}>
+              {loading ? "Loading…" : "Load Data"}
+            </button>
+          </form>
 
-            {/* Top info row */}
-            <div className="row" style={{ gap: 16, marginBottom: 12 }}>
-              {/* Quote Card */}
+          {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
+          <div
+            id="main-stock-info"
+            ref={mainSectionRef}
+            style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
+            aria-hidden
+          />
+
+          {/* Top info row */}
+          <div className="row" style={{ gap: 16, marginBottom: 12 }}>
+            {/* Quote Card */}
+            <SegmentBoundary name="QuoteCard">
               <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                   <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
@@ -899,39 +899,51 @@ export default function App() {
                   </p>
                 )}
               </div>
+            </SegmentBoundary>
 
-              {/* Earnings */}
-              <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-                <EarningsCard earnings={earnings} />
-              </div>
+            {!isDisabled(disabled, "EarningsCard") && (
+              <SegmentBoundary name="EarningsCard">
+                <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+                  <EarningsCard earnings={earnings} />
+                </div>
+              </SegmentBoundary>
+            )}
 
-              {/* Recommendation */}
-              <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-                <RecommendationCard recommendation={recommendation} />
-              </div>
-            </div>
+            {!isDisabled(disabled, "RecommendationCard") && (
+              <SegmentBoundary name="RecommendationCard">
+                <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+                  <RecommendationCard recommendation={recommendation} />
+                </div>
+              </SegmentBoundary>
+            )}
+          </div>
 
-            {/* Market Breadth */}
-            {market && (
+          {!isDisabled(disabled, "MarketCard") && market && (
+            <SegmentBoundary name="MarketCard">
               <div className="card">
                 <MarketCard market={market} />
               </div>
-            )}
+            </SegmentBoundary>
+          )}
 
-            {/* 📰 Sentiment overlay */}
-            <div className="card" style={{ marginTop: 12 }}>
-              <SentimentOverlay ticker={ticker} days={120} />
-            </div>
+          {!isDisabled(disabled, "SentimentOverlay") && (
+            <SegmentBoundary name="SentimentOverlay">
+              <div className="card" style={{ marginTop: 12 }}>
+                <SentimentOverlay ticker={ticker} days={120} />
+              </div>
+            </SegmentBoundary>
+          )}
 
-            {/* Metrics list */}
-            {!!metrics.length && (
+          {!!metrics.length && !isDisabled(disabled, "MetricsList") && (
+            <SegmentBoundary name="MetricsList">
               <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
                 <MetricsList metrics={metrics} />
               </div>
-            )}
+            </SegmentBoundary>
+          )}
 
-            {/* --- Actual vs Predicted (chart + table) --- */}
-            {results.length > 0 && closes.length >= 2 && (
+          {!isDisabled(disabled, "AvP") && results.length > 0 && closes.length >= 2 && (
+            <SegmentBoundary name="AvP">
               <div className="card" style={{ marginTop: 12 }}>
                 <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
 
@@ -942,7 +954,8 @@ export default function App() {
                     overflow: "hidden",
                     background: "rgba(255,255,255,0.03)",
                     padding: 8,
-                }}>
+                  }}
+                >
                   <Chart type="line" data={avpChartData} options={avpChartOptions} />
                 </div>
 
@@ -988,33 +1001,35 @@ export default function App() {
                   </div>
                 )}
               </div>
-            )}
+            </SegmentBoundary>
+          )}
 
-            {diagnostic && (
-              <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
-                <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
-              </div>
-            )}
-
-            {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
-
-            {/* Model selector */}
-            <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
-              {MODEL_OPTIONS.map((m) => (
-                <label key={m} style={{ marginRight: 12 }}>
-                  <input
-                    type="checkbox"
-                    checked={models.includes(m)}
-                    onChange={() => toggleModel(m)}
-                  />{" "}
-                  {m}
-                </label>
-              ))}
+          {diagnostic && (
+            <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
+              <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
             </div>
+          )}
 
-            {/* Forecast Table */}
-            {results.length > 0 && (
+          {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
+
+          {/* Model selector */}
+          <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
+            {MODEL_OPTIONS.map((m) => (
+              <label key={m} style={{ marginRight: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={models.includes(m)}
+                  onChange={() => toggleModel(m)}
+                />{" "}
+                {m}
+              </label>
+            ))}
+          </div>
+
+          {/* Forecast Table */}
+          {!isDisabled(disabled, "ForecastTable") && results.length > 0 && (
+            <SegmentBoundary name="ForecastTable">
               <div className="card table-card">
                 <div className="table-wrap">
                   <table className="table">
@@ -1051,29 +1066,29 @@ export default function App() {
                   </div>
                 )}
               </div>
-            )}
-          </section>
-        </main>
+            </SegmentBoundary>
+          )}
+        </section>
+      </main>
 
-        {/* Big chart modal */}
-        {showBigPriceChart && (
-          <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
-            <div style={{ borderRadius: 12, overflow: "hidden" }}>
-              <InteractivePriceChart
-                data={closes || []}
-                labels={closeDates || []}
-                width={800}
-                height={300}
-                big
-              />
-            </div>
-          </MagnifyModal>
-        )}
+      {/* Big chart modal */}
+      {showBigPriceChart && (
+        <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
+          <div style={{ borderRadius: 12, overflow: "hidden" }}>
+            <InteractivePriceChart
+              data={closes || []}
+              labels={closeDates || []}
+              width={800}
+              height={300}
+              big
+            />
+          </div>
+        </MagnifyModal>
+      )}
 
-        {/* 🔐 Auth modal mount */}
-        <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
-      </div>
-    </ErrorBoundary>
+      {/* 🔐 Auth modal mount */}
+      <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
+    </div>
   );
 }
 
