@@ -1,14 +1,14 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
-// - fixes AV 25% clamp by recomputing % from $change + price
-// - hydrates any row with |%| >= 24.9
-// - earnings fallback: retry /earnings_week/ on 405
+// Robust recompute of Δ$ / Δ% + local sign classification (no mixed-sign rows)
+// Keeps your hydration (quotes -> closes) + 405 earnings retry path.
 
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE, fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
 const EPS = 1e-6;
+const MAX_SENSIBLE_PCT = 200; // guardrail vs junk data
 
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
@@ -71,6 +71,7 @@ const signMismatch = (a, b) =>
   isNum(a) && isNum(b) && !nearZero(a) && !nearZero(b) &&
   Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
+/** Normalize any row into a consistent shape.  IMPORTANT: now returns last_close too. */
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
@@ -92,45 +93,66 @@ function normalizeRow(row) {
   ]);
   const open = firstNum(row, ["open","Open"]);
 
+  // fix clamped % if we can
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const p2 = pctFromPriceChange(price, change);
     if (isNum(p2) && Math.abs(p2) < 24.9) change_pct = p2;
   }
 
-  if (isNum(price) && isNum(prevClose)) {
+  // If we have price + prevClose, that's the right baseline
+  if (isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
-    if (!isNum(change) || nearZero(change)) change = derivedChange;
-    if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
+    if (!isNum(change)) change = derivedChange;
+    if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
+  // Fallback to open as baseline if needed
   if (!(isNum(change) && isNum(change_pct)) && isNum(price) && isNum(open) && !nearZero(open)) {
     const intraday = toNum(price) - toNum(open);
     const intradayPct = (intraday / toNum(open)) * 100;
-    if (!isNum(change) || nearZero(change)) change = intraday;
-    if (!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
+    if (!isNum(change)) change = intraday;
+    if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
+  // If only one of change / pct is present, derive the other
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
   }
-
   if (!isNum(change_pct) && isNum(change)) {
-    const base = isNum(prevClose) ? prevClose : price;
+    const base = isNum(prevClose) ? prevClose : (isNum(price) ? toNum(price) - toNum(change) : NaN);
     const p2 = isNum(base) && !nearZero(base) ? (toNum(change) / toNum(base)) * 100 : NaN;
     if (isNum(p2)) change_pct = p2;
   }
 
-  if (signMismatch(change, change_pct)) {
-    const base = isNum(prevClose) ? prevClose : price;
-    if (isNum(base) && isNum(change_pct)) change = (toNum(change_pct) / 100) * toNum(base);
+  // Some APIs return fractional pct (e.g., 0.0123 = 1.23%)
+  if (isNum(change_pct) && Math.abs(toNum(change_pct)) <= 2.5 && isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
+    // Compare with recomputed from prevClose; choose the one closer to truth
+    const recomputed = ((toNum(price) - toNum(prevClose)) / toNum(prevClose)) * 100;
+    const asPercent = toNum(change_pct);
+    const asPercentTimes100 = asPercent * 100;
+    const err1 = Math.abs(recomputed - asPercent);
+    const err2 = Math.abs(recomputed - asPercentTimes100);
+    change_pct = err2 < err1 ? asPercentTimes100 : asPercent;
   }
 
+  // If signs disagree, align using baseline math
+  if (signMismatch(change, change_pct)) {
+    const base = isNum(prevClose) ? prevClose : (isNum(price) ? toNum(price) - toNum(change) : NaN);
+    if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
+  }
+
+  // sanitize
   if (isNum(change) && nearZero(change)) change = 0;
   if (isNum(change_pct) && nearZero(change_pct)) change_pct = 0;
 
-  return { symbol, price, change, change_pct, name: row?.name ?? "" };
+  // guard against absurd %
+  if (isNum(change_pct) && Math.abs(toNum(change_pct)) > MAX_SENSIBLE_PCT) {
+    change_pct = NaN;
+  }
+
+  return { symbol, price, change, change_pct, last_close: isNum(prevClose) ? toNum(prevClose) : undefined, name: row?.name ?? "" };
 }
 
 function pickFromQuote(q) {
@@ -156,10 +178,10 @@ function pickFromQuote(q) {
     "change_pct","percent_change","regularMarketChangePercent",
   ]);
 
-  if ((!isNum(change) || nearZero(change)) && isNum(price) && isNum(lastClose)) {
+  if ((!isNum(change)) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
-  if ((!isNum(change_pct) || nearZero(change_pct) || looksClamped(change_pct)) && isNum(change) && isNum(lastClose) && !nearZero(lastClose)) {
+  if ((!isNum(change_pct) || looksClamped(change_pct)) && isNum(change) && isNum(lastClose) && !nearZero(lastClose)) {
     change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
@@ -203,7 +225,7 @@ function pickLastTwoCloses(resp) {
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  if (!Number.isFinite(pct) || Math.abs(pct) > 60) return null;
+  if (!Number.isFinite(pct) || Math.abs(pct) > MAX_SENSIBLE_PCT) return null;
 
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
@@ -286,12 +308,39 @@ function Card({ title, right, children }) {
   );
 }
 
+function rowSign(r) {
+  if (isNum(r.change_pct) && !nearZero(r.change_pct)) return Math.sign(toNum(r.change_pct));
+  if (isNum(r.change) && !nearZero(r.change)) return Math.sign(toNum(r.change));
+  // derive from price vs last_close if we can
+  if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
+    return Math.sign(toNum(r.price) - toNum(r.last_close));
+  }
+  return 0; // unknown
+}
+
+function dedupeBest(rows) {
+  const score = (v) =>
+    (isNum(v.price) ? 1 : 0) +
+    (isNum(v.last_close) ? 1 : 0) +
+    (isNum(v.change) ? 1 : 0) +
+    (isNum(v.change_pct) ? 1 : 0);
+  const map = new Map();
+  for (const r0 of rows) {
+    const r = normalizeRow(r0);
+    if (!r.symbol) continue;
+    const ex = map.get(r.symbol);
+    if (!ex || score(r) > score(ex)) map.set(r.symbol, r);
+  }
+  return [...map.values()];
+}
+
 function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kind = "gainers" }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
   const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc");
 
-  const normalized = useMemo(() => (Array.isArray(rows) ? rows.map(normalizeRow) : []), [rows]);
+  // rows are already normalized & sign-filtered by parent
+  const normalized = rows;
 
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
@@ -328,7 +377,11 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
       title={title}
       right={
         <div className="he-controls">
-          {fetchedFrom && <span className="he-source">source: {fetchedFrom}</span>}
+          {fetchedFrom && (
+            <span className="he-source">
+              source: {fetchedFrom}{fetchedFrom.includes("fallback") ? " (recalculated)" : ""}
+            </span>
+          )}
           <select
             value={String(minPrice)}
             onChange={(e) => setMinPrice(Number(e.target.value))}
@@ -544,17 +597,37 @@ export default function HotAndEarnings({ onSelectTicker }) {
     try {
       const mv = await fetchMovers();
 
+      // Normalize both lists
       const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
       const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
 
+      // Hydrate any rows with missing/iffy deltas
       const [gHydrated, lHydrated] = await Promise.all([hydrateRows(g0), hydrateRows(l0)]);
 
-      const keep = (r) =>
-        isNum(r.price) &&
-        ((isNum(r.change) && !nearZero(r.change)) || (isNum(r.change_pct) && !nearZero(r.change_pct)));
+      // Merge + dedupe by symbol, then recompute from last_close if available
+      const merged = dedupeBest([...gHydrated, ...lHydrated]).map((r) => {
+        // Final consistency pass: if we have last_close, recompute from it
+        if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
+          const ch = toNum(r.price) - toNum(r.last_close);
+          const pct = (ch / toNum(r.last_close)) * 100;
+          return normalizeRow({ ...r, change: ch, change_pct: pct });
+        }
+        return r;
+      });
 
-      setGainers(gHydrated.filter(keep));
-      setLosers(lHydrated.filter(keep));
+      // Classify by sign so gainers/losers never mix, even if the backend does
+      const onlyValid = (x) =>
+        isNum(x.price) &&
+        (
+          (isNum(x.change) && !nearZero(x.change)) ||
+          (isNum(x.change_pct) && !nearZero(x.change_pct))
+        );
+
+      const pos = merged.filter((r) => onlyValid(r) && rowSign(r) > 0);
+      const neg = merged.filter((r) => onlyValid(r) && rowSign(r) < 0);
+
+      setGainers(pos);
+      setLosers(neg);
       setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
       setErrMovers(e?.message || "Failed to load movers.");
