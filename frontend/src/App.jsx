@@ -15,7 +15,6 @@ import EarningsCard from "./components/EarningsCard";
 import RecommendationCard from "./components/RecommendationCard";
 import MetricsList from "./components/MetricsList";
 import WatchlistPanel from "./components/WatchlistPanel";
-// intentionally NOT using custom useEventSource to keep hook order stable
 import useTweenNumber from "./hooks/useTweenNumber";
 import CompareMode from "./components/CompareMode";
 import HotAndEarnings from "./components/HotAndEarnings";
@@ -50,55 +49,6 @@ ChartJS.register(
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 
-// ===== Debug helpers: disable segments via URL ?disable=A,B,C =====
-function useDisabledSegments() {
-  const [disabled] = useState(() => {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const list = (params.get("disable") || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      return new Set(list);
-    } catch {
-      return new Set();
-    }
-  });
-  return disabled;
-}
-const isDisabled = (disabledSet, name) => disabledSet.has(name);
-
-// ===== Real class-based error boundary per segment =====
-class SegmentBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-  componentDidCatch(error, info) {
-    // eslint-disable-next-line no-console
-    console.error(`🧯 Segment crashed: ${this.props.name}`, error, info);
-  }
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="card" style={{ borderLeft: "4px solid #ff6b6b", marginTop: 8 }}>
-          <div style={{ fontWeight: 700 }}>Segment failed: {this.props.name}</div>
-          <div className="muted" style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
-            {String(this.state.error?.message || this.state.error)}
-          </div>
-          <div className="muted" style={{ fontSize: 12 }}>
-            Tip: add <code>?disable={this.props.name}</code> to the URL to bypass this section.
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
 // ----- Date helpers (timezone-safe) -----
 const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
 const fmtLocalISO = (dt) => {
@@ -121,6 +71,11 @@ const addBusinessDays = (start, n) => {
 // normalize model keys so we don’t miss due to case/whitespace
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
+
+// --- numeric helpers
+const toNum = (x) => (Number.isFinite(+x) ? +x : null);
+const safePct = (curr, prev) =>
+  Number.isFinite(curr) && Number.isFinite(prev) && prev !== 0 ? ((curr - prev) / prev) * 100 : null;
 
 /** ===== Tail de-dupe helpers (fix duplicate final day) ===== */
 const dropDupTailSeries = (dates = [], closes = []) => {
@@ -208,8 +163,6 @@ function scrollMainInfoNow() {
 }
 
 export default function App() {
-  const disabled = useDisabledSegments();
-
   const { user, logout } = useAuth();
   const [showAuth, setShowAuth] = useState(false);
 
@@ -313,11 +266,11 @@ export default function App() {
       const dk = dkey(r.date);
       byDate[dk] = {
         ...r,
-        actual: Number.isFinite(+r.actual) ? +r.actual : Number.isFinite(+r.close) ? +r.close : null,
+        actual: toNum(r.actual) ?? toNum(r.close) ?? null,
       };
       const perModel = {};
       Object.entries(r.pred || {}).forEach(([m, v]) => {
-        perModel[normModel(m)] = Number(v);
+        perModel[normModel(m)] = toNum(v);
       });
       byDateModel[dk] = perModel;
     });
@@ -353,7 +306,7 @@ export default function App() {
         const q = await fetchQuote(t, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return null;
         setQuote(q);
-        prevPriceRef.current = q.current_price;
+        prevPriceRef.current = q?.current_price ?? null;
         if (!live) setLive(true);
         return q;
       } catch {
@@ -412,14 +365,14 @@ export default function App() {
       }
     })();
 
-    // 4) Past backtest rows (drop duplicate tail if backend repeats it)
+    // 4) Past backtest rows
     const pHist = (async () => {
       try {
         const hist = await fetchPredictHistory({ ticker: t, models, days: 15 }, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map((r) => ({
           ...r,
-          actual: Number.isFinite(+r?.actual) ? +r.actual : Number.isFinite(+r?.close) ? +r.close : null,
+          actual: toNum(r?.actual) ?? toNum(r?.close) ?? null,
         }));
         setHistoryRows(dropDupTailHistory(safeRows));
       } catch {
@@ -462,7 +415,7 @@ export default function App() {
     };
   }, [loadData]);
 
-  // 🔄 Inline SSE (replaces useEventSource). Hook order is stable across renders.
+  // 🔄 Inline SSE (stable)
   useEffect(() => {
     if (!live || !ticker) return;
     const url = buildQuoteStreamURL(ticker, 5);
@@ -476,19 +429,24 @@ export default function App() {
       try {
         const payload = JSON.parse(ev.data);
         const prev = prevPriceRef.current;
-        const next = Number(payload.current_price);
-        if (typeof next === "number" && !Number.isNaN(next)) {
-          setQuote((q) =>
-            q
-              ? { ...q, current_price: next, change_pct: payload.change_pct }
-              : {
-                  ticker: payload.ticker,
-                  current_price: next,
-                  last_close: payload.last_close,
-                  change_pct: payload.change_pct,
-                }
-          );
-          if (typeof prev === "number" && !Number.isNaN(prev) && prev !== next) {
+        const next = toNum(payload.current_price);
+        const lastClose = toNum(payload.last_close) ?? toNum(quote?.last_close) ?? null;
+
+        if (next != null) {
+          setQuote((q) => {
+            const base = q || {};
+            const derivedPct = safePct(next, lastClose);
+            const pct = toNum(payload.change_pct) ?? derivedPct ?? toNum(base.change_pct) ?? 0;
+            return {
+              ...base,
+              ticker: payload.ticker ?? base.ticker ?? ticker,
+              current_price: next,
+              last_close: lastClose,
+              change_pct: pct,
+            };
+          });
+
+          if (prev != null && prev !== next) {
             setBlinkClass(next > prev ? "blink-up" : "blink-down");
             setTimeout(() => setBlinkClass(""), 520);
           }
@@ -504,7 +462,7 @@ export default function App() {
     return () => {
       try { es.close(); } catch {}
     };
-  }, [live, ticker]);
+  }, [live, ticker, quote?.last_close]);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -523,7 +481,7 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // ➕ Add from Watchlist into Compare (explicit; avoids earlier crash)
+  // ➕ Add from Watchlist into Compare
   const handleAddToCompare = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
@@ -537,7 +495,7 @@ export default function App() {
   // Client-side metrics & recommendation
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
-    const base = Number(quote.last_close) || 0;
+    const base = toNum(quote.last_close) || 0;
     if (base <= 0) return [];
     return results.map((r) => {
       const preds = (Array.isArray(r.predictions) ? r.predictions : [])
@@ -596,10 +554,59 @@ export default function App() {
     return arr;
   })();
 
+  // ----- Backtest harmonization (optional rescale if clearly mismatched) -----
+  function harmonize(series, actual) {
+    // collect overlapping pairs
+    const pairs = [];
+    for (let i = 0; i < pastLabels.length; i++) {
+      const a = actual[i];
+      const b = series[i];
+      if (Number.isFinite(a) && Number.isFinite(b)) pairs.push([a, b]);
+    }
+    if (pairs.length < 5) return { series, note: null }; // not enough data
+
+    const A = pairs.map((p) => p[0]);
+    const B = pairs.map((p) => p[1]);
+
+    const median = (xs) => {
+      const s = [...xs].sort((x, y) => x - y);
+      const m = Math.floor(s.length / 2);
+      return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    };
+
+    const medA = median(A);
+    const medB = median(B);
+    const scaleRatio = medB && medA ? medA / medB : 1;
+
+    // baseline MAPE
+    const mape = A.reduce((acc, a, i) => {
+      const b = B[i];
+      return acc + Math.abs(a - b) / (Math.abs(a) || 1);
+    }, 0) / A.length;
+
+    // If clearly off-scale (> 20% typical error) and median ratio far from 1, rescale linearly.
+    if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
+      // Simple linear fit y ≈ alpha + beta * x (map B -> A)
+      const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
+      const meanA = mean(A);
+      const meanB = mean(B);
+      const cov = A.reduce((s, a, i) => s + (a - meanA) * (B[i] - meanB), 0) / A.length;
+      const varB = B.reduce((s, b) => s + (b - meanB) * (b - meanB), 0) / B.length || 1;
+      const beta = cov / varB;
+      const alpha = meanA - beta * meanB;
+
+      const adjusted = series.map((b) => (Number.isFinite(b) ? alpha + beta * b : null));
+      return { series: adjusted, note: `Backtests rescaled (α=${alpha.toFixed(2)}, β=${beta.toFixed(3)}) to match actuals.` };
+    }
+
+    return { series, note: null };
+  }
+
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
-  const avpDatasets = useMemo(() => {
-    if (!chartLabels.length) return [];
+  // Build datasets for the chart
+  const { avpDatasets, harmonizeNote } = useMemo(() => {
+    if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
 
     const actualSeries = [
       ...actualForPastLabels,
@@ -619,19 +626,26 @@ export default function App() {
       },
     ];
 
+    let note = null;
+
     results.forEach((r, idx) => {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      const backtestSeries = chartLabels.map((lab) => {
+      // Past (backtest)
+      const backtestRaw = chartLabels.map((lab, i) => {
+        if (i >= pastLabels.length) return null; // only for past segment
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
         return Number.isFinite(Number(val)) ? Number(val) : null;
       });
 
+      const { series: backtestSeries, note: n } = harmonize(backtestRaw, actualForPastLabels);
+      if (n && !note) note = n;
+
       ds.push({
         label: `${r.model} • backtest`,
-        data: backtestSeries,
+        data: backtestSeries.concat(Array(futureLabels.length).fill(null)),
         borderColor: color,
         backgroundColor: "transparent",
         borderDash: [6, 4],
@@ -641,6 +655,7 @@ export default function App() {
         spanGaps: true,
       });
 
+      // Future (current forecast)
       const start =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
       const currentSeries = [
@@ -661,7 +676,7 @@ export default function App() {
       });
     });
 
-    return ds;
+    return { avpDatasets: ds, harmonizeNote: note };
   }, [
     results,
     histPred,
@@ -686,13 +701,14 @@ export default function App() {
     },
   };
 
+  // ----- Table rows -----
   const pastRows = pastLabels.map((iso, i, arr) => {
     const dk = dkey(iso);
     const row = histByDate[dk];
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
-    // last past day: force to official last_close to avoid early/late-day drift
+    // last past day: force to official last_close to avoid drift
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -705,9 +721,17 @@ export default function App() {
   });
 
   const futureRows = futureLabels.map((d, i) => {
-    const perModel = results.map((r) => r.predictions?.[i] ?? null);
+    const perModel = results.map((r) => (Array.isArray(r.predictions) ? r.predictions[i] ?? null : null));
     return { date: d, actual: null, perModel, kind: "future" };
   });
+
+  // ----- Derived change for header (fix 0.00% problem) -----
+  const curr = toNum(quote?.current_price);
+  const prev = toNum(quote?.last_close);
+  const derivedPct = safePct(curr, prev);
+  const pctToShow = toNum(quote?.change_pct) ?? derivedPct ?? 0;
+  const absToShow =
+    Number.isFinite(curr) && Number.isFinite(prev) ? (curr - prev) : 0;
 
   return (
     <div className="app-root">
@@ -743,15 +767,11 @@ export default function App() {
       <main className="container grid-2col">
         {/* LEFT: Watchlist */}
         <aside className="left-rail">
-          {!isDisabled(disabled, "WatchlistPanel") && (
-            <SegmentBoundary name="WatchlistPanel">
-              <WatchlistPanel
-                current={ticker}
-                onLoad={(s) => setTicker(s)}
-                onAddToCompare={handleAddToCompare}
-              />
-            </SegmentBoundary>
-          )}
+          <WatchlistPanel
+            current={ticker}
+            onLoad={(s) => setTicker(s)}
+            onAddToCompare={handleAddToCompare}
+          />
           <div style={{ marginTop: 12 }}>
             <label>
               <input
@@ -773,24 +793,18 @@ export default function App() {
             </button>
           </div>
 
-          {compareOpen && !isDisabled(disabled, "CompareMode") && (
-            <SegmentBoundary name="CompareMode">
-              <CompareMode
-                symbols={compareSymbols}
-                onSymbolsChange={setCompareSymbols}
-                defaultModels={models}
-                rememberSession={false}
-                onExit={() => setCompareOpen(false)}
-              />
-            </SegmentBoundary>
+          {compareOpen && (
+            <CompareMode
+              symbols={compareSymbols}
+              onSymbolsChange={setCompareSymbols}
+              defaultModels={models}
+              rememberSession={false}
+              onExit={() => setCompareOpen(false)}
+            />
           )}
 
           {/* Hot movers + Earnings next 7d */}
-          {!isDisabled(disabled, "HotAndEarnings") && (
-            <SegmentBoundary name="HotAndEarnings">
-              <HotAndEarnings onSelectTicker={handleSelectTicker} />
-            </SegmentBoundary>
-          )}
+          <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
@@ -817,191 +831,192 @@ export default function App() {
           {/* Top info row */}
           <div className="row" style={{ gap: 16, marginBottom: 12 }}>
             {/* Quote Card */}
-            <SegmentBoundary name="QuoteCard">
-              <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
-                <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-                  <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
-                  {closes.length > 0 && (
-                    <button
-                      className="btn ghost"
-                      onClick={() => setShowBigPriceChart(true)}
-                      style={{ padding: "2px 8px", fontSize: 12 }}
-                      title="Magnify chart"
-                    >
-                      🔍 Magnify
-                    </button>
-                  )}
-                </div>
+            <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+                <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+                {closes.length > 0 && (
+                  <button
+                    className="btn ghost"
+                    onClick={() => setShowBigPriceChart(true)}
+                    style={{ padding: "2px 8px", fontSize: 12 }}
+                    title="Magnify chart"
+                  >
+                    🔍 Magnify
+                  </button>
+                )}
+              </div>
 
-                {quoteErr ? (
-                  <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
-                    Error loading quote
+              {quoteErr ? (
+                <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
+                  Error loading quote
+                </p>
+              ) : quote ? (
+                <>
+                  <p style={{ margin: 0 }}>
+                    Last Close: ${Number(quote.last_close).toFixed(2)}
                   </p>
-                ) : quote ? (
-                  <>
-                    <p style={{ margin: 0 }}>
-                      Last Close: ${Number(quote.last_close).toFixed(2)}
-                    </p>
-                    <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
-                      <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
-                        ${tweenPrice.toFixed(2)}
+                  <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
+                    <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
+                      ${tweenPrice.toFixed(2)}
+                    </span>
+                    {Number.isFinite(pctToShow) && (
+                      <span
+                        style={{
+                          color: pctToShow >= 0 ? "#2e7d32" : "#c62828",
+                          fontWeight: 600,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          fontSize: "0.9em",
+                        }}
+                        aria-label={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)} percent`}
+                        title={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)}%`}
+                      >
+                        {pctToShow >= 0 ? "▲" : "▼"} {Number(absToShow).toFixed(2)} ({Math.abs(pctToShow).toFixed(2)}%)
                       </span>
-                      {Number.isFinite(Number(quote?.change_pct)) && (
-                        <span
-                          style={{
-                            color: Number(quote.change_pct) >= 0 ? "#2e7d32" : "#c62828",
-                            fontWeight: 600,
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 4,
-                            fontSize: "0.9em",
-                          }}
-                          aria-label={`${
-                            Number(quote.change_pct) >= 0 ? "Up" : "Down"
-                          } ${Math.abs(Number(quote.change_pct)).toFixed(2)} percent`}
-                          title={`${
-                            Number(quote.change_pct) >= 0 ? "Up" : "Down"
-                          } ${Math.abs(Number(quote.change_pct)).toFixed(2)}%`}
-                        >
-                          {Number(quote.change_pct) >= 0 ? "▲" : "▼"}{" "}
-                          {(Number(quote.current_price) - Number(quote.last_close)).toFixed(2)}{" "}
-                          ({Math.abs(Number(quote.change_pct)).toFixed(2)}%)
-                        </span>
-                      )}
-                    </p>
+                    )}
+                  </p>
 
-                    {/* mini interactive chart (clipped) */}
-                    <div style={{ marginTop: 6 }}>
-                      {closes.length >= 2 ? (
-                        <div style={{ borderRadius: 10, overflow: "hidden" }}>
-                          <InteractivePriceChart
-                            data={closes}
-                            labels={closeDates}
-                            width={320}
-                            height={80}
-                          />
-                        </div>
-                      ) : (
-                        <div className="muted" style={{ fontSize: 12 }}>
-                          no chart data
-                        </div>
-                      )}
-                    </div>
-                    {closes.length >= 2 && (
-                      <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-                        drag to pan • wheel to zoom • double-click to reset
+                  {/* mini interactive chart (clipped) */}
+                  <div style={{ marginTop: 6 }}>
+                    {closes.length >= 2 ? (
+                      <div style={{ borderRadius: 10, overflow: "hidden" }}>
+                        <InteractivePriceChart
+                          data={closes}
+                          labels={closeDates}
+                          width={320}
+                          height={80}
+                        />
+                      </div>
+                    ) : (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        no chart data
                       </div>
                     )}
-                  </>
-                ) : (
-                  <p className="muted" style={{ margin: 0 }}>
-                    N/A
-                  </p>
-                )}
-              </div>
-            </SegmentBoundary>
+                  </div>
+                  {closes.length >= 2 && (
+                    <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                      drag to pan • wheel to zoom • double-click to reset
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="muted" style={{ margin: 0 }}>
+                  N/A
+                </p>
+              )}
+            </div>
 
-            {!isDisabled(disabled, "EarningsCard") && (
-              <SegmentBoundary name="EarningsCard">
-                <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-                  <EarningsCard earnings={earnings} />
-                </div>
-              </SegmentBoundary>
-            )}
+            {/* Earnings */}
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+              <EarningsCard earnings={earnings} />
+            </div>
 
-            {!isDisabled(disabled, "RecommendationCard") && (
-              <SegmentBoundary name="RecommendationCard">
-                <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-                  <RecommendationCard recommendation={recommendation} />
-                </div>
-              </SegmentBoundary>
-            )}
+            {/* Recommendation */}
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
+              <RecommendationCard recommendation={recommendation} />
+            </div>
           </div>
 
-          {!isDisabled(disabled, "MarketCard") && market && (
-            <SegmentBoundary name="MarketCard">
-              <div className="card">
-                <MarketCard market={market} />
-              </div>
-            </SegmentBoundary>
+          {/* Market Breadth */}
+          {market && (
+            <div className="card">
+              <MarketCard market={market} />
+            </div>
           )}
 
-          {!isDisabled(disabled, "SentimentOverlay") && (
-            <SegmentBoundary name="SentimentOverlay">
-              <div className="card" style={{ marginTop: 12 }}>
-                <SentimentOverlay ticker={ticker} days={120} />
-              </div>
-            </SegmentBoundary>
+          {/* 📰 Sentiment overlay */}
+          <div className="card" style={{ marginTop: 12 }}>
+            <SentimentOverlay ticker={ticker} days={120} />
+          </div>
+
+          {/* Metrics list */}
+          {!!metrics.length && (
+            <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
+              <MetricsList metrics={metrics} />
+            </div>
           )}
 
-          {!!metrics.length && !isDisabled(disabled, "MetricsList") && (
-            <SegmentBoundary name="MetricsList">
-              <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
-                <MetricsList metrics={metrics} />
+          {/* --- Actual vs Predicted (chart + table) --- */}
+          {results.length > 0 && closes.length >= 2 && (
+            <div className="card" style={{ marginTop: 12 }}>
+              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
+
+              <div
+                style={{
+                  height: 260,
+                  borderRadius: 12,
+                  overflow: "hidden",
+                  background: "rgba(255,255,255,0.03)",
+                  padding: 8,
+                }}
+              >
+                <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
-            </SegmentBoundary>
-          )}
 
-          {!isDisabled(disabled, "AvP") && results.length > 0 && closes.length >= 2 && (
-            <SegmentBoundary name="AvP">
-              <div className="card" style={{ marginTop: 12 }}>
-                <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
-
-                <div
-                  style={{
-                    height: 260,
-                    borderRadius: 12,
-                    overflow: "hidden",
-                    background: "rgba(255,255,255,0.03)",
-                    padding: 8,
-                  }}
-                >
-                  <Chart type="line" data={avpChartData} options={avpChartOptions} />
-                </div>
-
-                <div className="table-wrap" style={{ marginTop: 12 }}>
-                  <table className="table">
-                    <thead>
-                      <tr>
-                        <th style={{ whiteSpace: "nowrap" }}>Date</th>
-                        <th>Actual</th>
-                        {results.map((r) => (
-                          <th key={r.model}>
-                            {r.model}
-                            <span className="muted" style={{ fontSize: 11, display: "block" }}>
-                              <em>past: backtest • future: current</em>
-                            </span>
-                          </th>
+              <div className="table-wrap" style={{ marginTop: 12 }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th style={{ whiteSpace: "nowrap" }}>Date</th>
+                      <th>Actual</th>
+                      {results.map((r) => (
+                        <th key={r.model}>
+                          {r.model}
+                          <span className="muted" style={{ fontSize: 11, display: "block" }}>
+                            <em>past: backtest • future: current</em>
+                          </span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      ...pastLabels.map((iso, idx) => ({
+                        date: iso,
+                        actual: actualForPastLabels[idx],
+                        perModel: results.map((r) => {
+                          const v = histPred?.[iso]?.[normModel(r.model)];
+                          return Number.isFinite(Number(v)) ? Number(v) : null;
+                        }),
+                        kind: "past",
+                      })),
+                      ...futureLabels.map((d, i) => ({
+                        date: d,
+                        actual: null,
+                        perModel: results.map((r) => (Array.isArray(r.predictions) ? r.predictions[i] ?? null : null)),
+                        kind: "future",
+                      })),
+                    ].map((row, i) => (
+                      <tr key={`${row.kind}-${row.date || i}`}>
+                        <td>
+                          {row.date
+                            ? row.kind === "future"
+                              ? `${row.date} (+${i - pastLabels.length + 1}d)`
+                              : row.date
+                            : ""}
+                        </td>
+                        <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
+                        {row.perModel.map((v, j) => (
+                          <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
                         ))}
                       </tr>
-                    </thead>
-                    <tbody>
-                      {[...pastRows, ...futureRows].map((row, i) => (
-                        <tr key={`${row.kind}-${row.date || i}`}>
-                          <td>
-                            {row.date
-                              ? row.kind === "future"
-                                ? `${row.date} (+${i - pastRows.length + 1}d)`
-                                : row.date
-                              : ""}
-                          </td>
-                          <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
-                          {row.perModel.map((v, j) => (
-                            <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                {!!diagnostic && (
-                  <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-                    Note: {diagnostic}
-                  </div>
-                )}
+                    ))}
+                  </tbody>
+                </table>
               </div>
-            </SegmentBoundary>
+
+              {!!diagnostic && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                  Note: {diagnostic}
+                </div>
+              )}
+              {!!harmonizeNote && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                  {harmonizeNote}
+                </div>
+              )}
+            </div>
           )}
 
           {diagnostic && (
@@ -1028,45 +1043,43 @@ export default function App() {
           </div>
 
           {/* Forecast Table */}
-          {!isDisabled(disabled, "ForecastTable") && results.length > 0 && (
-            <SegmentBoundary name="ForecastTable">
-              <div className="card table-card">
-                <div className="table-wrap">
-                  <table className="table">
-                    <thead>
-                      <tr>
-                        <th>Model</th>
-                        {results[0].predictions.map((_, i) => (
-                          <th key={i}>{`+${i + 1}d`}</th>
+          {results.length > 0 && (
+            <div className="card table-card">
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      {results[0].predictions.map((_, i) => (
+                        <th key={i}>{`+${i + 1}d`}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map(({ model, predictions, confidence }) => (
+                      <tr key={model}>
+                        <td>{model}</td>
+                        {predictions.map((val, i) => (
+                          <td key={i}>
+                            {Number(val).toFixed(2)}
+                            {Array.isArray(confidence) && confidence[i] != null && (
+                              <div className="muted" style={{ fontSize: 11 }}>
+                                conf {Number(confidence[i]).toFixed(2)}
+                              </div>
+                            )}
+                          </td>
                         ))}
                       </tr>
-                    </thead>
-                    <tbody>
-                      {results.map(({ model, predictions, confidence }) => (
-                        <tr key={model}>
-                          <td>{model}</td>
-                          {predictions.map((val, i) => (
-                            <td key={i}>
-                              {Number(val).toFixed(2)}
-                              {Array.isArray(confidence) && confidence[i] != null && (
-                                <div className="muted" style={{ fontSize: 11 }}>
-                                  conf {Number(confidence[i]).toFixed(2)}
-                                </div>
-                              )}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {!!diagnostic && (
-                  <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
-                    Note: {diagnostic}
-                  </div>
-                )}
+                    ))}
+                  </tbody>
+                </table>
               </div>
-            </SegmentBoundary>
+              {!!diagnostic && (
+                <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
+                  Note: {diagnostic}
+                </div>
+              )}
+            </div>
           )}
         </section>
       </main>

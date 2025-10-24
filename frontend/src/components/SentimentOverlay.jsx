@@ -13,148 +13,138 @@ import {
 } from "chart.js";
 import { Chart } from "react-chartjs-2";
 
+// Register once
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, Tooltip, Legend);
 
-// Theme-safe color tokens (explicit to avoid "black" fallback)
-const colors = {
-  priceLine: "var(--line-actual, #8fb9ff)",       // blue
-  sentBars: "rgba(150,170,255,0.35)",             // translucent blue
-  axis: "rgba(220,225,255,0.70)",
-  grid: "rgba(255,255,255,0.08)",
-  legend: "rgba(230,235,255,0.85)",
+// fixed palette — prevents “black line” on dark backgrounds
+const COLORS = {
+  price: "#9ec1ff",
+  sentimentBar: "rgba(150,170,255,0.35)",
 };
-
-// Set global defaults so tooltips/labels aren’t black on dark BG
-ChartJS.defaults.color = colors.legend;
-ChartJS.defaults.borderColor = colors.grid;
 
 export default function SentimentOverlay({ ticker = "AAPL", days = 120 }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
+  // Load once per (ticker, days) — no conditional hooks anywhere
   useEffect(() => {
-    const ac = new AbortController();
+    let alive = true;
     (async () => {
+      setLoading(true);
+      setErr("");
       try {
-        setErr("");
-        setLoading(true);
-        const res = await fetchSentimentCorrelation(ticker, days, { signal: ac.signal });
-        if (!ac.signal.aborted) setData(res);
+        const res = await fetchSentimentCorrelation(ticker, days);
+        if (!alive) return;
+        setData(res || null);
       } catch (e) {
-        if (!ac.signal.aborted) setErr(e?.message || "Failed to load sentiment correlation");
+        if (!alive) return;
+        setErr(e?.message || "Failed to load sentiment correlation");
+        setData(null);
       } finally {
-        if (!ac.signal.aborted) setLoading(false);
+        if (alive) setLoading(false);
       }
     })();
-    return () => ac.abort();
+    return () => {
+      alive = false;
+    };
   }, [ticker, days]);
 
-  if (err) return <div className="muted error">{err}</div>;
-  if (!data) return <div className="muted">Loading sentiment…</div>;
+  // Build chart payload in a single memo (always called)
+  const chartStuff = useMemo(() => {
+    if (!data) {
+      return { ok: false, labels: [], datasets: [], r: null };
+    }
 
-  // Align by date; sentiment daily has {date, mean}, closes_dates are ISO day strings
-  const sentMap = useMemo(
-    () => new Map((data.daily || []).map((r) => [String(r.date).slice(0, 10), Number(r.mean)])),
-    [data.daily]
-  );
-  const labels = useMemo(() => (data.closes_dates || []).map((d) => String(d).slice(0, 10)), [data.closes_dates]);
-  const price = useMemo(() => (data.closes || []).map((n) => Number(n)), [data.closes]);
-  const sent = useMemo(() => labels.map((d) => (sentMap.has(d) ? sentMap.get(d) : null)), [labels, sentMap]);
+    // Align by date; sentiment daily has {date, mean}, closes_dates are ISO day strings
+    const sentMap = new Map((data.daily || []).map((r) => [String(r.date).slice(0, 10), Number(r.mean)]));
+    const rawLabels = Array.isArray(data.closes_dates) ? data.closes_dates : [];
+    const labels = rawLabels.map((d) => String(d).slice(0, 10));
 
-  // Simple normalization for overlay (z-score-ish). Handles all-null safely.
-  const norm = (arr) => {
-    const xs = arr.filter((v) => Number.isFinite(v));
-    if (!xs.length) return arr.map(() => null);
-    const m = xs.reduce((a, b) => a + b, 0) / xs.length;
-    const s = Math.sqrt(xs.reduce((a, b) => a + (b - m) * (b - m), 0) / xs.length) || 1;
-    return arr.map((v) => (Number.isFinite(v) ? (v - m) / s : null));
-  };
+    const price = (Array.isArray(data.closes) ? data.closes : []).map((v) => (Number.isFinite(+v) ? +v : null));
+    const sent = labels.map((d) => {
+      const v = sentMap.get(d);
+      return Number.isFinite(+v) ? +v : null;
+    });
 
-  const normPrice = useMemo(() => norm(price), [price]);
-  const normSent = useMemo(() => norm(sent), [sent]);
+    if (!labels.length || !price.length) {
+      return { ok: false, labels: [], datasets: [], r: data.correlation?.pearson_r ?? null };
+    }
 
-  const hasAnySent = useMemo(() => normSent.some((v) => Number.isFinite(v)), [normSent]);
+    // Normalize both to z-ish scores so they overlay meaningfully
+    const norm = (arr) => {
+      const xs = arr.filter((v) => Number.isFinite(v));
+      if (!xs.length) return arr.map(() => null);
+      const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const stdev = Math.sqrt(xs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / xs.length) || 1;
+      return arr.map((v) => (Number.isFinite(v) ? (v - mean) / stdev : null));
+    };
 
-  const r = data?.correlation?.pearson_r;
-  const rText = Number.isFinite(r) ? r.toFixed(3) : "n/a";
+    const normPrice = norm(price);
+    const normSent = norm(sent);
 
-  const datasets = useMemo(() => {
-    const base = [
+    const datasets = [
       {
         type: "line",
         label: "Price (normalized)",
         data: normPrice,
-        borderColor: colors.priceLine,     // <- explicit (fixes “black line”)
-        backgroundColor: colors.priceLine,
+        borderColor: COLORS.price,      // explicit
+        backgroundColor: "transparent",
         borderWidth: 2,
         pointRadius: 0,
-        tension: 0.25,
         spanGaps: true,
+        tension: 0.25,
         yAxisID: "y",
       },
-    ];
-    if (hasAnySent) {
-      base.push({
+      {
         type: "bar",
         label: "Sentiment (normalized)",
         data: normSent,
-        backgroundColor: colors.sentBars, // <- explicit
+        backgroundColor: COLORS.sentimentBar,
         borderWidth: 0,
         yAxisID: "y1",
-      });
-    }
-    return base;
-  }, [normPrice, normSent, hasAnySent]);
+      },
+    ];
 
-  const options = useMemo(
-    () => ({
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: "index", intersect: false },
-      scales: {
-        x: {
-          ticks: { color: colors.axis, maxRotation: 0 },
-          grid: { color: colors.grid },
-        },
-        y: {
-          position: "left",
-          ticks: { color: colors.axis },
-          grid: { color: colors.grid },
-        },
-        y1: {
-          position: "right",
-          ticks: { color: colors.axis },
-          grid: { display: false },
-        },
-      },
-      plugins: {
-        legend: {
-          position: "bottom",
-          labels: { color: colors.legend },
-        },
-        tooltip: {
-          intersect: false,
-        },
-      },
-      animation: { duration: 250 },
-    }),
-    []
-  );
+    return {
+      ok: true,
+      labels,
+      datasets,
+      r: Number.isFinite(+data?.correlation?.pearson_r) ? +data.correlation.pearson_r : null,
+    };
+  }, [data]);
 
   return (
     <div className="card" style={{ padding: 12 }}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
         <h3 style={{ margin: 0 }}>📰 Sentiment vs Price — {ticker}</h3>
-        <div className="muted">
-          {loading ? "Loading…" : `Pearson r = ${rText}`}
-          {!hasAnySent ? " • no recent news sentiment" : ""}
-        </div>
+        <div className="muted">Pearson r = {Number.isFinite(chartStuff.r) ? chartStuff.r.toFixed(3) : "n/a"}</div>
       </div>
 
-      <div style={{ marginTop: 8, height: 280 }}>
-        <Chart type="bar" data={{ labels, datasets }} options={options} />
-      </div>
+      {loading && <div className="muted">Loading sentiment…</div>}
+      {!!err && !loading && <div className="muted error">{err}</div>}
+
+      {chartStuff.ok ? (
+        <div style={{ marginTop: 8 }}>
+          <Chart
+            type="bar"
+            data={{ labels: chartStuff.labels, datasets: chartStuff.datasets }}
+            options={{
+              responsive: true,
+              interaction: { mode: "index", intersect: false },
+              scales: {
+                y: { position: "left", grid: { display: false } },
+                y1: { position: "right", grid: { display: false } },
+              },
+              plugins: { legend: { position: "bottom" } },
+              animation: { duration: 250 },
+            }}
+          />
+        </div>
+      ) : (
+        !loading &&
+        !err && <div className="muted" style={{ marginTop: 8 }}>No sentiment/price data to display.</div>
+      )}
     </div>
   );
 }
