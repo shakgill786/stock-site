@@ -108,17 +108,28 @@ const dropDupTailHistory = (rows = []) => {
   return rows;
 };
 
-// If we have a quote, force the last daily close to match the official last_close
+// Rescale provider closes to the quote’s last_close if they’re on a different scale.
+// Also pins the last close exactly to quote.last_close and drops duplicated tail.
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
-  let outCloses = Array.isArray(closes) ? [...closes] : [];
+  let outCloses = Array.isArray(closes) ? closes.map(Number).filter(Number.isFinite) : [];
   if (!outDates.length || outDates.length !== outCloses.length) {
     return { dates: [], closes: [] };
   }
-  const lastIdx = outCloses.length - 1;
-  if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
-    outCloses[lastIdx] = Number(quote.last_close);
+
+  const n = outCloses.length;
+  const providerLast = outCloses[n - 1];
+  const quoteLast = Number(quote?.last_close);
+
+  if (Number.isFinite(quoteLast) && quoteLast > 0 && Number.isFinite(providerLast) && providerLast > 0) {
+    const ratio = quoteLast / providerLast;
+    // treat >8% mismatch as scaling issue (split/adj vs unadj)
+    if (Math.abs(1 - ratio) > 0.08) {
+      outCloses = outCloses.map((v) => v * ratio);
+    }
+    outCloses[n - 1] = quoteLast; // pin to official last_close
   }
+
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
 }
@@ -222,7 +233,7 @@ export default function App() {
     return () => window.removeEventListener("ticker:set", handler);
   }, []);
 
-  // Pre-warm backend right after mount to reduce cold-start timeouts
+  // Pre-warm backend right after mount
   useEffect(() => {
     (async () => {
       try { await ping(); } catch {}
@@ -277,21 +288,18 @@ export default function App() {
     return { histByDate: byDate, histPred: byDateModel };
   }, [historyRows]);
 
-  // Prefer the API's backtest dates for the table
   const histDates = useMemo(
     () => (historyRows || []).map((r) => dkey(r.date)),
     [historyRows]
   );
 
   const loadData = useCallback(async () => {
-    const myVer = ++reqVer.current; // this run's token
+    const myVer = ++reqVer.current;
 
-    // cancel any in-flight request from the previous run
     try { abortRef.current?.abort?.(); } catch {}
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
-    // Reset errors (keep existing data visible during refresh)
     setError("");
     setDiagnostic("");
     setQuoteErr(false);
@@ -300,7 +308,7 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // 1) Quote — awaited, used by closes sanitization
+    // 1) Quote
     const pQuote = (async () => {
       try {
         const q = await fetchQuote(t, { signal: ctrl.signal });
@@ -335,9 +343,7 @@ export default function App() {
         const m = await fetchMarket({ signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         setMarket(m);
-      } catch {
-        /* ignore */
-      }
+      } catch {/* ignore */}
     })();
 
     // 3.5) Closes (align with quote + drop duplicate tail)
@@ -452,9 +458,7 @@ export default function App() {
           }
           prevPriceRef.current = next;
         }
-      } catch {
-        /* ignore parse issues */
-      }
+      } catch { /* ignore */ }
     };
     es.onerror = () => {
       try { es.close(); } catch {}
@@ -479,17 +483,6 @@ export default function App() {
     setTicker(t);
     const go = () => scrollToTarget(mainSectionRef.current);
     requestAnimationFrame(() => requestAnimationFrame(go));
-  };
-
-  // ➕ Add from Watchlist into Compare
-  const handleAddToCompare = (sym) => {
-    const s = String(sym || "").toUpperCase().trim();
-    if (!s) return;
-    setCompareSymbols((prev) => {
-      const next = [...new Set([...(prev || []), s])];
-      return next.slice(0, 3);
-    });
-    setCompareOpen(true);
   };
 
   // Client-side metrics & recommendation
@@ -522,7 +515,8 @@ export default function App() {
   const horizon = results?.[0]?.predictions?.length || 0;
 
   const pastDaysToShow = 10;
-  const pastLabels = (histDates.length ? histDates : closeDates).slice(-pastDaysToShow);
+  // Always use closeDates for the table’s past labels so “Actual” is consistent with the rescaled series
+  const pastLabels = closeDates.slice(-pastDaysToShow);
 
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
@@ -556,14 +550,13 @@ export default function App() {
 
   // ----- Backtest harmonization (optional rescale if clearly mismatched) -----
   function harmonize(series, actual) {
-    // collect overlapping pairs
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
       const a = actual[i];
       const b = series[i];
       if (Number.isFinite(a) && Number.isFinite(b)) pairs.push([a, b]);
     }
-    if (pairs.length < 5) return { series, note: null }; // not enough data
+    if (pairs.length < 5) return { series, note: null };
 
     const A = pairs.map((p) => p[0]);
     const B = pairs.map((p) => p[1]);
@@ -578,15 +571,9 @@ export default function App() {
     const medB = median(B);
     const scaleRatio = medB && medA ? medA / medB : 1;
 
-    // baseline MAPE
-    const mape = A.reduce((acc, a, i) => {
-      const b = B[i];
-      return acc + Math.abs(a - b) / (Math.abs(a) || 1);
-    }, 0) / A.length;
+    const mape = A.reduce((acc, a, i) => acc + Math.abs(a - B[i]) / (Math.abs(a) || 1), 0) / A.length;
 
-    // If clearly off-scale (> 20% typical error) and median ratio far from 1, rescale linearly.
     if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
-      // Simple linear fit y ≈ alpha + beta * x (map B -> A)
       const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
       const meanA = mean(A);
       const meanB = mean(B);
@@ -632,9 +619,9 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // Past (backtest)
+      // Past (backtest) — map onto chartLabels’ past segment
       const backtestRaw = chartLabels.map((lab, i) => {
-        if (i >= pastLabels.length) return null; // only for past segment
+        if (i >= pastLabels.length) return null;
         const dk = dkey(lab);
         const val = histPred?.[dk]?.[mKey];
         return Number.isFinite(Number(val)) ? Number(val) : null;
@@ -708,7 +695,6 @@ export default function App() {
     const idx = closeDates.lastIndexOf(iso);
     let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
-    // last past day: force to official last_close to avoid drift
     if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
       actual = Number(quote.last_close);
     }
@@ -770,7 +756,7 @@ export default function App() {
           <WatchlistPanel
             current={ticker}
             onLoad={(s) => setTicker(s)}
-            onAddToCompare={handleAddToCompare}
+            onAddToCompare={setCompareSymbols}
           />
           <div style={{ marginTop: 12 }}>
             <label>
@@ -804,7 +790,7 @@ export default function App() {
           )}
 
           {/* Hot movers + Earnings next 7d */}
-          <HotAndEarnings onSelectTicker={handleSelectTicker} />
+          <HotAndEarnings onSelectTicker={(s)=>setTicker(s)} />
 
           <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
@@ -972,21 +958,8 @@ export default function App() {
                   </thead>
                   <tbody>
                     {[
-                      ...pastLabels.map((iso, idx) => ({
-                        date: iso,
-                        actual: actualForPastLabels[idx],
-                        perModel: results.map((r) => {
-                          const v = histPred?.[iso]?.[normModel(r.model)];
-                          return Number.isFinite(Number(v)) ? Number(v) : null;
-                        }),
-                        kind: "past",
-                      })),
-                      ...futureLabels.map((d, i) => ({
-                        date: d,
-                        actual: null,
-                        perModel: results.map((r) => (Array.isArray(r.predictions) ? r.predictions[i] ?? null : null)),
-                        kind: "future",
-                      })),
+                      ...pastRows,
+                      ...futureRows,
                     ].map((row, i) => (
                       <tr key={`${row.kind}-${row.date || i}`}>
                         <td>

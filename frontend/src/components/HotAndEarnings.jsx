@@ -1,18 +1,18 @@
 // frontend/src/components/HotAndEarnings.jsx
 // Movers (Gainers/Losers) + Earnings Week + Top Buys
-// - Broader hydration (always first N + missing/clamped/near-zero)
-// - Recompute Δ$ / Δ% from price vs last_close when possible
-// - Local sign classification (no cross-contamination)
+// - Prefer EOD last-two-closes deltas to avoid quote/baseline mismatches
+// - Fallback to quote-derived deltas if EOD unavailable
+// - Strict sign classification to avoid cross-contamination
 
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE, fetchMovers, fetchEarningsWeek, fetchQuote, fetchCloses } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
 const EPS = 1e-6;
-const MAX_SENSIBLE_PCT = 200;       // guardrail vs junk data
+const MAX_SENSIBLE_PCT = 120;     // anything beyond this is junk for large caps
 const HYDRATE_BATCH = 6;
-const HYDRATE_ALWAYS_FIRST = 40;    // always hydrate at least this many per list
-const NEAR_ZERO_PCT = 0.05;         // rows with |pct| < this are rehydrated
+const CALIBRATE_FIRST = 60;       // always calibrate (via EOD) at least this many rows per list
+const NEAR_ZERO_PCT = 0.05;
 
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
@@ -68,7 +68,6 @@ const signMismatch = (a, b) =>
   isNum(a) && isNum(b) && !nearZero(a) && !nearZero(b) &&
   Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
-/** Normalize any row into a consistent shape.  IMPORTANT: returns last_close too. */
 function normalizeRow(row) {
   const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
 
@@ -126,7 +125,7 @@ function normalizeRow(row) {
     if (isNum(p2)) change_pct = p2;
   }
 
-  // Fractional pct (e.g., 0.0123 = 1.23%)
+  // Fractional percent (e.g., 0.012 -> 1.2%)
   if (isNum(change_pct) && Math.abs(toNum(change_pct)) <= 2.5 && isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
     const recomputed = ((toNum(price) - toNum(prevClose)) / toNum(prevClose)) * 100;
     const asPercent = toNum(change_pct);
@@ -200,7 +199,7 @@ function pickLastTwoCloses(resp) {
     const c = toNum(cs[i]);
     if (Number.isFinite(t) && isNum(c)) rows.push({ t, d, c });
   }
-  if (!rows.length) return null;
+  if (rows.length < 2) return null;
 
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
@@ -226,82 +225,73 @@ function pickLastTwoCloses(resp) {
   return { prevClose: prev.c, lastClose: last.c, change: ch, change_pct: pct };
 }
 
-/** Ensure a row has solid deltas by hydrating via quote (then EOD closes). */
-async function hydrateOneRow(row) {
+// Calibrate one row using EOD last-two-closes; fallback to quote if needed.
+async function calibrateRow(row) {
+  const sym = row.symbol;
   try {
-    const q = await fetchQuote(row.symbol);
-    const picked = pickFromQuote(q || {});
-    let merged = normalizeRow({
-      ...row,
-      price: isNum(row.price) ? row.price : picked.price,
-      change: isNum(row.change) && !nearZero(row.change) ? row.change : picked.change,
-      change_pct:
-        (isNum(row.change_pct) && !nearZero(row.change_pct) && !looksClamped(row.change_pct))
-          ? row.change_pct
-          : picked.change_pct,
-      last_close: firstNum(q, ["last_close", "previous_close", "previousClose", "prev_close", "regularMarketPreviousClose"]),
-    });
+    const closeResp = await fetchCloses(sym, 10);
+    const eod = pickLastTwoCloses(closeResp);
+    if (eod) {
+      return normalizeRow({
+        symbol: sym,
+        price: eod.lastClose,
+        last_close: eod.prevClose,
+        change: eod.change,
+        change_pct: eod.change_pct,
+      });
+    }
+  } catch { /* ignore */ }
 
-    const ok =
-      (isNum(merged.change) && !nearZero(merged.change)) ||
-      (isNum(merged.change_pct) && !nearZero(merged.change_pct) && !looksClamped(merged.change_pct));
+  // fallback to quote math
+  try {
+    const q = await fetchQuote(sym);
+    const lastClose = toNum(firstNum(q, [
+      "last_close","previous_close","previousClose","prev_close","regularMarketPreviousClose"
+    ]));
+    const price = toNum(firstNum(q, [
+      "current_price","price","last","last_price","regularMarketPrice",
+      "extended_price","ext_price","postmarket_price","postMarketPrice",
+      "after_hours_price","afterHoursPrice","premarket_price","preMarketPrice",
+    ]));
+    if (isNum(price) && isNum(lastClose) && !nearZero(lastClose)) {
+      const ch = price - lastClose;
+      const pct = (ch / lastClose) * 100;
+      return normalizeRow({
+        symbol: sym,
+        price,
+        last_close: lastClose,
+        change: ch,
+        change_pct: pct,
+      });
+    }
+  } catch { /* ignore */ }
 
-    if (ok) return merged;
-
-    try {
-      const closeResp = await fetchCloses(row.symbol, 10);
-      const eod = pickLastTwoCloses(closeResp);
-      if (eod) {
-        return normalizeRow({
-          ...row,
-          price: isNum(merged.price) ? merged.price : eod.lastClose,
-          last_close: eod.prevClose,
-          change: eod.change,
-          change_pct: eod.change_pct,
-        });
-      }
-    } catch { /* ignore */ }
-
-    return merged;
-  } catch {
-    return row;
-  }
+  return row; // best-effort
 }
 
-/** Hydrate a list: always first N, plus rows with missing/clamped/near-zero deltas. */
-async function hydrateRows(rows) {
-  const base = rows.map((r) => ({ ...r }));
-  const need = [];
+async function calibrateList(rows) {
+  const base = rows.map((r) => normalizeRow(r));
+  const badIdx = base
+    .map((r, i) => {
+      const bad =
+        !isNum(r.price) ||
+        (!isNum(r.change) && !isNum(r.change_pct)) ||
+        (isNum(r.change_pct) && Math.abs(toNum(r.change_pct)) > MAX_SENSIBLE_PCT) ||
+        (isNum(r.change_pct) && Math.abs(toNum(r.change_pct)) < NEAR_ZERO_PCT);
+      return bad ? i : -1;
+    })
+    .filter((i) => i >= 0);
 
-  const markNeed = (r, i) => {
-    const smallPct = isNum(r.change_pct) && Math.abs(toNum(r.change_pct)) < NEAR_ZERO_PCT;
-    const missing =
-      (!(isNum(r.change) && !nearZero(r.change)) &&
-       !(isNum(r.change_pct) && !nearZero(r.change_pct))) ||
-      looksClamped(r.change_pct) ||
-      smallPct;
-    if (missing) need.push({ i, sym: r.symbol });
-  };
+  const targets = [...new Set([...Array(Math.min(base.length, CALIBRATE_FIRST)).keys(), ...badIdx])];
 
-  // Always include the first HYDRATE_ALWAYS_FIRST rows
-  for (let i = 0; i < Math.min(base.length, HYDRATE_ALWAYS_FIRST); i++) {
-    need.push({ i, sym: base[i].symbol });
-  }
-  // Also include any that look missing/clamped/near-zero
-  base.forEach(markNeed);
-
-  // Deduplicate indices
-  const uniqIdx = [...new Set(need.map((x) => x.i))];
-
-  for (let k = 0; k < uniqIdx.length; k += HYDRATE_BATCH) {
-    const slice = uniqIdx.slice(k, k + HYDRATE_BATCH);
+  for (let k = 0; k < targets.length; k += HYDRATE_BATCH) {
+    const slice = targets.slice(k, k + HYDRATE_BATCH);
     await Promise.all(
       slice.map(async (i) => {
-        base[i] = await hydrateOneRow(base[i]);
+        base[i] = await calibrateRow(base[i]);
       })
     );
   }
-
   return base;
 }
 
@@ -313,22 +303,6 @@ function rowSign(r) {
     if (!nearZero(ch)) return Math.sign(ch);
   }
   return 0;
-}
-
-function dedupeBest(rows) {
-  const score = (v) =>
-    (isNum(v.price) ? 1 : 0) +
-    (isNum(v.last_close) ? 1 : 0) +
-    (isNum(v.change) ? 1 : 0) +
-    (isNum(v.change_pct) ? 1 : 0);
-  const map = new Map();
-  for (const r0 of rows) {
-    const r = normalizeRow(r0);
-    if (!r.symbol) continue;
-    const ex = map.get(r.symbol);
-    if (!ex || score(r) > score(ex)) map.set(r.symbol, r);
-  }
-  return [...map.values()];
 }
 
 function Card({ title, right, children }) {
@@ -351,16 +325,13 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return (rows || []).filter((x) => {
-      // Keep if we have a price and either:
-      // - a usable change/percent, or
-      // - we can compute from last_close
       if (!isNum(x.price) || toNum(x.price) < lim) return false;
 
-      const usableDelta =
-        (isNum(x.change) && !nearZero(x.change)) ||
-        (isNum(x.change_pct) && !nearZero(x.change_pct));
+      const usable =
+        (isNum(x.change_pct) && Math.abs(toNum(x.change_pct)) > 0.01 && Math.abs(toNum(x.change_pct)) <= MAX_SENSIBLE_PCT) ||
+        (isNum(x.change) && Math.abs(toNum(x.change)) > toNum(x.price) * 0.0005); // ~0.05%
 
-      if (usableDelta) return true;
+      if (usable) return true;
 
       if (isNum(x.last_close) && !nearZero(x.last_close)) {
         const ch = toNum(x.price) - toNum(x.last_close);
@@ -371,9 +342,8 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
   }, [rows, minPrice]);
 
   const sorted = useMemo(() => {
-    const key = sortKey;
+    // Recompute display deltas from last_close where possible
     const arr = filtered.map((r) => {
-      // final recompute display deltas when possible
       if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
         const ch = toNum(r.price) - toNum(r.last_close);
         const pct = (ch / toNum(r.last_close)) * 100;
@@ -382,6 +352,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
       return r;
     });
 
+    const key = sortKey;
     arr.sort((a, b) => {
       const va = isNum(a?.[key]) ? toNum(a[key]) : (sortDir === "desc" ? -Infinity : Infinity);
       const vb = isNum(b?.[key]) ? toNum(b[key]) : (sortDir === "desc" ? -Infinity : Infinity);
@@ -401,11 +372,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
       title={title}
       right={
         <div className="he-controls">
-          {fetchedFrom && (
-            <span className="he-source">
-              source: {fetchedFrom}{fetchedFrom.includes("alpha") ? " (hydrated)" : ""}
-            </span>
-          )}
+          {fetchedFrom && <span className="he-source">source: {fetchedFrom} (EOD-calibrated)</span>}
           <select
             value={String(minPrice)}
             onChange={(e) => setMinPrice(Number(e.target.value))}
@@ -462,6 +429,7 @@ function MoversCard({ title, rows = [], loading, error, onPick, fetchedFrom, kin
                         type="button"
                         className="ticker-link"
                         onClick={() => {
+                          onPick?.(sym);
                           window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
                         }}
                         title={`Load ${sym}`}
@@ -619,41 +587,22 @@ export default function HotAndEarnings({ onSelectTicker }) {
     setErrMovers("");
     try {
       const mv = await fetchMovers();
+      const gl = Array.isArray(mv?.gainers) ? mv.gainers : [];
+      const ll = Array.isArray(mv?.losers) ? mv.losers : [];
 
-      // Normalize both lists
-      const g0 = (Array.isArray(mv?.gainers) ? mv.gainers : []).map(normalizeRow);
-      const l0 = (Array.isArray(mv?.losers) ? mv.losers : []).map(normalizeRow);
+      // Calibrate from EOD wherever possible
+      const [gCal, lCal] = await Promise.all([calibrateList(gl), calibrateList(ll)]);
 
-      // Always hydrate a chunk + any missing/clamped/near-zero
-      const [gHydrated, lHydrated] = await Promise.all([hydrateRows(g0), hydrateRows(l0)]);
+      // Strict sign classification after calibration
+      const onlyValid = (x) => isNum(x.price) && (
+        (isNum(x.change_pct) && Math.abs(toNum(x.change_pct)) > 0.01 && Math.abs(toNum(x.change_pct)) <= MAX_SENSIBLE_PCT) ||
+        (isNum(x.last_close) && !nearZero(x.last_close) && Math.abs(toNum(x.price) - toNum(x.last_close)) > toNum(x.price) * 0.0005)
+      );
 
-      // Merge + dedupe by symbol
-      const merged = dedupeBest([...gHydrated, ...lHydrated]).map((r) => {
-        // Final consistency: if we have last_close, recompute from it
-        if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
-          const ch = toNum(r.price) - toNum(r.last_close);
-          const pct = (ch / toNum(r.last_close)) * 100;
-          return normalizeRow({ ...r, change: ch, change_pct: pct });
-        }
-        return r;
-      });
+      const pos = gCal.concat(lCal).filter((r) => onlyValid(r) && rowSign(r) > 0);
+      const neg = gCal.concat(lCal).filter((r) => onlyValid(r) && rowSign(r) < 0);
 
-      // Classify by sign so gainers/losers never mix
-      const onlyValid = (x) => {
-        if (!isNum(x.price)) return false;
-        if ((isNum(x.change) && !nearZero(x.change)) || (isNum(x.change_pct) && !nearZero(x.change_pct))) return true;
-        if (isNum(x.last_close) && !nearZero(x.last_close)) {
-          const ch = toNum(x.price) - toNum(x.last_close);
-          return !nearZero(ch);
-        }
-        return false;
-      };
-
-      const pos = merged.filter((r) => onlyValid(r) && rowSign(r) > 0);
-      const neg = merged.filter((r) => onlyValid(r) && rowSign(r) < 0);
-
-      // Debug counts (visible in console)
-      console.debug("[movers] source:", mv?.source, "| gainers:", g0.length, "→", pos.length, "| losers:", l0.length, "→", neg.length);
+      console.debug("[movers]", mv?.source, "pos:", pos.length, "neg:", neg.length);
 
       setGainers(pos);
       setLosers(neg);
@@ -676,6 +625,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         throw new Error("405");
       }
       const items = Array.isArray(wk?.items) ? wk.items : [];
+
       if (!items.length) {
         try {
           const res = await fetch(`${API_BASE}/earnings_week/`, {
@@ -693,6 +643,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
           }
         } catch {/* ignore */}
       }
+
       setEarnings(items.slice(0, 500));
       if (!items.length && wk?.error) setErrEarnings(wk.error);
     } catch (e) {
@@ -758,6 +709,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         items={earnings}
         loading={loadingEarnings}
         error={errEarnings}
+        onPick={pick}
       />
 
       <style>{`
