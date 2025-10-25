@@ -10,17 +10,9 @@ import {
 } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
-// ---------- tuning constants ----------
-// if yesterday_close vs today_close ratio is beyond this, we assume hard split / garbage
-// (was 1.3 before, way too strict, now 2.0 so ~+100% is still allowed without auto-disqualifying)
-const SPLIT_RATIO_THRESHOLD = 2.0;
-
-// the absolute % move we're still willing to show in movers
-// (was 40 → that nuked basically everything; bumped to 80 so -91% still dies, +800% dies)
-const SANE_PCT_LIMIT = 80;
-
-// ignore microscopic noise (<0.05%)
-const MIN_MOVE_PCT = 0.05;
+const SPLIT_RATIO_THRESHOLD = 2.0; // tolerate up to ~100% gap day/day before calling it a split
+const SANE_PCT_LIMIT = 80; // kill <-80% / >+80% "moves"
+const MIN_MOVE_PCT = 0.05; // we won't *filter* by this anymore, but we still use it for calibration targets
 
 const HYDRATE_BATCH = 6;
 const CALIBRATE_FIRST = 60;
@@ -90,7 +82,7 @@ const SESSION_BADGE = (s) => {
 };
 
 const looksClamped = (pct) =>
-  isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
+  isNum(pct) && Math.abs(toNum(pct)) >= 24.9; // vendor "max ±25%" circuit breaker look
 
 function firstNum(obj, keys) {
   for (const k of keys) {
@@ -109,7 +101,8 @@ const signMismatch = (a, b) =>
   Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
 /**
- * normalizeRow: produce a canonical row no matter what trash shape the vendor gave us
+ * normalizeRow: try to coerce whatever junk vendor sent into:
+ * { symbol, price, last_close, change, change_pct }
  */
 function normalizeRow(row) {
   const symbol = String(
@@ -174,7 +167,7 @@ function normalizeRow(row) {
 
   const open = firstNum(row, ["open", "Open"]);
 
-  // unclamp if the feed is doing +/-25.00% walls
+  // unclamp vendor's ±25% wall if possible
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const base = toNum(price) - toNum(change);
     if (isNum(base) && !nearZero(base)) {
@@ -191,7 +184,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback to open (intraday style)
+  // fallback to open (intraday reference)
   if (
     !(isNum(change) && isNum(change_pct)) &&
     isNum(price) &&
@@ -204,12 +197,13 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
-  // derive missing piece if only one of change / change_pct exists
+  // derive missing piece from pct
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base))
       change = (toNum(change_pct) / 100) * toNum(base);
   }
+  // derive pct from change
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose)
       ? prevClose
@@ -223,7 +217,7 @@ function normalizeRow(row) {
     if (isNum(p2)) change_pct = p2;
   }
 
-  // fractional pct case (0.87 actually means 87%)
+  // pct might be fractional (0.8 = 80%)
   if (
     isNum(change_pct) &&
     Math.abs(toNum(change_pct)) <= 2.5 &&
@@ -240,7 +234,7 @@ function normalizeRow(row) {
     change_pct = err2 < err1 ? asPercentTimes100 : asPercent;
   }
 
-  // fix sign mismatch if they disagree
+  // fix sign mismatch
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose)
       ? prevClose
@@ -276,7 +270,7 @@ function pickFromQuote(q) {
     ])
   );
 
-  // extended or current price
+  // choose extended/session price if present, else regular
   const extPrice = firstNum(q, [
     "extended_price",
     "ext_price",
@@ -339,7 +333,7 @@ function pickFromQuote(q) {
   });
 }
 
-// look at last 2 unique closes via /closes and compute clean change
+// use last 2 unique closes to compute sane pct move
 function pickLastTwoCloses(resp) {
   const ds = Array.isArray(resp?.dates) ? resp.dates : [];
   const cs = Array.isArray(resp?.closes) ? resp.closes : [];
@@ -354,7 +348,6 @@ function pickLastTwoCloses(resp) {
   }
   if (rows.length < 2) return null;
 
-  // unique by date, keep latest for that date
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
   for (let i = 0; i < rows.length; i++) {
@@ -373,18 +366,15 @@ function pickLastTwoCloses(resp) {
   const prev = uniq[j];
 
   if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
-
   const ratio = Math.abs(toNum(last.c) / toNum(prev.c));
 
-  // if it looks like a giant discontinuity (>2x move overnight),
-  // assume it's a split / weird feed and bail
+  // looks like a split or garbage → bail
   if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
     return null;
   }
 
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
-
   if (!Number.isFinite(pct) || Math.abs(pct) > 1000) return null;
 
   return {
@@ -395,9 +385,7 @@ function pickLastTwoCloses(resp) {
   };
 }
 
-// main per-row calibration:
-// 1) try clean 2-day EOD math
-// 2) else fallback to quote math
+// hydrate with /closes then /quote fallbacks
 async function calibrateRow(row) {
   const sym = row.symbol;
   // try EOD closes
@@ -422,24 +410,21 @@ async function calibrateRow(row) {
     const q = await fetchQuote(sym);
     return pickFromQuote(q || {});
   } catch {
-    // just return whatever we had
     return row;
   }
 }
 
-// run calibration on a list, but not for every single row 1-by-1 serially
 async function calibrateList(rows) {
-  // normalize first
   const base = rows.map((r) => normalizeRow(r));
 
-  // find "sketchy" rows to hydrate, plus first N
+  // mark "sketchy" rows for hydration with slower calls
   const badIdx = base
     .map((r, i) => {
       const pct = toNum(r.change_pct);
       const huge = isNum(pct) && Math.abs(pct) > SANE_PCT_LIMIT;
-      const tiny = isNum(pct) && Math.abs(pct) < MIN_MOVE_PCT;
       const missingBoth = !isNum(r.change) && !isNum(r.change_pct);
-      return huge || missingBoth ? i : -1; // (we don't mark "tiny" as bad anymore because maybe % is tiny but $move is huge)
+      // note: we do NOT mark "tiny" as bad anymore
+      return huge || missingBoth ? i : -1;
     })
     .filter((i) => i >= 0);
 
@@ -461,7 +446,7 @@ async function calibrateList(rows) {
   return base;
 }
 
-// re-derive change/$ and pct strictly from price vs last_close so they match
+// make sure $chg and %chg line up with price vs last_close
 function recomputeFromClose(r) {
   if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
@@ -471,16 +456,15 @@ function recomputeFromClose(r) {
   return r;
 }
 
-// sanity check final % move
+// how "big" is the move? (0% is allowed now)
 function saneAbsPct(row) {
   if (!isNum(row.change_pct)) return NaN;
   const absPct = Math.abs(toNum(row.change_pct));
-  if (absPct < MIN_MOVE_PCT) return NaN;
   if (absPct > SANE_PCT_LIMIT) return NaN;
   return absPct;
 }
 
-// dedupe tickers across sources, pick the most "useful" version
+// we choose best duplicate ticker row by "better" pct info
 function mergeBestBySymbol(rows) {
   const out = new Map();
   for (const raw of rows) {
@@ -496,12 +480,13 @@ function mergeBestBySymbol(rows) {
     const prevAbs = saneAbsPct(prev);
     const currAbs = saneAbsPct(r);
 
-    // prefer sane % over insane
+    // prefer the one that has *valid* saneAbsPct at all
     if (Number.isFinite(currAbs) && !Number.isFinite(prevAbs)) {
       out.set(r.symbol, r);
       continue;
     }
     if (Number.isFinite(currAbs) && Number.isFinite(prevAbs)) {
+      // if both valid, prefer the one with larger |pct| (more interesting)
       if (currAbs > prevAbs) {
         out.set(r.symbol, r);
         continue;
@@ -511,27 +496,41 @@ function mergeBestBySymbol(rows) {
   return [...out.values()];
 }
 
-// classify positive/negative for gainers vs losers
+// classify + / -
+// IMPORTANT CHANGE: if move is basically 0, we treat it as +
+// so after-hours "flat" still shows under Gainers instead of nothing.
 function rowSign(r) {
-  if (isNum(r.change_pct) && !nearZero(r.change_pct))
-    return Math.sign(toNum(r.change_pct));
-  if (isNum(r.change) && !nearZero(r.change)) return Math.sign(toNum(r.change));
+  if (isNum(r.change_pct)) {
+    const v = toNum(r.change_pct);
+    if (!nearZero(v)) return Math.sign(v);
+    return v >= 0 ? 1 : -1;
+  }
+  if (isNum(r.change)) {
+    const v = toNum(r.change);
+    if (!nearZero(v)) return Math.sign(v);
+    return v >= 0 ? 1 : -1;
+  }
   if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
     if (!nearZero(ch)) return Math.sign(ch);
+    return ch >= 0 ? 1 : -1;
   }
   return 0;
 }
 
-// final display filter
+// final display filter (loosened):
+// - price must exist and be ≥ $1
+// - %change must exist and be sane (but 0% is fine)
 function validRowForDisplay(r) {
-  const absPct = saneAbsPct(r); // NaN if nonsense / too tiny / too huge
-  if (!Number.isFinite(absPct)) return false;
   if (!isNum(r.price)) return false;
   if (toNum(r.price) < 1) return false;
+  if (!isNum(r.change_pct)) return false;
+  const absPct = Math.abs(toNum(r.change_pct));
+  if (absPct > SANE_PCT_LIMIT) return false;
   return true;
 }
 
+/* ---------- UI bits ---------- */
 function Card({ title, right, children }) {
   return (
     <div className="he-card">
@@ -557,7 +556,6 @@ function MoversCard({
   const [sortKey, setSortKey] = useState("change_pct");
   const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc");
 
-  // filter by user-selected min price
   const filtered = useMemo(() => {
     const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return (rows || []).filter((x) => {
@@ -566,7 +564,6 @@ function MoversCard({
     });
   }, [rows, minPrice]);
 
-  // sort
   const sorted = useMemo(() => {
     const arr = filtered.slice();
     const key = sortKey;
@@ -709,7 +706,7 @@ function MoversCard({
 function EarningsCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
-  // filter tickers client-side as you type
+  // filter client-side as user types
   const filtered = useMemo(() => {
     const list = Array.isArray(items) ? items : [];
     const needle = q.trim().toUpperCase();
@@ -719,7 +716,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
     );
   }, [items, q]);
 
-  // group by date, dedupe per date, and sort tickers
+  // group by date and dedupe tickers *within that date*
   const groups = useMemo(() => {
     const map = new Map();
     for (const row of filtered) {
@@ -731,7 +728,6 @@ function EarningsCard({ items = [], loading, error, onPick }) {
     return Array.from(map.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, rows]) => {
-        // dedupe tickers for that date
         const uniqMap = new Map();
         rows.forEach((r) => {
           const sym = String(r.symbol || "").toUpperCase();
@@ -793,7 +789,7 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                     const sym = String(r.symbol || "").toUpperCase();
                     return (
                       <tr key={`${date}-${sym}-${i}`}>
-                        <td className="muted">{/* blank on purpose under group */}</td>
+                        <td className="muted">{/* intentionally blank */}</td>
                         <td
                           style={{
                             textAlign: "center",
@@ -875,24 +871,24 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const rawG = Array.isArray(mv?.gainers) ? mv.gainers : [];
       const rawL = Array.isArray(mv?.losers) ? mv.losers : [];
 
-      // calibrate (EOD math first, then quote fallback)
+      // "hydrate" & normalize
       const [gCal, lCal] = await Promise.all([
         calibrateList(rawG),
         calibrateList(rawL),
       ]);
 
-      // merge, dedupe, recompute % from last_close
+      // dedupe symbol-level, recompute change_pct from price vs last_close
       const merged = mergeBestBySymbol([...gCal, ...lCal]);
 
-      // final filter + split by sign
+      // split them into positive/negative buckets
       const pos = [];
       const neg = [];
       for (const r0 of merged) {
-        const r = recomputeFromClose(r0); // re-sync $ and %
+        const r = recomputeFromClose(r0);
         if (!validRowForDisplay(r)) continue;
-        const sgn = rowSign(r);
-        if (sgn > 0) pos.push(r);
-        else if (sgn < 0) neg.push(r);
+        const sgn = rowSign(r); // >=0 goes to pos, <0 to neg
+        if (sgn >= 0) pos.push(r);
+        else neg.push(r);
       }
 
       setGainers(pos);
@@ -915,7 +911,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       if (!wk && typeof wk !== "object") wk = {};
       const items = Array.isArray(wk?.items) ? wk.items : [];
 
-      // fallback: try /earnings_week/ if first endpoint didn't populate
+      // fallback endpoint if needed
       if (!items.length) {
         try {
           const res = await fetch(`${API_BASE}/earnings_week/`, {
@@ -959,7 +955,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // candidate symbols we pass to TopBuysCard
+  // supply symbols to TopBuysCard (model scoring)
   const topBuyCandidates = useMemo(() => {
     const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
     const uniq = Array.from(new Set(fromMovers));

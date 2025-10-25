@@ -135,7 +135,7 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
       // full-series scale if provider is clearly on wrong basis
       outCloses = outCloses.map((v) => v * ratio);
     }
-    // always pin last item to quote
+    // always pin last item exactly to the quote
     outCloses[n - 1] = quoteLast;
   }
 
@@ -572,12 +572,9 @@ export default function App() {
 
   // ---------- Actual vs. Predicted ----------
   const horizon = results?.[0]?.predictions?.length || 0;
-
   const pastDaysToShow = 10;
 
-  // 🔁 KEY FIX:
-  // Prefer historyRows dates (histDates) because those have sane actuals (e.g. 188,180,...),
-  // and only fall back to closeDates if we don't have history.
+  // Prefer historyRows dates if we have them
   const basePast = (histDates.length ? histDates : closeDates).slice(
     -pastDaysToShow
   );
@@ -595,19 +592,33 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // Also KEY FIX:
-  // Actual should come from histByDate first.
-  // Only if we don't have that, we fallback to closes[] by matching date string.
-  const actualForPastLabels = pastLabels.map((iso) => {
+  // 🔧 FIX PART 1:
+  // For each past date:
+  //  - Use predict_history.actual if available (good scale ~180, ~181, ...)
+  //  - ELSE (for *non-final* past rows only) fall back to closes[]
+  //  - For the last past date, if we don't have actual in hist, return null
+  //    instead of injecting the mismatched 262.xx close.
+  const actualForPastLabels = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const h = histByDate[dkIso];
+
     if (Number.isFinite(h?.actual)) return h.actual;
-    const idx = closeDates.lastIndexOf(iso);
-    if (idx >= 0 && Number.isFinite(closes[idx])) return closes[idx];
+
+    const isLast = idx === pastLabels.length - 1;
+    if (isLast) {
+      // Don't fall back to closes on the freshest date if history
+      // hasn't landed yet. This avoids the giant split jump.
+      return null;
+    }
+
+    const idxClose = closeDates.lastIndexOf(iso);
+    if (idxClose >= 0 && Number.isFinite(closes[idxClose])) {
+      return closes[idxClose];
+    }
     return null;
   });
 
-  // harmonizer to smooth model backtests onto actual scale
+  // harmonizer to smooth each model's backtest scale into actual scale
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
@@ -777,15 +788,18 @@ export default function App() {
     },
   };
 
-  // build table rows for AVP table
-  const pastRows = pastLabels.map((iso) => {
+  // 🔧 FIX PART 2:
+  // Build table rows using same "don't inject 262.xx if it's not in history" rule
+  const pastRows = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const hist = histByDate[dkIso];
+
+    const isLast = idx === pastLabels.length - 1;
     const idxClose = closeDates.lastIndexOf(iso);
 
     const actualHere = Number.isFinite(hist?.actual)
       ? hist.actual
-      : idxClose >= 0 && Number.isFinite(closes[idxClose])
+      : !isLast && idxClose >= 0 && Number.isFinite(closes[idxClose])
       ? closes[idxClose]
       : null;
 
