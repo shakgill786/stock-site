@@ -1,14 +1,4 @@
 // frontend/src/components/HotAndEarnings.jsx
-// Movers (Gainers/Losers) + Earnings Week + Top Buys
-//
-// Goals here:
-//   - Use EOD (last two closes) *only* if it's not obviously a split (>30% jump).
-//   - Otherwise fall back to quote math.
-//   - Recompute $ / % change from (price - last_close).
-//   - Throw out rows with absurd % moves (>40%) or microscopic noise (<0.05%).
-//   - Dedupe tickers and keep just one clean row per symbol.
-//   - Classify gainers vs losers only AFTER cleanup, so KO doesn't show -91%, etc.
-//
 
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -20,13 +10,22 @@ import {
 } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
-const EPS = 1e-6;
-const SPLIT_RATIO_THRESHOLD = 1.3; // >30% gap overnight screams split / adjustment
-const SANE_PCT_LIMIT = 40; // anything above 40% we treat as sketchy for "Top 25"
-const MIN_MOVE_PCT = 0.05; // ignore pure noise (<0.05%)
+// ---------- tuning constants ----------
+// if yesterday_close vs today_close ratio is beyond this, we assume hard split / garbage
+// (was 1.3 before, way too strict, now 2.0 so ~+100% is still allowed without auto-disqualifying)
+const SPLIT_RATIO_THRESHOLD = 2.0;
+
+// the absolute % move we're still willing to show in movers
+// (was 40 → that nuked basically everything; bumped to 80 so -91% still dies, +800% dies)
+const SANE_PCT_LIMIT = 80;
+
+// ignore microscopic noise (<0.05%)
+const MIN_MOVE_PCT = 0.05;
+
 const HYDRATE_BATCH = 6;
 const CALIBRATE_FIRST = 60;
 
+const EPS = 1e-6;
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
   if (typeof v === "number") return v;
@@ -41,6 +40,7 @@ const toNum = (v) => {
 const isNum = (v) => Number.isFinite(toNum(v));
 const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
+// formatting helpers
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
   isNum(v)
@@ -109,8 +109,7 @@ const signMismatch = (a, b) =>
   Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
 /**
- * normalizeRow: take whatever original vendor row gave us,
- * and produce { symbol, price, change, change_pct, last_close } as numbers (or NaN).
+ * normalizeRow: produce a canonical row no matter what trash shape the vendor gave us
  */
 function normalizeRow(row) {
   const symbol = String(
@@ -175,28 +174,24 @@ function normalizeRow(row) {
 
   const open = firstNum(row, ["open", "Open"]);
 
-  // If the provider "clamped" percent at e.g. 25%, try to fix
+  // unclamp if the feed is doing +/-25.00% walls
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const base = toNum(price) - toNum(change);
     if (isNum(base) && !nearZero(base)) {
       const p2 = (toNum(change) / base) * 100;
-      if (isNum(p2) && Math.abs(p2) < 24.9)
-        change_pct = p2;
+      if (isNum(p2) && Math.abs(p2) < 24.9) change_pct = p2;
     }
   }
 
-  // Prefer price vs prevClose if both exist
+  // recompute from prevClose if we have it
   if (isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
-    const derivedChange =
-      toNum(price) - toNum(prevClose);
-    const derivedPct =
-      (derivedChange / toNum(prevClose)) * 100;
+    const derivedChange = toNum(price) - toNum(prevClose);
+    const derivedPct = (derivedChange / toNum(prevClose)) * 100;
     if (!isNum(change)) change = derivedChange;
-    if (!isNum(change_pct) || looksClamped(change_pct))
-      change_pct = derivedPct;
+    if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // Fallback to open if needed (intraday fallback)
+  // fallback to open (intraday style)
   if (
     !(isNum(change) && isNum(change_pct)) &&
     isNum(price) &&
@@ -204,25 +199,16 @@ function normalizeRow(row) {
     !nearZero(open)
   ) {
     const intraday = toNum(price) - toNum(open);
-    const intradayPct =
-      (intraday / toNum(open)) * 100;
+    const intradayPct = (intraday / toNum(open)) * 100;
     if (!isNum(change)) change = intraday;
-    if (
-      !isNum(change_pct) ||
-      looksClamped(change_pct)
-    )
-      change_pct = intradayPct;
+    if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
-  // Derive missing one from the other
+  // derive missing piece if only one of change / change_pct exists
   if (!isNum(change) && isNum(change_pct)) {
-    const base = isNum(prevClose)
-      ? prevClose
-      : price;
+    const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base))
-      change =
-        (toNum(change_pct) / 100) *
-        toNum(base);
+      change = (toNum(change_pct) / 100) * toNum(base);
   }
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose)
@@ -232,13 +218,12 @@ function normalizeRow(row) {
       : NaN;
     const p2 =
       isNum(base) && !nearZero(base)
-        ? (toNum(change) / toNum(base)) *
-          100
+        ? (toNum(change) / toNum(base)) * 100
         : NaN;
     if (isNum(p2)) change_pct = p2;
   }
 
-  // Fractional % case: 0.012 -> maybe 1.2%
+  // fractional pct case (0.87 actually means 87%)
   if (
     isNum(change_pct) &&
     Math.abs(toNum(change_pct)) <= 2.5 &&
@@ -247,24 +232,15 @@ function normalizeRow(row) {
     !nearZero(prevClose)
   ) {
     const recomputed =
-      ((toNum(price) - toNum(prevClose)) /
-        toNum(prevClose)) *
-      100;
+      ((toNum(price) - toNum(prevClose)) / toNum(prevClose)) * 100;
     const asPercent = toNum(change_pct);
     const asPercentTimes100 = asPercent * 100;
-    const err1 = Math.abs(
-      recomputed - asPercent
-    );
-    const err2 = Math.abs(
-      recomputed - asPercentTimes100
-    );
-    change_pct =
-      err2 < err1
-        ? asPercentTimes100
-        : asPercent;
+    const err1 = Math.abs(recomputed - asPercent);
+    const err2 = Math.abs(recomputed - asPercentTimes100);
+    change_pct = err2 < err1 ? asPercentTimes100 : asPercent;
   }
 
-  // Fix sign mismatch (common from some feeds)
+  // fix sign mismatch if they disagree
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose)
       ? prevClose
@@ -272,33 +248,23 @@ function normalizeRow(row) {
       ? toNum(price) - toNum(change)
       : NaN;
     if (isNum(base) && !nearZero(base))
-      change =
-        (toNum(change_pct) / 100) *
-        toNum(base);
+      change = (toNum(change_pct) / 100) * toNum(base);
   }
 
-  if (isNum(change) && nearZero(change))
-    change = 0;
-  if (
-    isNum(change_pct) &&
-    nearZero(change_pct)
-  )
-    change_pct = 0;
+  if (isNum(change) && nearZero(change)) change = 0;
+  if (isNum(change_pct) && nearZero(change_pct)) change_pct = 0;
 
-  // Crazy % like 800% from penny pump? we'll filter later.
   return {
     symbol,
     price,
     change,
     change_pct,
-    last_close: isNum(prevClose)
-      ? toNum(prevClose)
-      : undefined,
+    last_close: isNum(prevClose) ? toNum(prevClose) : undefined,
     name: row?.name ?? "",
   };
 }
 
-// Build consistent row from quote data
+// quote fallback row
 function pickFromQuote(q) {
   const lastClose = toNum(
     firstNum(q, [
@@ -310,6 +276,7 @@ function pickFromQuote(q) {
     ])
   );
 
+  // extended or current price
   const extPrice = firstNum(q, [
     "extended_price",
     "ext_price",
@@ -329,9 +296,7 @@ function pickFromQuote(q) {
       "regularMarketPrice",
     ])
   );
-  const price = isNum(extPrice)
-    ? extPrice
-    : curPrice;
+  const price = isNum(extPrice) ? extPrice : curPrice;
 
   let change = firstNum(q, [
     "extended_change",
@@ -353,28 +318,20 @@ function pickFromQuote(q) {
     "regularMarketChangePercent",
   ]);
 
-  if (
-    !isNum(change) &&
-    isNum(price) &&
-    isNum(lastClose)
-  ) {
+  if (!isNum(change) && isNum(price) && isNum(lastClose)) {
     change = toNum(price) - toNum(lastClose);
   }
   if (
-    (!isNum(change_pct) ||
-      looksClamped(change_pct)) &&
+    (!isNum(change_pct) || looksClamped(change_pct)) &&
     isNum(change) &&
     isNum(lastClose) &&
     !nearZero(lastClose)
   ) {
-    change_pct =
-      (toNum(change) / toNum(lastClose)) *
-      100;
+    change_pct = (toNum(change) / toNum(lastClose)) * 100;
   }
 
   return normalizeRow({
-    symbol:
-      q?.ticker || q?.symbol || "",
+    symbol: q?.ticker || q?.symbol || "",
     price,
     last_close: lastClose,
     change,
@@ -382,14 +339,10 @@ function pickFromQuote(q) {
   });
 }
 
-// Look at last 2 unique trading-day closes. Reject if it smells like a split.
+// look at last 2 unique closes via /closes and compute clean change
 function pickLastTwoCloses(resp) {
-  const ds = Array.isArray(resp?.dates)
-    ? resp.dates
-    : [];
-  const cs = Array.isArray(resp?.closes)
-    ? resp.closes
-    : [];
+  const ds = Array.isArray(resp?.dates) ? resp.dates : [];
+  const cs = Array.isArray(resp?.closes) ? resp.closes : [];
   const rows = [];
   for (let i = 0; i < Math.min(ds.length, cs.length); i++) {
     const d = String(ds[i]).slice(0, 10);
@@ -401,14 +354,11 @@ function pickLastTwoCloses(resp) {
   }
   if (rows.length < 2) return null;
 
-  // unique by date, keep latest for each date
+  // unique by date, keep latest for that date
   rows.sort((a, b) => a.t - b.t);
   const uniq = [];
   for (let i = 0; i < rows.length; i++) {
-    if (
-      !uniq.length ||
-      uniq[uniq.length - 1].d !== rows[i].d
-    ) {
+    if (!uniq.length || uniq[uniq.length - 1].d !== rows[i].d) {
       uniq.push(rows[i]);
     } else {
       uniq[uniq.length - 1] = rows[i];
@@ -417,39 +367,25 @@ function pickLastTwoCloses(resp) {
   if (uniq.length < 2) return null;
 
   const last = uniq[uniq.length - 1];
-  // find the previous DIFFERENT trading day
   let j = uniq.length - 2;
   while (j >= 0 && uniq[j].d === last.d) j--;
   if (j < 0) return null;
   const prev = uniq[j];
 
-  if (
-    !isNum(prev.c) ||
-    !isNum(last.c) ||
-    nearZero(prev.c)
-  )
-    return null;
+  if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
 
-  const ratio = Math.abs(
-    toNum(last.c) / toNum(prev.c)
-  );
+  const ratio = Math.abs(toNum(last.c) / toNum(prev.c));
 
-  // If overnight ratio >30% jump, call it "split/adjustment", bail.
-  if (
-    ratio > SPLIT_RATIO_THRESHOLD ||
-    ratio < 1 / SPLIT_RATIO_THRESHOLD
-  ) {
+  // if it looks like a giant discontinuity (>2x move overnight),
+  // assume it's a split / weird feed and bail
+  if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
     return null;
   }
 
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
 
-  if (
-    !Number.isFinite(pct) ||
-    Math.abs(pct) > 500
-  )
-    return null;
+  if (!Number.isFinite(pct) || Math.abs(pct) > 1000) return null;
 
   return {
     prevClose: prev.c,
@@ -459,17 +395,16 @@ function pickLastTwoCloses(resp) {
   };
 }
 
-// Build the "best guess row" for one symbol.
-// Prefer EOD last-two-closes IF it's not a split jump.
-// Otherwise derive from quote.
+// main per-row calibration:
+// 1) try clean 2-day EOD math
+// 2) else fallback to quote math
 async function calibrateRow(row) {
   const sym = row.symbol;
-  // Try EOD
+  // try EOD closes
   try {
     const closeResp = await fetchCloses(sym, 10);
     const eod = pickLastTwoCloses(closeResp);
     if (eod) {
-      // Done: price = lastClose, last_close = prevClose
       return normalizeRow({
         symbol: sym,
         price: eod.lastClose,
@@ -479,38 +414,32 @@ async function calibrateRow(row) {
       });
     }
   } catch {
-    /* ignore, fallback to quote */
+    /* ignore */
   }
 
-  // Fallback to quote math
+  // fallback to quote
   try {
     const q = await fetchQuote(sym);
     return pickFromQuote(q || {});
   } catch {
+    // just return whatever we had
     return row;
   }
 }
 
-// Calibrate many rows in batches (first N and anything obviously bad)
+// run calibration on a list, but not for every single row 1-by-1 serially
 async function calibrateList(rows) {
+  // normalize first
   const base = rows.map((r) => normalizeRow(r));
+
+  // find "sketchy" rows to hydrate, plus first N
   const badIdx = base
     .map((r, i) => {
-      const huge =
-        isNum(r.change_pct) &&
-        Math.abs(toNum(r.change_pct)) >
-          SANE_PCT_LIMIT;
-      const tiny =
-        isNum(r.change_pct) &&
-        Math.abs(toNum(r.change_pct)) <
-          MIN_MOVE_PCT;
-      const missingBoth =
-        !isNum(r.change) &&
-        !isNum(r.change_pct);
-
-      return huge || tiny || missingBoth
-        ? i
-        : -1;
+      const pct = toNum(r.change_pct);
+      const huge = isNum(pct) && Math.abs(pct) > SANE_PCT_LIMIT;
+      const tiny = isNum(pct) && Math.abs(pct) < MIN_MOVE_PCT;
+      const missingBoth = !isNum(r.change) && !isNum(r.change_pct);
+      return huge || missingBoth ? i : -1; // (we don't mark "tiny" as bad anymore because maybe % is tiny but $move is huge)
     })
     .filter((i) => i >= 0);
 
@@ -532,26 +461,17 @@ async function calibrateList(rows) {
   return base;
 }
 
-// Recompute change / change_pct strictly from price vs last_close.
-// This keeps $ and % internally consistent.
+// re-derive change/$ and pct strictly from price vs last_close so they match
 function recomputeFromClose(r) {
-  if (
-    isNum(r.price) &&
-    isNum(r.last_close) &&
-    !nearZero(r.last_close)
-  ) {
+  if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
     const pct = (ch / toNum(r.last_close)) * 100;
-    return {
-      ...r,
-      change: ch,
-      change_pct: pct,
-    };
+    return { ...r, change: ch, change_pct: pct };
   }
   return r;
 }
 
-// Return absolute % move if it's sane (0.05% <= |pct| <= 40%). Else NaN.
+// sanity check final % move
 function saneAbsPct(row) {
   if (!isNum(row.change_pct)) return NaN;
   const absPct = Math.abs(toNum(row.change_pct));
@@ -560,66 +480,52 @@ function saneAbsPct(row) {
   return absPct;
 }
 
-// Deduplicate by symbol: keep the row with "best" (most informative) sane move.
+// dedupe tickers across sources, pick the most "useful" version
 function mergeBestBySymbol(rows) {
   const out = new Map();
-  for (const r0 of rows) {
-    const r = recomputeFromClose(r0);
+  for (const raw of rows) {
+    const r = recomputeFromClose(raw);
     if (!r.symbol) continue;
+
     const prev = out.get(r.symbol);
     if (!prev) {
       out.set(r.symbol, r);
       continue;
     }
+
     const prevAbs = saneAbsPct(prev);
     const currAbs = saneAbsPct(r);
 
-    // prefer row with a saneAbsPct; if both sane, take bigger absolute pct
-    if (
-      Number.isFinite(currAbs) &&
-      !Number.isFinite(prevAbs)
-    ) {
+    // prefer sane % over insane
+    if (Number.isFinite(currAbs) && !Number.isFinite(prevAbs)) {
       out.set(r.symbol, r);
       continue;
     }
-    if (
-      Number.isFinite(currAbs) &&
-      Number.isFinite(prevAbs)
-    ) {
+    if (Number.isFinite(currAbs) && Number.isFinite(prevAbs)) {
       if (currAbs > prevAbs) {
         out.set(r.symbol, r);
         continue;
       }
     }
-    // else keep prev
   }
   return [...out.values()];
 }
 
-// Positive or negative classifier using final pct / $ change.
+// classify positive/negative for gainers vs losers
 function rowSign(r) {
-  if (
-    isNum(r.change_pct) &&
-    !nearZero(r.change_pct)
-  )
+  if (isNum(r.change_pct) && !nearZero(r.change_pct))
     return Math.sign(toNum(r.change_pct));
-  if (isNum(r.change) && !nearZero(r.change))
-    return Math.sign(toNum(r.change));
-  if (
-    isNum(r.price) &&
-    isNum(r.last_close) &&
-    !nearZero(r.last_close)
-  ) {
-    const ch =
-      toNum(r.price) - toNum(r.last_close);
+  if (isNum(r.change) && !nearZero(r.change)) return Math.sign(toNum(r.change));
+  if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
+    const ch = toNum(r.price) - toNum(r.last_close);
     if (!nearZero(ch)) return Math.sign(ch);
   }
   return 0;
 }
 
-// Final "is this row ok to even show"
+// final display filter
 function validRowForDisplay(r) {
-  const absPct = saneAbsPct(r); // NaN if nonsense
+  const absPct = saneAbsPct(r); // NaN if nonsense / too tiny / too huge
   if (!Number.isFinite(absPct)) return false;
   if (!isNum(r.price)) return false;
   if (toNum(r.price) < 1) return false;
@@ -649,23 +555,18 @@ function MoversCard({
 }) {
   const [minPrice, setMinPrice] = useState(1);
   const [sortKey, setSortKey] = useState("change_pct");
-  const [sortDir, setSortDir] = useState(
-    kind === "losers" ? "asc" : "desc"
-  );
+  const [sortDir, setSortDir] = useState(kind === "losers" ? "asc" : "desc");
 
-  // filter by min price again in UI layer (extra guard)
+  // filter by user-selected min price
   const filtered = useMemo(() => {
-    const lim = Number.isFinite(minPrice)
-      ? Number(minPrice)
-      : 0;
+    const lim = Number.isFinite(minPrice) ? Number(minPrice) : 0;
     return (rows || []).filter((x) => {
-      if (!isNum(x.price) || toNum(x.price) < lim)
-        return false;
+      if (!isNum(x.price) || toNum(x.price) < lim) return false;
       return true;
     });
   }, [rows, minPrice]);
 
-  // sort list based on the chosen column
+  // sort
   const sorted = useMemo(() => {
     const arr = filtered.slice();
     const key = sortKey;
@@ -688,10 +589,7 @@ function MoversCard({
 
   const onHeaderClick = (key) => {
     if (sortKey !== key) setSortKey(key);
-    else
-      setSortDir((d) =>
-        d === "desc" ? "asc" : "desc"
-      );
+    else setSortDir((d) => (d === "desc" ? "asc" : "desc"));
   };
 
   return (
@@ -706,38 +604,22 @@ function MoversCard({
           )}
           <select
             value={String(minPrice)}
-            onChange={(e) =>
-              setMinPrice(Number(e.target.value))
-            }
+            onChange={(e) => setMinPrice(Number(e.target.value))}
             className="btn ghost"
             title="Filter by minimum price"
           >
-            <option value="0">
-              All prices
-            </option>
-            <option value="1">
-              ≥ $1
-            </option>
-            <option value="5">
-              ≥ $5
-            </option>
+            <option value="0">All prices</option>
+            <option value="1">≥ $1</option>
+            <option value="5">≥ $5</option>
           </select>
-          {loading ? (
-            <span className="muted">
-              Loading…
-            </span>
-          ) : null}
+          {loading ? <span className="muted">Loading…</span> : null}
         </div>
       }
     >
       {error ? (
-        <div className="muted error">
-          {error}
-        </div>
+        <div className="muted error">{error}</div>
       ) : !sorted.length ? (
-        <div className="muted">
-          No data.
-        </div>
+        <div className="muted">No data.</div>
       ) : (
         <div className="he-scroll">
           <table className="he-table">
@@ -750,61 +632,31 @@ function MoversCard({
             </colgroup>
             <thead>
               <tr>
-                <th className="num">
-                  #
-                </th>
-                <th>
-                  Symbol
-                </th>
+                <th className="num">#</th>
+                <th>Symbol</th>
                 <th
                   className="num th-click"
-                  onClick={() =>
-                    onHeaderClick(
-                      "price"
-                    )
-                  }
+                  onClick={() => onHeaderClick("price")}
                 >
                   Price{" "}
-                  {sortKey ===
-                  "price"
-                    ? sortDir ===
-                      "desc"
-                      ? "▾"
-                      : "▴"
-                    : ""}
+                  {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
-                  onClick={() =>
-                    onHeaderClick(
-                      "change"
-                    )
-                  }
+                  onClick={() => onHeaderClick("change")}
                   title="Sort by $ change"
                 >
                   $ Change{" "}
-                  {sortKey ===
-                  "change"
-                    ? sortDir ===
-                      "desc"
-                      ? "▾"
-                      : "▴"
-                    : ""}
+                  {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
-                  onClick={() =>
-                    onHeaderClick(
-                      "change_pct"
-                    )
-                  }
+                  onClick={() => onHeaderClick("change_pct")}
                   title="Sort by % change"
                 >
                   % Change{" "}
-                  {sortKey ===
-                  "change_pct"
-                    ? sortDir ===
-                      "desc"
+                  {sortKey === "change_pct"
+                    ? sortDir === "desc"
                       ? "▾"
                       : "▴"
                     : ""}
@@ -813,28 +665,12 @@ function MoversCard({
             </thead>
             <tbody>
               {sorted.map((r, i) => {
-                const {
-                  symbol: sym,
-                  price,
-                  change,
-                  change_pct,
-                } = r;
-                const up = toNum(
-                  change
-                ) >= 0;
+                const { symbol: sym, price, change, change_pct } = r;
+                const up = toNum(change) >= 0;
                 const top = i < 3;
                 return (
-                  <tr
-                    key={`${sym}-${i}`}
-                    className={
-                      top
-                        ? "he-toprow"
-                        : ""
-                    }
-                  >
-                    <td className="num">
-                      {i + 1}
-                    </td>
+                  <tr key={`${sym}-${i}`} className={top ? "he-toprow" : ""}>
+                    <td className="num">{i + 1}</td>
                     <td>
                       <button
                         type="button"
@@ -842,12 +678,9 @@ function MoversCard({
                         onClick={() => {
                           onPick?.(sym);
                           window.dispatchEvent(
-                            new CustomEvent(
-                              "ticker:set",
-                              {
-                                detail: sym,
-                              }
-                            )
+                            new CustomEvent("ticker:set", {
+                              detail: sym,
+                            })
                           );
                         }}
                         title={`Load ${sym}`}
@@ -855,34 +688,12 @@ function MoversCard({
                         {sym}
                       </button>
                     </td>
-                    <td className="num">
-                      {fmtMoney(
-                        price
-                      )}
+                    <td className="num">{fmtMoney(price)}</td>
+                    <td className={`num ${up ? "pos" : "neg"}`}>
+                      {fmtSignMoney(change)}
                     </td>
-                    <td
-                      className={`num ${
-                        up
-                          ? "pos"
-                          : "neg"
-                      }`}
-                    >
-                      {fmtSignMoney(
-                        change
-                      )}
-                    </td>
-                    <td
-                      className={`num ${
-                        toNum(
-                          change_pct
-                        ) >= 0
-                          ? "pos"
-                          : "neg"
-                      }`}
-                    >
-                      {fmtPct(
-                        change_pct
-                      )}
+                    <td className={`num ${toNum(change_pct) >= 0 ? "pos" : "neg"}`}>
+                      {fmtPct(change_pct)}
                     </td>
                   </tr>
                 );
@@ -895,31 +706,20 @@ function MoversCard({
   );
 }
 
-function EarningsCard({
-  items = [],
-  loading,
-  error,
-  onPick,
-}) {
+function EarningsCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
+  // filter tickers client-side as you type
   const filtered = useMemo(() => {
-    const list = Array.isArray(items)
-      ? items
-      : [];
-    const needle = q
-      .trim()
-      .toUpperCase();
+    const list = Array.isArray(items) ? items : [];
+    const needle = q.trim().toUpperCase();
     if (!needle) return list;
     return list.filter((r) =>
-      String(
-        r.symbol || ""
-      )
-        .toUpperCase()
-        .includes(needle)
+      String(r.symbol || "").toUpperCase().includes(needle)
     );
   }, [items, q]);
 
+  // group by date, dedupe per date, and sort tickers
   const groups = useMemo(() => {
     const map = new Map();
     for (const row of filtered) {
@@ -929,20 +729,20 @@ function EarningsCard({
       map.get(d).push(row);
     }
     return Array.from(map.entries())
-      .sort(([a], [b]) =>
-        a.localeCompare(b)
-      )
-      .map(([date, rows]) => [
-        date,
-        rows
-          .slice()
-          .sort((a, b) =>
-            (a.symbol || "")
-              .localeCompare(
-                b.symbol || ""
-              )
-          ),
-      ]);
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, rows]) => {
+        // dedupe tickers for that date
+        const uniqMap = new Map();
+        rows.forEach((r) => {
+          const sym = String(r.symbol || "").toUpperCase();
+          if (!uniqMap.has(sym)) uniqMap.set(sym, r);
+        });
+        const deduped = Array.from(uniqMap.values());
+        deduped.sort((a, b) =>
+          String(a.symbol || "").localeCompare(String(b.symbol || ""))
+        );
+        return [date, deduped];
+      });
   }, [filtered]);
 
   return (
@@ -952,181 +752,87 @@ function EarningsCard({
         <div className="he-controls">
           <input
             value={q}
-            onChange={(e) =>
-              setQ(
-                e.target.value
-              )
-            }
+            onChange={(e) => setQ(e.target.value)}
             placeholder="Filter ticker…"
             className="btn ghost"
-            style={{
-              minWidth: 120,
-            }}
+            style={{ minWidth: 120 }}
           />
-          {loading ? (
-            <span className="muted">
-              Loading…
-            </span>
-          ) : null}
+          {loading ? <span className="muted">Loading…</span> : null}
         </div>
       }
     >
       {error ? (
-        <div className="muted error">
-          {error}
-        </div>
+        <div className="muted error">{error}</div>
       ) : !groups.length ? (
-        <div className="muted">
-          No earnings
-          found.
-        </div>
+        <div className="muted">No earnings found.</div>
       ) : (
         <div className="he-scroll">
           <table className="he-table">
             <colgroup>
-              <col
-                style={{
-                  width: "35%",
-                }}
-              />
-              <col
-                style={{
-                  width: "35%",
-                }}
-              />
-              <col
-                style={{
-                  width: "30%",
-                }}
-              />
+              <col style={{ width: "35%" }} />
+              <col style={{ width: "35%" }} />
+              <col style={{ width: "30%" }} />
             </colgroup>
             <thead>
               <tr>
-                <th
-                  style={{
-                    textAlign:
-                      "left",
-                  }}
-                >
-                  Date
-                </th>
-                <th
-                  style={{
-                    textAlign:
-                      "center",
-                  }}
-                >
-                  Ticker
-                </th>
-                <th
-                  style={{
-                    textAlign:
-                      "center",
-                  }}
-                >
-                  Session
-                </th>
+                <th style={{ textAlign: "left" }}>Date</th>
+                <th style={{ textAlign: "center" }}>Ticker</th>
+                <th style={{ textAlign: "center" }}>Session</th>
               </tr>
             </thead>
             <tbody>
-              {groups.map(
-                ([date, rows]) => (
-                  <FragmentBlock
-                    key={date}
-                  >
-                    <tr className="he-group-row">
-                      <td
-                        colSpan={
-                          3
-                        }
-                        style={{
-                          fontWeight: 700,
-                        }}
-                      >
-                        {fmtDateHuman(
-                          date
-                        )}
-                      </td>
-                    </tr>
-                    {rows.map(
-                      (
-                        r,
-                        i
-                      ) => {
-                        const badge =
-                          SESSION_BADGE(
-                            r.session
-                          );
-                        const sym = String(
-                          r.symbol ||
-                            ""
-                        ).toUpperCase();
-                        return (
-                          <tr
-                            key={`${date}-${sym}-${i}`}
+              {groups.map(([date, rows]) => (
+                <FragmentBlock key={date}>
+                  <tr className="he-group-row">
+                    <td colSpan={3} style={{ fontWeight: 700 }}>
+                      {fmtDateHuman(date)}
+                    </td>
+                  </tr>
+                  {rows.map((r, i) => {
+                    const badge = SESSION_BADGE(r.session);
+                    const sym = String(r.symbol || "").toUpperCase();
+                    return (
+                      <tr key={`${date}-${sym}-${i}`}>
+                        <td className="muted">{/* blank on purpose under group */}</td>
+                        <td
+                          style={{
+                            textAlign: "center",
+                            fontWeight: 700,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            className="ticker-link"
+                            onClick={() => {
+                              onPick?.(sym);
+                              window.dispatchEvent(
+                                new CustomEvent("ticker:set", {
+                                  detail: sym,
+                                })
+                              );
+                            }}
+                            title={`Load ${sym}`}
                           >
-                            <td className="muted">
-                              {fmtDateHuman(
-                                date
-                              )}
-                            </td>
-                            <td
-                              style={{
-                                textAlign:
-                                  "center",
-                                fontWeight: 700,
-                              }}
-                            >
-                              <button
-                                type="button"
-                                className="ticker-link"
-                                onClick={() => {
-                                  onPick?.(
-                                    sym
-                                  );
-                                  window.dispatchEvent(
-                                    new CustomEvent(
-                                      "ticker:set",
-                                      {
-                                        detail:
-                                          sym,
-                                      }
-                                    )
-                                  );
-                                }}
-                                title={`Load ${sym}`}
-                              >
-                                {sym}
-                              </button>
-                            </td>
-                            <td
-                              style={{
-                                textAlign:
-                                  "center",
-                              }}
-                            >
-                              <span
-                                className="he-badge"
-                                style={{
-                                  background:
-                                    badge.bg,
-                                  border: `1px solid ${badge.br}`,
-                                  color:
-                                    badge.fg,
-                                }}
-                              >
-                                {
-                                  badge.text
-                                }
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      }
-                    )}
-                  </FragmentBlock>
-                )
-              )}
+                            {sym}
+                          </button>
+                        </td>
+                        <td style={{ textAlign: "center" }}>
+                          <span
+                            className="he-badge"
+                            style={{
+                              background: badge.bg,
+                              border: `1px solid ${badge.br}`,
+                              color: badge.fg,
+                            }}
+                          >
+                            {badge.text}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </FragmentBlock>
+              ))}
             </tbody>
           </table>
         </div>
@@ -1139,34 +845,24 @@ function FragmentBlock({ children }) {
   return <>{children}</>;
 }
 
-export default function HotAndEarnings({
-  onSelectTicker,
-}) {
-  const [loadingMovers, setLoadingMovers] =
-    useState(true);
-  const [loadingEarnings, setLoadingEarnings] =
-    useState(true);
+export default function HotAndEarnings({ onSelectTicker }) {
+  const [loadingMovers, setLoadingMovers] = useState(true);
+  const [loadingEarnings, setLoadingEarnings] = useState(true);
+
   const [errMovers, setErrMovers] = useState("");
-  const [errEarnings, setErrEarnings] =
-    useState("");
+  const [errEarnings, setErrEarnings] = useState("");
+
   const [gainers, setGainers] = useState([]);
   const [losers, setLosers] = useState([]);
   const [earnings, setEarnings] = useState([]);
-  const [moverSource, setMoverSource] =
-    useState("");
+
+  const [moverSource, setMoverSource] = useState("");
 
   const pick = (sym) => {
-    const s = String(sym || "")
-      .toUpperCase()
-      .trim();
+    const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
-    if (typeof onSelectTicker === "function")
-      onSelectTicker(s);
-    window.dispatchEvent(
-      new CustomEvent("ticker:set", {
-        detail: s,
-      })
-    );
+    if (typeof onSelectTicker === "function") onSelectTicker(s);
+    window.dispatchEvent(new CustomEvent("ticker:set", { detail: s }));
   };
 
   const refresh = async () => {
@@ -1176,59 +872,34 @@ export default function HotAndEarnings({
     try {
       const mv = await fetchMovers();
 
-      const rawG = Array.isArray(
-        mv?.gainers
-      )
-        ? mv.gainers
-        : [];
-      const rawL = Array.isArray(
-        mv?.losers
-      )
-        ? mv.losers
-        : [];
+      const rawG = Array.isArray(mv?.gainers) ? mv.gainers : [];
+      const rawL = Array.isArray(mv?.losers) ? mv.losers : [];
 
-      // Calibrate raw rows (EOD unless split detected, else quote)
+      // calibrate (EOD math first, then quote fallback)
       const [gCal, lCal] = await Promise.all([
         calibrateList(rawG),
         calibrateList(rawL),
       ]);
 
-      // Merge, recompute % from last_close, dedupe by symbol
-      const merged = mergeBestBySymbol([
-        ...gCal,
-        ...lCal,
-      ]);
+      // merge, dedupe, recompute % from last_close
+      const merged = mergeBestBySymbol([...gCal, ...lCal]);
 
-      // Filter out nonsense + classify sign
+      // final filter + split by sign
       const pos = [];
       const neg = [];
-      for (const r of merged) {
+      for (const r0 of merged) {
+        const r = recomputeFromClose(r0); // re-sync $ and %
         if (!validRowForDisplay(r)) continue;
         const sgn = rowSign(r);
         if (sgn > 0) pos.push(r);
         else if (sgn < 0) neg.push(r);
       }
 
-      // Debug to console
-      console.debug(
-        "[movers] src:",
-        mv?.source,
-        "| gainers:",
-        pos.length,
-        "| losers:",
-        neg.length
-      );
-
       setGainers(pos);
       setLosers(neg);
-      setMoverSource(
-        mv?.source ? `${mv.source}` : ""
-      );
+      setMoverSource(mv?.source ? `${mv.source}` : "");
     } catch (e) {
-      setErrMovers(
-        e?.message ||
-          "Failed to load movers."
-      );
+      setErrMovers(e?.message || "Failed to load movers.");
       setGainers([]);
       setLosers([]);
       setMoverSource("");
@@ -1241,60 +912,26 @@ export default function HotAndEarnings({
     setErrEarnings("");
     try {
       let wk = await fetchEarningsWeek();
-      if (!wk && typeof wk !== "object")
-        wk = {};
-      if (
-        !Array.isArray(wk.items) &&
-        wk?.error?.includes?.("405")
-      ) {
-        throw new Error("405");
-      }
-      const items = Array.isArray(
-        wk?.items
-      )
-        ? wk.items
-        : [];
+      if (!wk && typeof wk !== "object") wk = {};
+      const items = Array.isArray(wk?.items) ? wk.items : [];
 
-      // fallback attempt with /earnings_week/
+      // fallback: try /earnings_week/ if first endpoint didn't populate
       if (!items.length) {
         try {
-          const res = await fetch(
-            `${API_BASE}/earnings_week/`,
-            {
-              headers: {
-                Accept:
-                  "application/json",
-                "Cache-Control":
-                  "no-cache",
-                Pragma:
-                  "no-cache",
-              },
-              cache: "no-store",
-              method: "GET",
-            }
-          );
+          const res = await fetch(`${API_BASE}/earnings_week/`, {
+            headers: {
+              Accept: "application/json",
+              "Cache-Control": "no-cache",
+              Pragma: "no-cache",
+            },
+            cache: "no-store",
+            method: "GET",
+          });
           if (res.ok) {
-            const alt =
-              await res.json();
-            if (
-              Array.isArray(
-                alt?.items
-              )
-            ) {
-              setEarnings(
-                alt.items.slice(
-                  0,
-                  500
-                )
-              );
-              if (
-                !alt.items
-                  .length &&
-                alt?.error
-              )
-                setErrEarnings(
-                  alt.error
-                );
+            const alt = await res.json();
+            if (Array.isArray(alt?.items)) {
+              setEarnings(alt.items.slice(0, 500));
+              if (!alt.items.length && alt?.error) setErrEarnings(alt.error);
               return;
             }
           }
@@ -1304,17 +941,12 @@ export default function HotAndEarnings({
       }
 
       setEarnings(items.slice(0, 500));
-      if (
-        !items.length &&
-        wk?.error
-      )
-        setErrEarnings(wk.error);
+      if (!items.length && wk?.error) setErrEarnings(wk.error);
     } catch (e) {
       setErrEarnings(
         e?.message === "405"
-          ? "405 – Method Not Allowed (retry with trailing slash also failed)"
-          : e?.message ||
-              "Failed to load earnings."
+          ? "405 – Method Not Allowed (both endpoints)"
+          : e?.message || "Failed to load earnings."
       );
       setEarnings([]);
     } finally {
@@ -1327,15 +959,11 @@ export default function HotAndEarnings({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // candidate symbols we pass to TopBuysCard
   const topBuyCandidates = useMemo(() => {
-    const fromMovers = [...gainers, ...losers].map(
-      (r) => r.symbol
-    );
-    const uniq = Array.from(
-      new Set(fromMovers)
-    );
-    if (uniq.length >= 40)
-      return uniq;
+    const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
+    const uniq = Array.from(new Set(fromMovers));
+    if (uniq.length >= 40) return uniq;
     return Array.from(
       new Set(
         uniq.concat([
@@ -1518,6 +1146,7 @@ export default function HotAndEarnings({
             transparent 60%
           );
         }
+
         .he-group-row td {
           position: sticky;
           top: 28px;
@@ -1526,6 +1155,7 @@ export default function HotAndEarnings({
           z-index: 1;
           font-weight: 700;
         }
+
         .he-badge {
           display: inline-block;
           padding: 2px 8px;
@@ -1533,6 +1163,7 @@ export default function HotAndEarnings({
           font-size: 12px;
           line-height: 1.3;
         }
+
         .ticker-link {
           background: transparent;
           border: none;
@@ -1551,6 +1182,7 @@ export default function HotAndEarnings({
           text-shadow: 0 0 6px rgba(110,168,255,.45);
           text-decoration-thickness: 2px;
         }
+
         .muted {
           color: #a7adbc;
         }
