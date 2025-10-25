@@ -75,7 +75,9 @@ const dkey = (s) => String(s).slice(0, 10);
 // --- numeric helpers
 const toNum = (x) => (Number.isFinite(+x) ? +x : null);
 const safePct = (curr, prev) =>
-  Number.isFinite(curr) && Number.isFinite(prev) && prev !== 0 ? ((curr - prev) / prev) * 100 : null;
+  Number.isFinite(curr) && Number.isFinite(prev) && prev !== 0
+    ? ((curr - prev) / prev) * 100
+    : null;
 
 /** ===== Tail de-dupe helpers (fix duplicate final day) ===== */
 const dropDupTailSeries = (dates = [], closes = []) => {
@@ -108,26 +110,37 @@ const dropDupTailHistory = (rows = []) => {
   return rows;
 };
 
-// Rescale provider closes to the quote’s last_close if they’re on a different scale.
-// Also pins the last close exactly to quote.last_close and drops duplicated tail.
+// Rescale closes vs quote.last_close if provider/quote disagree (splits, adj vs unadj).
+// - If mismatch >8%, we multiply the WHOLE series by ratio so day-over-day stays smooth.
+// - Then we pin the final element to quote.last_close for consistency.
+// - Then we drop duplicate-tail if present.
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
-  let outCloses = Array.isArray(closes) ? closes.map(Number).filter(Number.isFinite) : [];
+  let outCloses = Array.isArray(closes)
+    ? closes.map(Number).filter(Number.isFinite)
+    : [];
+
   if (!outDates.length || outDates.length !== outCloses.length) {
     return { dates: [], closes: [] };
   }
 
   const n = outCloses.length;
-  const providerLast = outCloses[n - 1];
+  const providerLastRaw = outCloses[n - 1];
   const quoteLast = Number(quote?.last_close);
 
-  if (Number.isFinite(quoteLast) && quoteLast > 0 && Number.isFinite(providerLast) && providerLast > 0) {
-    const ratio = quoteLast / providerLast;
-    // treat >8% mismatch as scaling issue (split/adj vs unadj)
+  if (
+    Number.isFinite(quoteLast) &&
+    quoteLast > 0 &&
+    Number.isFinite(providerLastRaw) &&
+    providerLastRaw > 0
+  ) {
+    const ratio = quoteLast / providerLastRaw;
     if (Math.abs(1 - ratio) > 0.08) {
+      // looks like split / adj mismatch
       outCloses = outCloses.map((v) => v * ratio);
     }
-    outCloses[n - 1] = quoteLast; // pin to official last_close
+    // always lock the last value to quote
+    outCloses[n - 1] = quoteLast;
   }
 
   const dropped = dropDupTailSeries(outDates, outCloses);
@@ -155,7 +168,9 @@ function scrollToTarget(el) {
       ? { top: 0 }
       : scroller.getBoundingClientRect();
   const current =
-    scroller === document.documentElement ? window.pageYOffset : scroller.scrollTop;
+    scroller === document.documentElement
+      ? window.pageYOffset
+      : scroller.scrollTop;
   const top = current + (elRect.top - scRect.top) - 8;
   if (scroller === document.documentElement) {
     window.scrollTo({ top, behavior: "smooth" });
@@ -222,22 +237,28 @@ export default function App() {
   // Where to scroll when a symbol is chosen from the movers table
   const mainSectionRef = useRef(null);
 
-  // 🔔 Listen for global ticker:set so clicks from movers/earnings always scroll & set
+  // 🔔 Listen for global ticker:set
   useEffect(() => {
     const handler = (e) => {
       const sym = String(e?.detail || "").toUpperCase().trim();
       if (sym) setTicker(sym);
-      requestAnimationFrame(() => requestAnimationFrame(scrollMainInfoNow));
+      requestAnimationFrame(() =>
+        requestAnimationFrame(scrollMainInfoNow)
+      );
     };
     window.addEventListener("ticker:set", handler);
     return () => window.removeEventListener("ticker:set", handler);
   }, []);
 
-  // Pre-warm backend right after mount
+  // Pre-warm backend
   useEffect(() => {
     (async () => {
-      try { await ping(); } catch {}
-      setTimeout(() => { ping().catch(() => {}); }, 2500);
+      try {
+        await ping();
+      } catch {}
+      setTimeout(() => {
+        ping().catch(() => {});
+      }, 2500);
     })();
   }, []);
 
@@ -254,7 +275,8 @@ export default function App() {
         const r = await fetchCloses(tkr, days, { signal });
         const c = normalizeCloses(r?.closes);
         const d = Array.isArray(r?.dates) ? r.dates : [];
-        if (c.length >= 2 && d.length === c.length) return { dates: d, closes: c };
+        if (c.length >= 2 && d.length === c.length)
+          return { dates: d, closes: c };
         return null;
       } catch {
         return null;
@@ -296,7 +318,9 @@ export default function App() {
   const loadData = useCallback(async () => {
     const myVer = ++reqVer.current;
 
-    try { abortRef.current?.abort?.(); } catch {}
+    try {
+      abortRef.current?.abort?.();
+    } catch {}
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
@@ -343,10 +367,12 @@ export default function App() {
         const m = await fetchMarket({ signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         setMarket(m);
-      } catch {/* ignore */}
+      } catch {
+        /* ignore */
+      }
     })();
 
-    // 3.5) Closes (align with quote + drop duplicate tail)
+    // 4) Closes (align with quote + drop duplicate tail)
     const pCloses = (async () => {
       try {
         const raw = await fetchClosesSafe(t, ctrl.signal);
@@ -360,26 +386,37 @@ export default function App() {
         });
 
         if (!closes?.length) {
-          setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
+          setDiagnostic(
+            (dMsg) =>
+              dMsg || `No historical price series available for ${t}.`
+          );
         }
 
         setCloses(closes || []);
         setCloseDates(dates || []);
       } catch {
         if (reqVer.current !== myVer) return;
-        setDiagnostic((dMsg) => dMsg || `Failed to load historical prices for ${t}.`);
+        setDiagnostic(
+          (dMsg) =>
+            dMsg || `Failed to load historical prices for ${t}.`
+        );
       }
     })();
 
-    // 4) Past backtest rows
+    // 5) Past backtest rows
     const pHist = (async () => {
       try {
-        const hist = await fetchPredictHistory({ ticker: t, models, days: 15 }, { signal: ctrl.signal });
+        const hist = await fetchPredictHistory(
+          { ticker: t, models, days: 15 },
+          { signal: ctrl.signal }
+        );
         if (reqVer.current !== myVer) return;
-        const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map((r) => ({
-          ...r,
-          actual: toNum(r?.actual) ?? toNum(r?.close) ?? null,
-        }));
+        const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map(
+          (r) => ({
+            ...r,
+            actual: toNum(r?.actual) ?? toNum(r?.close) ?? null,
+          })
+        );
         setHistoryRows(dropDupTailHistory(safeRows));
       } catch {
         if (reqVer.current !== myVer) return;
@@ -387,15 +424,19 @@ export default function App() {
       }
     })();
 
-    // 5) Current forward predictions
+    // 6) Current forward predictions
     const pPredict = (async () => {
       try {
-        const res = await fetchPredict({ ticker: t, models }, { signal: ctrl.signal });
+        const res = await fetchPredict(
+          { ticker: t, models },
+          { signal: ctrl.signal }
+        );
         if (reqVer.current !== myVer) return;
         const got = Array.isArray(res?.results) ? res.results : [];
         setResults(got);
         if (!got.length) {
-          const msg = res?.message || res?.detail || "No predictions returned.";
+          const msg =
+            res?.message || res?.detail || "No predictions returned.";
           setDiagnostic((d) => d || `${msg} (${t})`);
         }
       } catch (e) {
@@ -406,7 +447,11 @@ export default function App() {
       }
     })();
 
-    await Promise.all([pQuote, pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {})));
+    await Promise.all(
+      [pQuote, pEarn, pMkt, pCloses, pHist, pPredict].map((p) =>
+        p?.catch?.(() => {})
+      )
+    );
 
     if (reqVer.current === myVer) {
       setLoading(false);
@@ -417,11 +462,13 @@ export default function App() {
   useEffect(() => {
     loadData();
     return () => {
-      try { abortRef.current?.abort?.(); } catch {}
+      try {
+        abortRef.current?.abort?.();
+      } catch {}
     };
   }, [loadData]);
 
-  // 🔄 Inline SSE (stable)
+  // 🔄 Inline SSE
   useEffect(() => {
     if (!live || !ticker) return;
     const url = buildQuoteStreamURL(ticker, 5);
@@ -436,13 +483,20 @@ export default function App() {
         const payload = JSON.parse(ev.data);
         const prev = prevPriceRef.current;
         const next = toNum(payload.current_price);
-        const lastClose = toNum(payload.last_close) ?? toNum(quote?.last_close) ?? null;
+        const lastClose =
+          toNum(payload.last_close) ??
+          toNum(quote?.last_close) ??
+          null;
 
         if (next != null) {
           setQuote((q) => {
             const base = q || {};
             const derivedPct = safePct(next, lastClose);
-            const pct = toNum(payload.change_pct) ?? derivedPct ?? toNum(base.change_pct) ?? 0;
+            const pct =
+              toNum(payload.change_pct) ??
+              derivedPct ??
+              toNum(base.change_pct) ??
+              0;
             return {
               ...base,
               ticker: payload.ticker ?? base.ticker ?? ticker,
@@ -458,25 +512,36 @@ export default function App() {
           }
           prevPriceRef.current = next;
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     };
     es.onerror = () => {
-      try { es.close(); } catch {}
+      try {
+        es.close();
+      } catch {}
     };
     return () => {
-      try { es.close(); } catch {}
+      try {
+        es.close();
+      } catch {}
     };
   }, [live, ticker, quote?.last_close]);
 
+  // manual submit reload
   const handleSubmit = (e) => {
     e.preventDefault();
     loadData();
   };
 
   const toggleModel = (m) =>
-    setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
+    setModels((prev) =>
+      prev.includes(m)
+        ? prev.filter((x) => x !== m)
+        : [...prev, m]
+    );
 
-  // When user clicks a symbol in movers table (prop path)
+  // When user clicks a symbol in movers/earnings
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
@@ -485,18 +550,42 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // Client-side metrics & recommendation
+  // ➕ Add from Watchlist into Compare
+  const handleAddToCompare = (sym) => {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return;
+    setCompareSymbols((prev) => {
+      const next = [...new Set([...(prev || []), s])];
+      return next.slice(0, 3);
+    });
+    setCompareOpen(true);
+  };
+
+  // ---------- Metrics & Recommendation ----------
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
     const base = toNum(quote.last_close) || 0;
     if (base <= 0) return [];
     return results.map((r) => {
-      const preds = (Array.isArray(r.predictions) ? r.predictions : [])
+      const preds = (Array.isArray(r.predictions)
+        ? r.predictions
+        : []
+      )
         .map(Number)
         .filter(Number.isFinite);
-      if (!preds.length) return { model: r.model, mapeProxy: Infinity, avgChangePct: 0 };
-      const mapeProxy = preds.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) / preds.length;
-      const meanPred = preds.reduce((a, b) => a + b, 0) / preds.length;
+      if (!preds.length)
+        return {
+          model: r.model,
+          mapeProxy: Infinity,
+          avgChangePct: 0,
+        };
+      const mapeProxy =
+        preds.reduce(
+          (acc, p) => acc + Math.abs(p - base) / base,
+          0
+        ) / preds.length;
+      const meanPred =
+        preds.reduce((a, b) => a + b, 0) / preds.length;
       const avgChangePct = ((meanPred - base) / base) * 100;
       return { model: r.model, mapeProxy, avgChangePct };
     });
@@ -504,7 +593,9 @@ export default function App() {
 
   const recommendation = useMemo(() => {
     if (!metrics.length) return null;
-    const best = [...metrics].sort((a, b) => a.mapeProxy - b.mapeProxy)[0];
+    const best = [...metrics].sort(
+      (a, b) => a.mapeProxy - b.mapeProxy
+    )[0];
     let action = "Hold";
     if (best.avgChangePct > 1) action = "Buy";
     if (best.avgChangePct < -1) action = "Sell";
@@ -515,7 +606,7 @@ export default function App() {
   const horizon = results?.[0]?.predictions?.length || 0;
 
   const pastDaysToShow = 10;
-  // Always use closeDates for the table’s past labels so “Actual” is consistent with the rescaled series
+  // We always use closeDates (the rescaled series), not histDates, so the "Actual" column and chart align
   const pastLabels = closeDates.slice(-pastDaysToShow);
 
   const lastPastDate = pastLabels.length
@@ -532,21 +623,15 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // “Actual” from closes; fallback to historyRows only if needed
-  const actualForPastLabelsRaw = pastLabels.map((iso) => {
+  // Take actuals directly from closes (already rescaled / pinned),
+  // and only fall back to historyRows if that specific date is missing.
+  const actualForPastLabels = pastLabels.map((iso) => {
     const idx = closeDates.lastIndexOf(iso);
-    return idx >= 0 ? closes[idx] : histByDate[iso]?.actual ?? null;
-  });
+    if (idx >= 0 && Number.isFinite(closes[idx])) return closes[idx];
 
-  // pin the last “actual” to quote.last_close for stability
-  const actualForPastLabels = (() => {
-    const arr = [...actualForPastLabelsRaw];
-    const lastIdx = arr.length - 1;
-    if (lastIdx >= 0 && Number.isFinite(Number(quote?.last_close))) {
-      arr[lastIdx] = Number(quote.last_close);
-    }
-    return arr;
-  })();
+    const h = histByDate[iso];
+    return Number.isFinite(h?.actual) ? h.actual : null;
+  });
 
   // ----- Backtest harmonization (optional rescale if clearly mismatched) -----
   function harmonize(series, actual) {
@@ -571,30 +656,66 @@ export default function App() {
     const medB = median(B);
     const scaleRatio = medB && medA ? medA / medB : 1;
 
-    const mape = A.reduce((acc, a, i) => acc + Math.abs(a - B[i]) / (Math.abs(a) || 1), 0) / A.length;
+    const mape =
+      A.reduce(
+        (acc, a, i) => acc + Math.abs(a - B[i]) / (Math.abs(a) || 1),
+        0
+      ) / A.length;
 
-    if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
-      const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
+    if (
+      mape > 0.2 &&
+      (scaleRatio < 0.8 || scaleRatio > 1.2)
+    ) {
+      const mean = (xs) =>
+        xs.reduce((s, v) => s + v, 0) / xs.length;
       const meanA = mean(A);
       const meanB = mean(B);
-      const cov = A.reduce((s, a, i) => s + (a - meanA) * (B[i] - meanB), 0) / A.length;
-      const varB = B.reduce((s, b) => s + (b - meanB) * (b - meanB), 0) / B.length || 1;
+      const cov =
+        A.reduce(
+          (s, a, i) =>
+            s + (a - meanA) * (B[i] - meanB),
+          0
+        ) / A.length;
+      const varB =
+        B.reduce(
+          (s, b) =>
+            s + (b - meanB) * (b - meanB),
+          0
+        ) / B.length || 1;
       const beta = cov / varB;
       const alpha = meanA - beta * meanB;
 
-      const adjusted = series.map((b) => (Number.isFinite(b) ? alpha + beta * b : null));
-      return { series: adjusted, note: `Backtests rescaled (α=${alpha.toFixed(2)}, β=${beta.toFixed(3)}) to match actuals.` };
+      const adjusted = series.map((b) =>
+        Number.isFinite(b) ? alpha + beta * b : null
+      );
+      return {
+        series: adjusted,
+        note: `Backtests rescaled (α=${alpha.toFixed(
+          2
+        )}, β=${beta.toFixed(
+          3
+        )}) to match actuals.`,
+      };
     }
 
     return { series, note: null };
   }
 
-  const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
+  const colorPalette = [
+    "#4e79a7",
+    "#f28e2b",
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc949",
+  ];
 
   // Build datasets for the chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
-    if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
+    if (!chartLabels.length)
+      return { avpDatasets: [], harmonizeNote: null };
 
+    // "Actual Close" line (past only)
     const actualSeries = [
       ...actualForPastLabels,
       ...Array(futureLabels.length).fill(null),
@@ -619,7 +740,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // Past (backtest) — map onto chartLabels’ past segment
+      // Past (backtest) — only fill past segment
       const backtestRaw = chartLabels.map((lab, i) => {
         if (i >= pastLabels.length) return null;
         const dk = dkey(lab);
@@ -627,12 +748,17 @@ export default function App() {
         return Number.isFinite(Number(val)) ? Number(val) : null;
       });
 
-      const { series: backtestSeries, note: n } = harmonize(backtestRaw, actualForPastLabels);
+      const { series: backtestSeries, note: n } = harmonize(
+        backtestRaw,
+        actualForPastLabels
+      );
       if (n && !note) note = n;
 
       ds.push({
         label: `${r.model} • backtest`,
-        data: backtestSeries.concat(Array(futureLabels.length).fill(null)),
+        data: backtestSeries.concat(
+          Array(futureLabels.length).fill(null)
+        ),
         borderColor: color,
         backgroundColor: "transparent",
         borderDash: [6, 4],
@@ -643,12 +769,20 @@ export default function App() {
       });
 
       // Future (current forecast)
-      const start =
-        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
+      const lastActual =
+        [...actualForPastLabels]
+          .reverse()
+          .find((v) => Number.isFinite(v)) ?? null;
+
       const currentSeries = [
-        ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
-        start,
-        ...(r.predictions || []).slice(0, futureLabels.length),
+        ...Array(
+          Math.max(0, pastLabels.length - 1)
+        ).fill(null),
+        lastActual,
+        ...(r.predictions || []).slice(
+          0,
+          futureLabels.length
+        ),
       ];
 
       ds.push({
@@ -684,40 +818,59 @@ export default function App() {
     interaction: { mode: "index", intersect: false },
     scales: {
       x: { ticks: { maxTicksLimit: 10 }, grid: { display: false } },
-      y: { ticks: { callback: (v) => `$${Number(v).toFixed(0)}` } },
+      y: {
+        ticks: {
+          callback: (v) => `$${Number(v).toFixed(0)}`,
+        },
+      },
     },
   };
 
   // ----- Table rows -----
-  const pastRows = pastLabels.map((iso, i, arr) => {
+  const pastRows = pastLabels.map((iso) => {
     const dk = dkey(iso);
-    const row = histByDate[dk];
     const idx = closeDates.lastIndexOf(iso);
-    let actual = idx >= 0 ? closes[idx] : row?.actual ?? null;
 
-    if (i === arr.length - 1 && Number.isFinite(Number(quote?.last_close))) {
-      actual = Number(quote.last_close);
-    }
+    // actual comes from closes (already rescaled)
+    const actualHere =
+      idx >= 0 && Number.isFinite(closes[idx])
+        ? closes[idx]
+        : Number.isFinite(histByDate[dk]?.actual)
+        ? histByDate[dk].actual
+        : null;
 
     const perModel = results.map((r) => {
       const v = histPred?.[dk]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
-    return { date: iso, actual, perModel, kind: "past" };
+
+    return {
+      date: iso,
+      actual: actualHere,
+      perModel,
+      kind: "past",
+    };
   });
 
   const futureRows = futureLabels.map((d, i) => {
-    const perModel = results.map((r) => (Array.isArray(r.predictions) ? r.predictions[i] ?? null : null));
+    const perModel = results.map((r) =>
+      Array.isArray(r.predictions)
+        ? r.predictions[i] ?? null
+        : null
+    );
     return { date: d, actual: null, perModel, kind: "future" };
   });
 
-  // ----- Derived change for header (fix 0.00% problem) -----
+  // ----- Derived change for header (avoid showing NaN / 0.00%) -----
   const curr = toNum(quote?.current_price);
   const prev = toNum(quote?.last_close);
   const derivedPct = safePct(curr, prev);
-  const pctToShow = toNum(quote?.change_pct) ?? derivedPct ?? 0;
+  const pctToShow =
+    toNum(quote?.change_pct) ?? derivedPct ?? 0;
   const absToShow =
-    Number.isFinite(curr) && Number.isFinite(prev) ? (curr - prev) : 0;
+    Number.isFinite(curr) && Number.isFinite(prev)
+      ? curr - prev
+      : 0;
 
   return (
     <div className="app-root">
@@ -725,25 +878,45 @@ export default function App() {
       <div className="hero-wrap">
         <div className="hero hero--center">
           <div>
-            <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
-            <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
+            <h1 className="hero-title">
+              Real-Time Stock & Crypto Dashboard
+            </h1>
+            <p className="hero-sub">
+              Live quotes • Movers • This week’s earnings
+            </p>
           </div>
-          <div className="hero-right" style={{ display: "flex", gap: 8 }}>
+          <div
+            className="hero-right"
+            style={{ display: "flex", gap: 8 }}
+          >
             {user ? (
               <>
-                <span className="muted" style={{ fontSize: 14 }}>
+                <span
+                  className="muted"
+                  style={{ fontSize: 14 }}
+                >
                   👋 {user?.name || user?.email}
                 </span>
-                <button className="btn ghost" onClick={logout} title="Sign out">
+                <button
+                  className="btn ghost"
+                  onClick={logout}
+                  title="Sign out"
+                >
                   Sign out
                 </button>
               </>
             ) : (
-              <button className="btn" onClick={() => setShowAuth(true)}>
+              <button
+                className="btn"
+                onClick={() => setShowAuth(true)}
+              >
                 Sign in / Create account
               </button>
             )}
-            <button className="btn ghost" onClick={() => window.location.reload()}>
+            <button
+              className="btn ghost"
+              onClick={() => window.location.reload()}
+            >
               ↻ Refresh
             </button>
           </div>
@@ -756,14 +929,16 @@ export default function App() {
           <WatchlistPanel
             current={ticker}
             onLoad={(s) => setTicker(s)}
-            onAddToCompare={setCompareSymbols}
+            onAddToCompare={handleAddToCompare}
           />
           <div style={{ marginTop: 12 }}>
             <label>
               <input
                 type="checkbox"
                 checked={live}
-                onChange={() => setLive((v) => !v)}
+                onChange={() =>
+                  setLive((v) => !v)
+                }
               />{" "}
               Live price updates (SSE)
             </label>
@@ -773,9 +948,22 @@ export default function App() {
         {/* RIGHT: Main content */}
         <section>
           {/* Compare Mode Toggle */}
-          <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-            <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
-              {compareOpen ? "Close Compare" : "Open Compare"}
+          <div
+            className="row"
+            style={{
+              justifyContent: "space-between",
+              marginBottom: 8,
+            }}
+          >
+            <button
+              className="btn"
+              onClick={() =>
+                setCompareOpen((v) => !v)
+              }
+            >
+              {compareOpen
+                ? "Close Compare"
+                : "Open Compare"}
             </button>
           </div>
 
@@ -790,41 +978,93 @@ export default function App() {
           )}
 
           {/* Hot movers + Earnings next 7d */}
-          <HotAndEarnings onSelectTicker={(s)=>setTicker(s)} />
+          <HotAndEarnings
+            onSelectTicker={handleSelectTicker}
+          />
 
-          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
+          {/* ticker form */}
+          <form
+            onSubmit={handleSubmit}
+            className="row"
+            style={{
+              marginBottom: 16,
+              marginTop: 8,
+            }}
+          >
             <input
               value={ticker}
-              onChange={(e) => setTicker(e.target.value.toUpperCase())}
+              onChange={(e) =>
+                setTicker(
+                  e.target.value.toUpperCase()
+                )
+              }
               placeholder="Ticker (e.g. AAPL or BTC-USD)"
               required
               type="text"
               style={{ flex: "1 1 180px" }}
             />
-            <button className="btn" disabled={loading}>
-              {loading ? "Loading…" : "Load Data"}
+            <button
+              className="btn"
+              disabled={loading}
+            >
+              {loading
+                ? "Loading…"
+                : "Load Data"}
             </button>
           </form>
 
-          {/* >>> Anchor for smooth-scroll target (just above info cards) <<< */}
+          {/* >>> Anchor for smooth-scroll target <<< */}
           <div
             id="main-stock-info"
             ref={mainSectionRef}
-            style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
+            style={{
+              scrollMarginTop: 12,
+              height: 0,
+              overflow: "hidden",
+            }}
             aria-hidden
           />
 
           {/* Top info row */}
-          <div className="row" style={{ gap: 16, marginBottom: 12 }}>
+          <div
+            className="row"
+            style={{
+              gap: 16,
+              marginBottom: 12,
+            }}
+          >
             {/* Quote Card */}
-            <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-                <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+            <div
+              className={`card ${blinkClass}`}
+              style={{
+                minWidth: 0,
+                flex: "1 1 300px",
+              }}
+            >
+              <div
+                className="row"
+                style={{
+                  justifyContent:
+                    "space-between",
+                  alignItems: "baseline",
+                }}
+              >
+                <h2 style={{ marginTop: 0 }}>
+                  💰 Current Price ({ticker})
+                </h2>
                 {closes.length > 0 && (
                   <button
                     className="btn ghost"
-                    onClick={() => setShowBigPriceChart(true)}
-                    style={{ padding: "2px 8px", fontSize: 12 }}
+                    onClick={() =>
+                      setShowBigPriceChart(
+                        true
+                      )
+                    }
+                    style={{
+                      padding:
+                        "2px 8px",
+                      fontSize: 12,
+                    }}
                     title="Magnify chart"
                   >
                     🔍 Magnify
@@ -833,182 +1073,459 @@ export default function App() {
               </div>
 
               {quoteErr ? (
-                <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
+                <p
+                  className="muted"
+                  style={{
+                    color: "#ff6b6b",
+                    margin: 0,
+                  }}
+                >
                   Error loading quote
                 </p>
               ) : quote ? (
                 <>
                   <p style={{ margin: 0 }}>
-                    Last Close: ${Number(quote.last_close).toFixed(2)}
+                    Last Close: $
+                    {Number(
+                      quote.last_close
+                    ).toFixed(2)}
                   </p>
-                  <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
-                    <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
-                      ${tweenPrice.toFixed(2)}
+                  <p
+                    style={{
+                      margin: "2px 0",
+                      display: "flex",
+                      alignItems:
+                        "baseline",
+                      gap: 6,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize:
+                          "1.3em",
+                        fontWeight: 600,
+                      }}
+                    >
+                      $
+                      {tweenPrice.toFixed(
+                        2
+                      )}
                     </span>
-                    {Number.isFinite(pctToShow) && (
+                    {Number.isFinite(
+                      pctToShow
+                    ) && (
                       <span
                         style={{
-                          color: pctToShow >= 0 ? "#2e7d32" : "#c62828",
+                          color:
+                            pctToShow >= 0
+                              ? "#2e7d32"
+                              : "#c62828",
                           fontWeight: 600,
-                          display: "inline-flex",
-                          alignItems: "center",
+                          display:
+                            "inline-flex",
+                          alignItems:
+                            "center",
                           gap: 4,
-                          fontSize: "0.9em",
+                          fontSize:
+                            "0.9em",
                         }}
-                        aria-label={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)} percent`}
-                        title={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)}%`}
+                        aria-label={`${
+                          pctToShow >= 0
+                            ? "Up"
+                            : "Down"
+                        } ${Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )} percent`}
+                        title={`${
+                          pctToShow >= 0
+                            ? "Up"
+                            : "Down"
+                        } ${Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )}%`}
                       >
-                        {pctToShow >= 0 ? "▲" : "▼"} {Number(absToShow).toFixed(2)} ({Math.abs(pctToShow).toFixed(2)}%)
+                        {pctToShow >= 0
+                          ? "▲"
+                          : "▼"}{" "}
+                        {Number(
+                          absToShow
+                        ).toFixed(
+                          2
+                        )}{" "}
+                        (
+                        {Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )}
+                        %)
                       </span>
                     )}
                   </p>
 
-                  {/* mini interactive chart (clipped) */}
-                  <div style={{ marginTop: 6 }}>
+                  {/* mini interactive chart */}
+                  <div
+                    style={{
+                      marginTop: 6,
+                    }}
+                  >
                     {closes.length >= 2 ? (
-                      <div style={{ borderRadius: 10, overflow: "hidden" }}>
+                      <div
+                        style={{
+                          borderRadius: 10,
+                          overflow:
+                            "hidden",
+                        }}
+                      >
                         <InteractivePriceChart
                           data={closes}
-                          labels={closeDates}
+                          labels={
+                            closeDates
+                          }
                           width={320}
                           height={80}
                         />
                       </div>
                     ) : (
-                      <div className="muted" style={{ fontSize: 12 }}>
+                      <div
+                        className="muted"
+                        style={{
+                          fontSize: 12,
+                        }}
+                      >
                         no chart data
                       </div>
                     )}
                   </div>
                   {closes.length >= 2 && (
-                    <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-                      drag to pan • wheel to zoom • double-click to reset
+                    <div
+                      className="muted"
+                      style={{
+                        fontSize: 11,
+                        marginTop: 4,
+                      }}
+                    >
+                      drag to pan •
+                      wheel to zoom •
+                      double-click to
+                      reset
                     </div>
                   )}
                 </>
               ) : (
-                <p className="muted" style={{ margin: 0 }}>
+                <p
+                  className="muted"
+                  style={{ margin: 0 }}
+                >
                   N/A
                 </p>
               )}
             </div>
 
             {/* Earnings */}
-            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <EarningsCard earnings={earnings} />
+            <div
+              className="card"
+              style={{
+                minWidth: 0,
+                flex: "1 1 300px",
+              }}
+            >
+              <EarningsCard
+                earnings={earnings}
+              />
             </div>
 
             {/* Recommendation */}
-            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
-              <RecommendationCard recommendation={recommendation} />
+            <div
+              className="card"
+              style={{
+                minWidth: 0,
+                flex: "1 1 300px",
+              }}
+            >
+              <RecommendationCard
+                recommendation={
+                  recommendation
+                }
+              />
             </div>
           </div>
 
           {/* Market Breadth */}
           {market && (
             <div className="card">
-              <MarketCard market={market} />
+              <MarketCard
+                market={market}
+              />
             </div>
           )}
 
           {/* 📰 Sentiment overlay */}
-          <div className="card" style={{ marginTop: 12 }}>
-            <SentimentOverlay ticker={ticker} days={120} />
+          <div
+            className="card"
+            style={{ marginTop: 12 }}
+          >
+            <SentimentOverlay
+              ticker={ticker}
+              days={120}
+            />
           </div>
 
           {/* Metrics list */}
           {!!metrics.length && (
-            <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
-              <MetricsList metrics={metrics} />
+            <div
+              className="card"
+              style={{
+                marginTop: 12,
+                marginBottom: 12,
+              }}
+            >
+              <MetricsList
+                metrics={metrics}
+              />
             </div>
           )}
 
           {/* --- Actual vs Predicted (chart + table) --- */}
-          {results.length > 0 && closes.length >= 2 && (
-            <div className="card" style={{ marginTop: 12 }}>
-              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
-
+          {results.length > 0 &&
+            closes.length >= 2 && (
               <div
-                style={{
-                  height: 260,
-                  borderRadius: 12,
-                  overflow: "hidden",
-                  background: "rgba(255,255,255,0.03)",
-                  padding: 8,
-                }}
+                className="card"
+                style={{ marginTop: 12 }}
               >
-                <Chart type="line" data={avpChartData} options={avpChartOptions} />
-              </div>
+                <h3
+                  style={{
+                    marginTop: 0,
+                  }}
+                >
+                  Actual vs. Predicted
+                </h3>
 
-              <div className="table-wrap" style={{ marginTop: 12 }}>
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th style={{ whiteSpace: "nowrap" }}>Date</th>
-                      <th>Actual</th>
-                      {results.map((r) => (
-                        <th key={r.model}>
-                          {r.model}
-                          <span className="muted" style={{ fontSize: 11, display: "block" }}>
-                            <em>past: backtest • future: current</em>
-                          </span>
+                <div
+                  style={{
+                    height: 260,
+                    borderRadius: 12,
+                    overflow:
+                      "hidden",
+                    background:
+                      "rgba(255,255,255,0.03)",
+                    padding: 8,
+                  }}
+                >
+                  <Chart
+                    type="line"
+                    data={
+                      avpChartData
+                    }
+                    options={
+                      avpChartOptions
+                    }
+                  />
+                </div>
+
+                <div
+                  className="table-wrap"
+                  style={{
+                    marginTop: 12,
+                  }}
+                >
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th
+                          style={{
+                            whiteSpace:
+                              "nowrap",
+                          }}
+                        >
+                          Date
                         </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[
-                      ...pastRows,
-                      ...futureRows,
-                    ].map((row, i) => (
-                      <tr key={`${row.kind}-${row.date || i}`}>
-                        <td>
-                          {row.date
-                            ? row.kind === "future"
-                              ? `${row.date} (+${i - pastLabels.length + 1}d)`
-                              : row.date
-                            : ""}
-                        </td>
-                        <td>{row.actual != null ? Number(row.actual).toFixed(2) : "—"}</td>
-                        {row.perModel.map((v, j) => (
-                          <td key={j}>{v != null ? Number(v).toFixed(2) : "—"}</td>
-                        ))}
+                        <th>
+                          Actual
+                        </th>
+                        {results.map(
+                          (r) => (
+                            <th
+                              key={
+                                r.model
+                              }
+                            >
+                              {r.model}
+                              <span
+                                className="muted"
+                                style={{
+                                  fontSize: 11,
+                                  display:
+                                    "block",
+                                }}
+                              >
+                                <em>
+                                  past:
+                                  backtest
+                                  •
+                                  future:
+                                  current
+                                </em>
+                              </span>
+                            </th>
+                          )
+                        )}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {[...pastRows, ...futureRows].map(
+                        (
+                          row,
+                          i
+                        ) => (
+                          <tr
+                            key={`${row.kind}-${row.date || i}`}
+                          >
+                            <td>
+                              {row.date
+                                ? row.kind ===
+                                  "future"
+                                  ? `${row.date} (+${
+                                      i -
+                                      pastRows.length +
+                                      1
+                                    }d)`
+                                  : row.date
+                                : ""}
+                            </td>
+                            <td>
+                              {row.actual !=
+                              null
+                                ? Number(
+                                    row.actual
+                                  ).toFixed(
+                                    2
+                                  )
+                                : "—"}
+                            </td>
+                            {row.perModel.map(
+                              (
+                                v,
+                                j
+                              ) => (
+                                <td
+                                  key={
+                                    j
+                                  }
+                                >
+                                  {v !=
+                                  null
+                                    ? Number(
+                                        v
+                                      ).toFixed(
+                                        2
+                                      )
+                                    : "—"}
+                                </td>
+                              )
+                            )}
+                          </tr>
+                        )
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-              {!!diagnostic && (
-                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-                  Note: {diagnostic}
-                </div>
-              )}
-              {!!harmonizeNote && (
-                <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-                  {harmonizeNote}
-                </div>
-              )}
-            </div>
-          )}
+                {!!diagnostic && (
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 11,
+                      marginTop: 6,
+                    }}
+                  >
+                    Note:{" "}
+                    {
+                      diagnostic
+                    }
+                  </div>
+                )}
+                {!!harmonizeNote && (
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 11,
+                      marginTop: 4,
+                    }}
+                  >
+                    {
+                      harmonizeNote
+                    }
+                  </div>
+                )}
+              </div>
+            )}
 
           {diagnostic && (
-            <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
-              <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
-              <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{diagnostic}</div>
+            <div
+              className="card"
+              style={{
+                borderLeft:
+                  "4px solid #a8b2ff",
+                marginTop: 8,
+              }}
+            >
+              <div
+                style={{
+                  fontWeight: 600,
+                  marginBottom: 4,
+                }}
+              >
+                Diagnostics
+              </div>
+              <div
+                className="muted"
+                style={{
+                  whiteSpace:
+                    "pre-wrap",
+                }}
+              >
+                {diagnostic}
+              </div>
             </div>
           )}
 
-          {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
+          {error && (
+            <p style={{ color: "red" }}>
+              Prediction Error:{" "}
+              {error}
+            </p>
+          )}
 
           {/* Model selector */}
-          <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
+          <div
+            className="row"
+            style={{
+              marginTop: 12,
+              marginBottom: 8,
+            }}
+          >
             {MODEL_OPTIONS.map((m) => (
-              <label key={m} style={{ marginRight: 12 }}>
+              <label
+                key={m}
+                style={{
+                  marginRight: 12,
+                }}
+              >
                 <input
                   type="checkbox"
-                  checked={models.includes(m)}
-                  onChange={() => toggleModel(m)}
+                  checked={models.includes(
+                    m
+                  )}
+                  onChange={() =>
+                    toggleModel(
+                      m
+                    )
+                  }
                 />{" "}
                 {m}
               </label>
@@ -1022,34 +1539,99 @@ export default function App() {
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>Model</th>
-                      {results[0].predictions.map((_, i) => (
-                        <th key={i}>{`+${i + 1}d`}</th>
-                      ))}
+                      <th>
+                        Model
+                      </th>
+                      {results[0].predictions.map(
+                        (_, i) => (
+                          <th
+                            key={
+                              i
+                            }
+                          >
+                            {`+${i + 1}d`}
+                          </th>
+                        )
+                      )}
                     </tr>
                   </thead>
                   <tbody>
-                    {results.map(({ model, predictions, confidence }) => (
-                      <tr key={model}>
-                        <td>{model}</td>
-                        {predictions.map((val, i) => (
-                          <td key={i}>
-                            {Number(val).toFixed(2)}
-                            {Array.isArray(confidence) && confidence[i] != null && (
-                              <div className="muted" style={{ fontSize: 11 }}>
-                                conf {Number(confidence[i]).toFixed(2)}
-                              </div>
-                            )}
+                    {results.map(
+                      ({
+                        model,
+                        predictions,
+                        confidence,
+                      }) => (
+                        <tr
+                          key={
+                            model
+                          }
+                        >
+                          <td>
+                            {
+                              model
+                            }
                           </td>
-                        ))}
-                      </tr>
-                    ))}
+                          {predictions.map(
+                            (
+                              val,
+                              i
+                            ) => (
+                              <td
+                                key={
+                                  i
+                                }
+                              >
+                                {Number(
+                                  val
+                                ).toFixed(
+                                  2
+                                )}
+                                {Array.isArray(
+                                  confidence
+                                ) &&
+                                  confidence[
+                                    i
+                                  ] !=
+                                    null && (
+                                    <div
+                                      className="muted"
+                                      style={{
+                                        fontSize: 11,
+                                      }}
+                                    >
+                                      conf{" "}
+                                      {Number(
+                                        confidence[
+                                          i
+                                        ]
+                                      ).toFixed(
+                                        2
+                                      )}
+                                    </div>
+                                  )}
+                              </td>
+                            )
+                          )}
+                        </tr>
+                      )
+                    )}
                   </tbody>
                 </table>
               </div>
               {!!diagnostic && (
-                <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
-                  Note: {diagnostic}
+                <div
+                  className="muted"
+                  style={{
+                    fontSize: 11,
+                    padding:
+                      "6px 12px 10px",
+                  }}
+                >
+                  Note:{" "}
+                  {
+                    diagnostic
+                  }
                 </div>
               )}
             </div>
@@ -1059,8 +1641,18 @@ export default function App() {
 
       {/* Big chart modal */}
       {showBigPriceChart && (
-        <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
-          <div style={{ borderRadius: 12, overflow: "hidden" }}>
+        <MagnifyModal
+          title={`${ticker} • Price`}
+          onClose={() =>
+            setShowBigPriceChart(false)
+          }
+        >
+          <div
+            style={{
+              borderRadius: 12,
+              overflow: "hidden",
+            }}
+          >
             <InteractivePriceChart
               data={closes || []}
               labels={closeDates || []}
@@ -1072,135 +1664,266 @@ export default function App() {
         </MagnifyModal>
       )}
 
-      {/* 🔐 Auth modal mount */}
-      <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
+      {/* 🔐 Auth modal */}
+      <AuthModal
+        open={showAuth && !user}
+        onClose={() => setShowAuth(false)}
+      />
     </div>
   );
 }
 
 /** Interactive SVG line chart with hover scrub, drag-pan, wheel-zoom + date labels */
-function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
+function InteractivePriceChart({
+  data = [],
+  labels = [],
+  width = 320,
+  height = 80,
+  big = false,
+}) {
   const pad = 10;
   const w = width - pad * 2;
   const h = height - pad * 2;
 
-  const [view, setView] = useState({ start: 0, end: Math.max(0, data.length - 1) });
+  const [view, setView] = useState({
+    start: 0,
+    end: Math.max(0, data.length - 1),
+  });
   const [cursorX, setCursorX] = useState(null);
   const [hoverIdx, setHoverIdx] = useState(null);
   const [drag, setDrag] = useState(null); // {startX, startView}
 
   useEffect(() => {
-    setView({ start: 0, end: Math.max(0, data.length - 1) });
+    setView({
+      start: 0,
+      end: Math.max(0, data.length - 1),
+    });
   }, [data.length]);
 
   if (!Array.isArray(data) || data.length < 2) {
-    return <div className="muted" style={{ fontSize: 12 }}>no data</div>;
+    return (
+      <div
+        className="muted"
+        style={{ fontSize: 12 }}
+      >
+        no data
+      </div>
+    );
   }
 
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
-  const vEnd   = clamp(view.end,   vStart + 1, data.length - 1);
-  const windowData = data.slice(vStart, vEnd + 1);
+  const vEnd = clamp(
+    view.end,
+    vStart + 1,
+    data.length - 1
+  );
+  const windowData = data.slice(
+    vStart,
+    vEnd + 1
+  );
 
   const min = Math.min(...windowData);
   const max = Math.max(...windowData);
   const range = max - min || 1;
 
-  const xForIndex = (i) => pad + (w * (i - vStart)) / (vEnd - vStart);
+  const xForIndex = (i) =>
+    pad +
+    (w * (i - vStart)) /
+      (vEnd - vStart);
   const idxForX = (x) => {
-    const t = clamp((x - pad) / w, 0, 1);
-    return Math.round(vStart + t * (vEnd - vStart));
+    const t = clamp(
+      (x - pad) / w,
+      0,
+      1
+    );
+    return Math.round(
+      vStart + t * (vEnd - vStart)
+    );
   };
-  const yForVal = (v) => pad + h - ((v - min) / range) * h;
+  const yForVal = (v) =>
+    pad +
+    h -
+    ((v - min) / range) * h;
 
   const points = windowData
     .map((v, k) => {
       const i = vStart + k;
-      return `${xForIndex(i)},${yForVal(v)}`;
+      return `${xForIndex(
+        i
+      )},${yForVal(v)}`;
     })
     .join(" ");
 
-  const lastUp = windowData[windowData.length - 1] >= windowData[0];
+  const lastUp =
+    windowData[windowData.length - 1] >=
+    windowData[0];
 
   const onMove = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect =
+      e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
     if (drag) {
       const dx = x - drag.startX;
       const frac = dx / w;
-      const windowSize = drag.startView.end - drag.startView.start;
-      let newStart = drag.startView.start - Math.round(frac * windowSize);
+      const windowSize =
+        drag.startView.end -
+        drag.startView.start;
+      let newStart =
+        drag.startView.start -
+        Math.round(frac * windowSize);
       let newEnd = newStart + windowSize;
-      if (newStart < 0) { newStart = 0; newEnd = windowSize; }
-      if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - windowSize; }
-      setView({ start: newStart, end: newEnd });
+      if (newStart < 0) {
+        newStart = 0;
+        newEnd = windowSize;
+      }
+      if (newEnd > data.length - 1) {
+        newEnd = data.length - 1;
+        newStart =
+          newEnd - windowSize;
+      }
+      setView({
+        start: newStart,
+        end: newEnd,
+      });
     }
   };
 
-  const onLeave = () => { setCursorX(null); setHoverIdx(null); setDrag(null); };
+  const onLeave = () => {
+    setCursorX(null);
+    setHoverIdx(null);
+    setDrag(null);
+  };
   const onDown = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect =
+      e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    setDrag({ startX: x, startView: { ...view } });
+    setDrag({
+      startX: x,
+      startView: { ...view },
+    });
   };
   const onUp = () => setDrag(null);
 
   const onWheel = (e) => {
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = clamp(e.clientX - rect.left, pad, pad + w);
+    const rect =
+      e.currentTarget.getBoundingClientRect();
+    const x = clamp(
+      e.clientX - rect.left,
+      pad,
+      pad + w
+    );
     const focusIdx = idxForX(x);
 
     const windowSize = vEnd - vStart;
     const delta = Math.sign(e.deltaY); // 1 = out, -1 = in
-    const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
-    let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
-    newSize = clamp(newSize, 5, data.length - 1);
+    const zoomStep = Math.max(
+      1,
+      Math.round(windowSize * 0.15)
+    );
+    let newSize =
+      delta < 0
+        ? windowSize - zoomStep
+        : windowSize + zoomStep;
+    newSize = clamp(
+      newSize,
+      5,
+      data.length - 1
+    );
 
-    let newStart = focusIdx - Math.round((focusIdx - vStart) * (newSize / windowSize));
+    let newStart =
+      focusIdx -
+      Math.round(
+        (focusIdx - vStart) *
+          (newSize / windowSize)
+      );
     let newEnd = newStart + newSize;
 
-    if (newStart < 0) { newStart = 0; newEnd = newSize; }
-    if (newEnd > data.length - 1) { newEnd = data.length - 1; newStart = newEnd - newSize; }
+    if (newStart < 0) {
+      newStart = 0;
+      newEnd = newSize;
+    }
+    if (newEnd > data.length - 1) {
+      newEnd = data.length - 1;
+      newStart =
+        newEnd - newSize;
+    }
 
-    setView({ start: newStart, end: newEnd });
+    setView({
+      start: newStart,
+      end: newEnd,
+    });
   };
 
-  const onDblClick = () => setView({ start: 0, end: data.length - 1 });
+  const onDblClick = () =>
+    setView({
+      start: 0,
+      end: data.length - 1,
+    });
 
-  const showIdx = clamp(hoverIdx ?? vEnd, 0, data.length - 1);
+  const showIdx = clamp(
+    hoverIdx ?? vEnd,
+    0,
+    data.length - 1
+  );
   const showVal = data[showIdx];
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
-  // label prefers real date when provided (timezone-safe)
+  // label prefers real date when available
   let label;
-  if (Array.isArray(labels) && labels.length === data.length) {
+  if (
+    Array.isArray(labels) &&
+    labels.length === data.length
+  ) {
     const d = labels[showIdx];
     try {
       const dt = asLocalDate(d);
-      label = dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      label = dt.toLocaleDateString(
+        undefined,
+        {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        }
+      );
     } catch {
       label = String(d);
     }
   } else {
-    const rel = (data.length - 1) - showIdx; // 0 = latest
-    label = rel === 0 ? "latest" : `t-${rel}d`;
+    const rel =
+      data.length - 1 - showIdx; // 0=latest
+    label =
+      rel === 0
+        ? "latest"
+        : `t-${rel}d`;
   }
 
-  const textW = Math.min(200, 72 + String(label).length * 6);
-  const boxX = Math.min(showX + 8, width - (textW + 10));
-  const boxY = Math.max(showY - 26, 2);
+  const textW = Math.min(
+    200,
+    72 + String(label).length * 6
+  );
+  const boxX = Math.min(
+    showX + 8,
+    width - (textW + 10)
+  );
+  const boxY = Math.max(
+    showY - 26,
+    2
+  );
 
   return (
     <svg
       width={width}
       height={height}
       style={{
-        cursor: drag ? "grabbing" : "crosshair",
+        cursor: drag
+          ? "grabbing"
+          : "crosshair",
         background: "transparent",
         borderRadius: 8,
         display: "block",
@@ -1213,16 +1936,62 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
-      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
+      <rect
+        x="0"
+        y="0"
+        width={width}
+        height={height}
+        rx="8"
+        ry="8"
+        fill="rgba(255,255,255,0.03)"
+      />
+      <polyline
+        fill="none"
+        stroke={
+          lastUp
+            ? "#2e7d32"
+            : "#c62828"
+        }
+        strokeWidth={big ? 2.5 : 2}
+        points={points}
+      />
       {cursorX != null && (
         <>
-          <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
-          <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
+          <line
+            x1={showX}
+            x2={showX}
+            y1={10}
+            y2={height - 10}
+            stroke="#a8b2ff"
+            strokeDasharray="3,3"
+          />
+          <circle
+            cx={showX}
+            cy={showY}
+            r={big ? 4 : 3}
+            fill="#a8b2ff"
+          />
           <g>
-            <rect x={boxX} y={boxY} width={textW} height="22" rx="6" fill="rgba(0,0,0,0.65)" stroke="rgba(255,255,255,0.25)" />
-            <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
-              ${Number(showVal).toFixed(2)} • {label}
+            <rect
+              x={boxX}
+              y={boxY}
+              width={textW}
+              height="22"
+              rx="6"
+              fill="rgba(0,0,0,0.65)"
+              stroke="rgba(255,255,255,0.25)"
+            />
+            <text
+              x={boxX + 10}
+              y={boxY + 15}
+              fontSize={big ? 12 : 11}
+              fill="#fff"
+            >
+              $
+              {Number(
+                showVal
+              ).toFixed(2)}{" "}
+              • {label}
             </text>
           </g>
         </>
@@ -1232,7 +2001,11 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
 }
 
 /** Minimal modal (no deps) */
-function MagnifyModal({ title, children, onClose }) {
+function MagnifyModal({
+  title,
+  children,
+  onClose,
+}) {
   return (
     <div
       style={{
@@ -1250,21 +2023,51 @@ function MagnifyModal({ title, children, onClose }) {
     >
       <div
         className="card"
-        style={{ width: "min(95vw, 1000px)", padding: 16 }}
-        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(95vw, 1000px)",
+          padding: 16,
+        }}
+        onClick={(e) =>
+          e.stopPropagation()
+        }
       >
-        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0 }}>{title}</h3>
-          <div className="row" style={{ gap: 8 }}>
-            <button className="btn ghost" onClick={onClose}>
+        <div
+          className="row"
+          style={{
+            justifyContent:
+              "space-between",
+            alignItems: "center",
+          }}
+        >
+          <h3 style={{ margin: 0 }}>
+            {title}
+          </h3>
+          <div
+            className="row"
+            style={{ gap: 8 }}
+          >
+            <button
+              className="btn ghost"
+              onClick={onClose}
+            >
               Close
             </button>
           </div>
         </div>
-        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-          Tip: drag to pan • wheel to zoom • double-click to reset
+        <div
+          className="muted"
+          style={{
+            fontSize: 12,
+            marginTop: 6,
+          }}
+        >
+          Tip: drag to pan • wheel
+          to zoom • double-click
+          to reset
         </div>
-        <div style={{ marginTop: 12 }}>{children}</div>
+        <div style={{ marginTop: 12 }}>
+          {children}
+        </div>
       </div>
     </div>
   );
