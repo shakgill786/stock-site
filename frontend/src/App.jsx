@@ -78,6 +78,11 @@ const safePct = (curr, prev) =>
     ? ((curr - prev) / prev) * 100
     : null;
 
+// --- split detection threshold for predict_history tail cleanup ---
+// If the last "actual" is more than 2x or less than 1/2 of the previous row,
+// assume vendor glued post-split data onto pre-split history (or vice versa).
+const SPLIT_RATIO_THRESHOLD = 2.0;
+
 /** ===== tail de-dupe helpers ===== */
 const dropDupTailSeries = (dates = [], closes = []) => {
   const n = Math.min(dates.length, closes.length);
@@ -95,19 +100,58 @@ const dropDupTailSeries = (dates = [], closes = []) => {
   return { dates, closes, dropped: false };
 };
 
-const dropDupTailHistory = (rows = []) => {
-  const n = rows.length;
-  if (n >= 2) {
-    const a = Number(rows[n - 1]?.actual ?? rows[n - 1]?.close);
-    const b = Number(rows[n - 2]?.actual ?? rows[n - 2]?.close);
-    const dA = String(rows[n - 1]?.date || "");
-    const dB = String(rows[n - 2]?.date || "");
-    if (dA !== dB && Number.isFinite(a) && Number.isFinite(b) && a === b) {
-      return rows.slice(0, n - 1);
+// Clean up weird tail rows in predict_history
+// 1. Kill obvious split/scale jump on the last row
+// 2. Then remove duplicate last-price rows across 2 different dates
+function dropDupTailHistory(rows = []) {
+  const arr = Array.isArray(rows) ? [...rows] : [];
+  const n = arr.length;
+  if (n < 2) return arr;
+
+  // helper: numeric "actual" for a row
+  const getActual = (row) => {
+    const a = Number(row?.actual);
+    if (Number.isFinite(a)) return a;
+    const c = Number(row?.close);
+    if (Number.isFinite(c)) return c;
+    return null;
+  };
+
+  const lastA = getActual(arr[n - 1]);
+  const prevA = getActual(arr[n - 2]);
+
+  // --- Step 1: drop last row if it's clearly a split-scale mismatch
+  if (Number.isFinite(lastA) && Number.isFinite(prevA) && prevA !== 0) {
+    const ratio = Math.abs(lastA / prevA);
+    if (
+      ratio > SPLIT_RATIO_THRESHOLD ||
+      ratio < 1 / SPLIT_RATIO_THRESHOLD
+    ) {
+      arr.pop(); // remove the problematic last row
     }
   }
-  return rows;
-};
+
+  // --- Step 2: after possible pop(), do the duplicate-last-price cleanup
+  const m = arr.length;
+  if (m >= 2) {
+    const aVal = getActual(arr[m - 1]);
+    const bVal = getActual(arr[m - 2]);
+    const dA = String(arr[m - 1]?.date || "");
+    const dB = String(arr[m - 2]?.date || "");
+
+    // if vendor duplicated same price across two different date stamps, drop newest dup
+    if (
+      dA !== dB &&
+      Number.isFinite(aVal) &&
+      Number.isFinite(bVal) &&
+      aVal === bVal
+    ) {
+      arr.pop();
+    }
+  }
+
+  return arr;
+}
 
 // align closes vs quote.last_close if there’s a big split-style mismatch
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
@@ -192,6 +236,8 @@ export default function App() {
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
   // Compare Mode
+  theCompareMode: {
+  }
   const [compareOpen, setCompareOpen] = useState(false);
   const [compareSymbols, setCompareSymbols] = useState([]);
 
@@ -286,7 +332,7 @@ export default function App() {
     );
   };
 
-  // Build lookup maps from predictHistory
+  // Build lookup maps from predict_history
   const { histByDate, histPred } = useMemo(() => {
     const byDate = {};
     const byDateModel = {};
@@ -592,12 +638,11 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // 🔧 FIX PART 1:
   // For each past date:
-  //  - Use predict_history.actual if available (good scale ~180, ~181, ...)
-  //  - ELSE (for *non-final* past rows only) fall back to closes[]
-  //  - For the last past date, if we don't have actual in hist, return null
-  //    instead of injecting the mismatched 262.xx close.
+  //  - Use predict_history.actual if available
+  //  - ELSE (non-final rows only) fall back to closes[]
+  //  - For the freshest row, if hist didn't give actual, return null
+  //    (avoid stitching post-split prices into pre-split scale)
   const actualForPastLabels = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const h = histByDate[dkIso];
@@ -606,8 +651,6 @@ export default function App() {
 
     const isLast = idx === pastLabels.length - 1;
     if (isLast) {
-      // Don't fall back to closes on the freshest date if history
-      // hasn't landed yet. This avoids the giant split jump.
       return null;
     }
 
@@ -788,8 +831,7 @@ export default function App() {
     },
   };
 
-  // 🔧 FIX PART 2:
-  // Build table rows using same "don't inject 262.xx if it's not in history" rule
+  // Build table rows using same "don't inject mismatch tail" rule
   const pastRows = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const hist = histByDate[dkIso];
@@ -1359,7 +1401,7 @@ export default function App() {
   );
 }
 
-/** InteractivePriceChart + MagnifyModal stay unchanged from previous version **/
+/** InteractivePriceChart + MagnifyModal **/
 function InteractivePriceChart({
   data = [],
   labels = [],
@@ -1428,6 +1470,8 @@ function InteractivePriceChart({
     setHoverIdx(idxForX(x));
     if (drag) {
       const dx = x - drag.startX;
+      theDragHandler: {
+      }
       const frac = dx / w;
       const windowSize = drag.startView.end - drag.startView.start;
       let newStart = drag.startView.start - Math.round(frac * windowSize);
