@@ -1,5 +1,11 @@
 // frontend/src/App.jsx
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from "react";
 import {
   fetchPredict,
   fetchQuote,
@@ -10,6 +16,7 @@ import {
   buildQuoteStreamURL,
   ping,
 } from "./api";
+
 import MarketCard from "./components/MarketCard";
 import EarningsCard from "./components/EarningsCard";
 import RecommendationCard from "./components/RecommendationCard";
@@ -21,6 +28,8 @@ import HotAndEarnings from "./components/HotAndEarnings";
 import AuthModal from "./components/AuthModal";
 import { useAuth } from "./auth/AuthContext";
 import SentimentOverlay from "./components/SentimentOverlay";
+import SectionHeader from "./components/SectionHeader";
+
 import "./App.css";
 
 import {
@@ -108,7 +117,6 @@ function dropDupTailHistory(rows = []) {
   const n = arr.length;
   if (n < 2) return arr;
 
-  // helper: numeric "actual" for a row
   const getActual = (row) => {
     const a = Number(row?.actual);
     if (Number.isFinite(a)) return a;
@@ -120,18 +128,18 @@ function dropDupTailHistory(rows = []) {
   const lastA = getActual(arr[n - 1]);
   const prevA = getActual(arr[n - 2]);
 
-  // --- Step 1: drop last row if it's clearly a split-scale mismatch
+  // Step 1: drop last row if it's clearly a split-scale mismatch
   if (Number.isFinite(lastA) && Number.isFinite(prevA) && prevA !== 0) {
     const ratio = Math.abs(lastA / prevA);
     if (
       ratio > SPLIT_RATIO_THRESHOLD ||
       ratio < 1 / SPLIT_RATIO_THRESHOLD
     ) {
-      arr.pop(); // remove the problematic last row
+      arr.pop(); // nuke broken tail row
     }
   }
 
-  // --- Step 2: after possible pop(), do the duplicate-last-price cleanup
+  // Step 2: after possible pop(), do the duplicate-last-price cleanup
   const m = arr.length;
   if (m >= 2) {
     const aVal = getActual(arr[m - 1]);
@@ -193,7 +201,8 @@ function getScrollableAncestor(el) {
   while (node) {
     const style = getComputedStyle(node);
     const canScroll =
-      /(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight;
+      /(auto|scroll)/.test(style.overflowY) &&
+      node.scrollHeight > node.clientHeight;
     if (canScroll) return node;
     node = node.parentElement;
   }
@@ -236,8 +245,6 @@ export default function App() {
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
   // Compare Mode
-  theCompareMode: {
-  }
   const [compareOpen, setCompareOpen] = useState(false);
   const [compareSymbols, setCompareSymbols] = useState([]);
 
@@ -259,7 +266,9 @@ export default function App() {
   // Live stream
   const [live, setLive] = useState(true);
   const prevPriceRef = useRef(null);
-  const tweenPrice = useTweenNumber(quote?.current_price ?? 0, { duration: 450 });
+  const tweenPrice = useTweenNumber(quote?.current_price ?? 0, {
+    duration: 450,
+  });
   const [blinkClass, setBlinkClass] = useState("");
 
   // price chart data
@@ -317,7 +326,8 @@ export default function App() {
         const r = await fetchCloses(tkr, days, { signal });
         const c = normalizeCloses(r?.closes);
         const d = Array.isArray(r?.dates) ? r.dates : [];
-        if (c.length >= 2 && d.length === c.length) return { dates: d, closes: c };
+        if (c.length >= 2 && d.length === c.length)
+          return { dates: d, closes: c };
         return null;
       } catch {
         return null;
@@ -427,14 +437,20 @@ export default function App() {
         });
 
         if (!closes?.length) {
-          setDiagnostic((dMsg) => dMsg || `No historical price series available for ${t}.`);
+          setDiagnostic(
+            (dMsg) =>
+              dMsg || `No historical price series available for ${t}.`
+          );
         }
 
         setCloses(closes || []);
         setCloseDates(dates || []);
       } catch {
         if (reqVer.current !== myVer) return;
-        setDiagnostic((dMsg) => dMsg || `Failed to load historical prices for ${t}.`);
+        setDiagnostic(
+          (dMsg) =>
+            dMsg || `Failed to load historical prices for ${t}.`
+        );
       }
     })();
 
@@ -446,10 +462,12 @@ export default function App() {
           { signal: ctrl.signal }
         );
         if (reqVer.current !== myVer) return;
-        const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map((r) => ({
-          ...r,
-          actual: toNum(r?.actual) ?? toNum(r?.close) ?? null,
-        }));
+        const safeRows = (Array.isArray(hist?.rows) ? hist.rows : []).map(
+          (r) => ({
+            ...r,
+            actual: toNum(r?.actual) ?? toNum(r?.close) ?? null,
+          })
+        );
         setHistoryRows(dropDupTailHistory(safeRows));
       } catch {
         if (reqVer.current !== myVer) return;
@@ -465,7 +483,8 @@ export default function App() {
         const got = Array.isArray(res?.results) ? res.results : [];
         setResults(got);
         if (!got.length) {
-          const msg = res?.message || res?.detail || "No predictions returned.";
+          const msg =
+            res?.message || res?.detail || "No predictions returned.";
           setDiagnostic((d) => d || `${msg} (${t})`);
         }
       } catch (e) {
@@ -477,7 +496,9 @@ export default function App() {
     })();
 
     await Promise.all(
-      [pQuote, pEarn, pMkt, pCloses, pHist, pPredict].map((p) => p?.catch?.(() => {}))
+      [pQuote, pEarn, pMkt, pCloses, pHist, pPredict].map((p) =>
+        p?.catch?.(() => {})
+      )
     );
 
     if (reqVer.current === myVer) {
@@ -511,7 +532,9 @@ export default function App() {
         const prev = prevPriceRef.current;
         const next = toNum(payload.current_price);
         const lastClose =
-          toNum(payload.last_close) ?? toNum(quote?.last_close) ?? null;
+          toNum(payload.last_close) ??
+          toNum(quote?.last_close) ??
+          null;
 
         if (next != null) {
           setQuote((q) => {
@@ -599,8 +622,10 @@ export default function App() {
           avgChangePct: 0,
         };
       const mapeProxy =
-        preds.reduce((acc, p) => acc + Math.abs(p - base) / base, 0) /
-        preds.length;
+        preds.reduce(
+          (acc, p) => acc + Math.abs(p - base) / base,
+          0
+        ) / preds.length;
       const meanPred = preds.reduce((a, b) => a + b, 0) / preds.length;
       const avgChangePct = ((meanPred - base) / base) * 100;
       return { model: r.model, mapeProxy, avgChangePct };
@@ -609,7 +634,9 @@ export default function App() {
 
   const recommendation = useMemo(() => {
     if (!metrics.length) return null;
-    const best = [...metrics].sort((a, b) => a.mapeProxy - b.mapeProxy)[0];
+    const best = [...metrics].sort(
+      (a, b) => a.mapeProxy - b.mapeProxy
+    )[0];
     let action = "Hold";
     if (best.avgChangePct > 1) action = "Buy";
     if (best.avgChangePct < -1) action = "Sell";
@@ -638,11 +665,7 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // For each past date:
-  //  - Use predict_history.actual if available
-  //  - ELSE (non-final rows only) fall back to closes[]
-  //  - For the freshest row, if hist didn't give actual, return null
-  //    (avoid stitching post-split prices into pre-split scale)
+  // Build "actual" for past rows, avoiding split jumps on the freshest row
   const actualForPastLabels = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const h = histByDate[dkIso];
@@ -651,6 +674,7 @@ export default function App() {
 
     const isLast = idx === pastLabels.length - 1;
     if (isLast) {
+      // Don't force-close the last row if we don't have hist.actual
       return null;
     }
 
@@ -667,7 +691,9 @@ export default function App() {
     for (let i = 0; i < pastLabels.length; i++) {
       const a = actual[i];
       const b = series[i];
-      if (Number.isFinite(a) && Number.isFinite(b)) pairs.push([a, b]);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        pairs.push([a, b]);
+      }
     }
     if (pairs.length < 5) return { series, note: null };
 
@@ -690,14 +716,21 @@ export default function App() {
         0
       ) / A.length;
 
+    // If scale is off and error is high, affine-rescale (alpha+beta*x)
     if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
       const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
       const meanA = mean(A);
       const meanB = mean(B);
       const cov =
-        A.reduce((s, a, i) => s + (a - meanA) * (B[i] - meanB), 0) / A.length;
+        A.reduce(
+          (s, a, i) => s + (a - meanA) * (B[i] - meanB),
+          0
+        ) / A.length;
       const varB =
-        B.reduce((s, b) => s + (b - meanB) * (b - meanB), 0) / B.length || 1;
+        B.reduce(
+          (s, b) => s + (b - meanB) * (b - meanB),
+          0
+        ) / B.length || 1;
       const beta = cov / varB;
       const alpha = meanA - beta * meanB;
 
@@ -724,11 +757,12 @@ export default function App() {
     "#edc949",
   ];
 
-  // datasets for AVP chart
+  // datasets for Actual vs Predicted chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
-    if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
+    if (!chartLabels.length)
+      return { avpDatasets: [], harmonizeNote: null };
 
-    // Actual close line (past only)
+    // Actual series (past only, null in future)
     const actualSeries = [
       ...actualForPastLabels,
       ...Array(futureLabels.length).fill(null),
@@ -753,7 +787,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // past segment (backtest)
+      // past/backtest
       const backtestRaw = chartLabels.map((lab, i) => {
         if (i >= pastLabels.length) return null;
         const dkIso = dkey(lab);
@@ -769,7 +803,9 @@ export default function App() {
 
       ds.push({
         label: `${r.model} • backtest`,
-        data: backtestSeries.concat(Array(futureLabels.length).fill(null)),
+        data: backtestSeries.concat(
+          Array(futureLabels.length).fill(null)
+        ),
         borderColor: color,
         backgroundColor: "transparent",
         borderDash: [6, 4],
@@ -781,8 +817,9 @@ export default function App() {
 
       // future/current forecast
       const lastActual =
-        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ??
-        null;
+        [...actualForPastLabels]
+          .reverse()
+          .find((v) => Number.isFinite(v)) ?? null;
 
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
@@ -822,7 +859,10 @@ export default function App() {
     },
     interaction: { mode: "index", intersect: false },
     scales: {
-      x: { ticks: { maxTicksLimit: 10 }, grid: { display: false } },
+      x: {
+        ticks: { maxTicksLimit: 10 },
+        grid: { display: false },
+      },
       y: {
         ticks: {
           callback: (v) => `$${Number(v).toFixed(0)}`,
@@ -831,7 +871,7 @@ export default function App() {
     },
   };
 
-  // Build table rows using same "don't inject mismatch tail" rule
+  // Build table rows (past + future)
   const pastRows = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
     const hist = histByDate[dkIso];
@@ -841,7 +881,9 @@ export default function App() {
 
     const actualHere = Number.isFinite(hist?.actual)
       ? hist.actual
-      : !isLast && idxClose >= 0 && Number.isFinite(closes[idxClose])
+      : !isLast &&
+        idxClose >= 0 &&
+        Number.isFinite(closes[idxClose])
       ? closes[idxClose]
       : null;
 
@@ -860,7 +902,9 @@ export default function App() {
 
   const futureRows = futureLabels.map((d, i) => {
     const perModel = results.map((r) =>
-      Array.isArray(r.predictions) ? r.predictions[i] ?? null : null
+      Array.isArray(r.predictions)
+        ? r.predictions[i] ?? null
+        : null
     );
     return { date: d, actual: null, perModel, kind: "future" };
   });
@@ -869,9 +913,12 @@ export default function App() {
   const curr = toNum(quote?.current_price);
   const prev = toNum(quote?.last_close);
   const derivedPct = safePct(curr, prev);
-  const pctToShow = toNum(quote?.change_pct) ?? derivedPct ?? 0;
+  const pctToShow =
+    toNum(quote?.change_pct) ?? derivedPct ?? 0;
   const absToShow =
-    Number.isFinite(curr) && Number.isFinite(prev) ? curr - prev : 0;
+    Number.isFinite(curr) && Number.isFinite(prev)
+      ? curr - prev
+      : 0;
 
   return (
     <div className="app-root">
@@ -886,24 +933,39 @@ export default function App() {
               Live quotes • Movers • This week’s earnings
             </p>
           </div>
-          <div className="hero-right" style={{ display: "flex", gap: 8 }}>
+          <div
+            className="hero-right"
+            style={{ display: "flex", gap: 8 }}
+          >
             {user ? (
               <>
-                <span className="muted" style={{ fontSize: 14 }}>
+                <span
+                  className="muted"
+                  style={{ fontSize: 14 }}
+                >
                   👋 {user?.name || user?.email}
                 </span>
-                <button className="btn ghost" onClick={logout} title="Sign out">
+                <button
+                  className="btn ghost"
+                  onClick={logout}
+                  title="Sign out"
+                >
                   Sign out
                 </button>
               </>
             ) : (
-              <button className="btn" onClick={() => setShowAuth(true)}>
+              <button
+                className="btn"
+                onClick={() => setShowAuth(true)}
+              >
                 Sign in / Create account
               </button>
             )}
             <button
               className="btn ghost"
-              onClick={() => window.location.reload()}
+              onClick={() =>
+                window.location.reload()
+              }
             >
               ↻ Refresh
             </button>
@@ -924,7 +986,9 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={live}
-                onChange={() => setLive((v) => !v)}
+                onChange={() =>
+                  setLive((v) => !v)
+                }
               />{" "}
               Live price updates (SSE)
             </label>
@@ -941,23 +1005,38 @@ export default function App() {
               marginBottom: 8,
             }}
           >
-            <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
-              {compareOpen ? "Close Compare" : "Open Compare"}
+            <button
+              className="btn"
+              onClick={() =>
+                setCompareOpen((v) => !v)
+              }
+            >
+              {compareOpen
+                ? "Close Compare"
+                : "Open Compare"}
             </button>
           </div>
 
           {compareOpen && (
             <CompareMode
               symbols={compareSymbols}
-              onSymbolsChange={setCompareSymbols}
+              onSymbolsChange={
+                setCompareSymbols
+              }
               defaultModels={models}
               rememberSession={false}
-              onExit={() => setCompareOpen(false)}
+              onExit={() =>
+                setCompareOpen(false)
+              }
             />
           )}
 
-          {/* Movers + Earnings */}
-          <HotAndEarnings onSelectTicker={handleSelectTicker} />
+          {/* Movers + Earnings list */}
+          <HotAndEarnings
+            onSelectTicker={
+              handleSelectTicker
+            }
+          />
 
           {/* ticker input */}
           <form
@@ -970,14 +1049,25 @@ export default function App() {
           >
             <input
               value={ticker}
-              onChange={(e) => setTicker(e.target.value.toUpperCase())}
+              onChange={(e) =>
+                setTicker(
+                  e.target.value.toUpperCase()
+                )
+              }
               placeholder="Ticker (e.g. AAPL or BTC-USD)"
               required
               type="text"
-              style={{ flex: "1 1 180px" }}
+              style={{
+                flex: "1 1 180px",
+              }}
             />
-            <button className="btn" disabled={loading}>
-              {loading ? "Loading…" : "Load Data"}
+            <button
+              className="btn"
+              disabled={loading}
+            >
+              {loading
+                ? "Loading…"
+                : "Load Data"}
             </button>
           </form>
 
@@ -993,12 +1083,13 @@ export default function App() {
             aria-hidden
           />
 
-          {/* Top info row */}
+          {/* Top info row: Quote / Earnings / Recommendation */}
           <div
-            className={`row`}
+            className="row"
             style={{
               gap: 16,
               marginBottom: 12,
+              flexWrap: "wrap",
             }}
           >
             {/* Quote card */}
@@ -1012,17 +1103,31 @@ export default function App() {
               <div
                 className="row"
                 style={{
-                  justifyContent: "space-between",
-                  alignItems: "baseline",
+                  justifyContent:
+                    "space-between",
+                  alignItems:
+                    "baseline",
                 }}
               >
-                <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
+                <h2
+                  style={{
+                    marginTop: 0,
+                  }}
+                >
+                  💰 Current Price (
+                  {ticker})
+                </h2>
                 {closes.length > 0 && (
                   <button
                     className="btn ghost"
-                    onClick={() => setShowBigPriceChart(true)}
+                    onClick={() =>
+                      setShowBigPriceChart(
+                        true
+                      )
+                    }
                     style={{
-                      padding: "2px 8px",
+                      padding:
+                        "2px 8px",
                       fontSize: 12,
                     }}
                     title="Magnify chart"
@@ -1040,75 +1145,144 @@ export default function App() {
                     margin: 0,
                   }}
                 >
-                  Error loading quote
+                  Error loading
+                  quote
                 </p>
               ) : quote ? (
                 <>
                   <p style={{ margin: 0 }}>
-                    Last Close: ${Number(quote.last_close).toFixed(2)}
+                    Last Close: $
+                    {Number(
+                      quote.last_close
+                    ).toFixed(2)}
                   </p>
                   <p
                     style={{
-                      margin: "2px 0",
-                      display: "flex",
-                      alignItems: "baseline",
+                      margin:
+                        "2px 0",
+                      display:
+                        "flex",
+                      alignItems:
+                        "baseline",
                       gap: 6,
                     }}
                   >
                     <span
                       style={{
-                        fontSize: "1.3em",
+                        fontSize:
+                          "1.3em",
                         fontWeight: 600,
                       }}
                     >
-                      ${tweenPrice.toFixed(2)}
+                      $
+                      {tweenPrice.toFixed(
+                        2
+                      )}
                     </span>
-                    {Number.isFinite(pctToShow) && (
+                    {Number.isFinite(
+                      pctToShow
+                    ) && (
                       <span
                         style={{
-                          color: pctToShow >= 0 ? "#2e7d32" : "#c62828",
+                          color:
+                            pctToShow >=
+                            0
+                              ? "#2e7d32"
+                              : "#c62828",
                           fontWeight: 600,
-                          display: "inline-flex",
-                          alignItems: "center",
+                          display:
+                            "inline-flex",
+                          alignItems:
+                            "center",
                           gap: 4,
-                          fontSize: "0.9em",
+                          fontSize:
+                            "0.9em",
                         }}
                         aria-label={`${
-                          pctToShow >= 0 ? "Up" : "Down"
-                        } ${Math.abs(pctToShow).toFixed(2)} percent`}
+                          pctToShow >=
+                          0
+                            ? "Up"
+                            : "Down"
+                        } ${Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )} percent`}
                         title={`${
-                          pctToShow >= 0 ? "Up" : "Down"
-                        } ${Math.abs(pctToShow).toFixed(2)}%`}
+                          pctToShow >=
+                          0
+                            ? "Up"
+                            : "Down"
+                        } ${Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )}%`}
                       >
-                        {pctToShow >= 0 ? "▲" : "▼"} {Number(absToShow).toFixed(2)} (
-                        {Math.abs(pctToShow).toFixed(2)}%)
+                        {pctToShow >=
+                        0
+                          ? "▲"
+                          : "▼"}{" "}
+                        {Number(
+                          absToShow
+                        ).toFixed(
+                          2
+                        )}{" "}
+                        (
+                        {Math.abs(
+                          pctToShow
+                        ).toFixed(
+                          2
+                        )}
+                        %)
                       </span>
                     )}
                   </p>
 
                   {/* mini chart */}
-                  <div style={{ marginTop: 6 }}>
-                    {closes.length >= 2 ? (
+                  <div
+                    style={{
+                      marginTop: 6,
+                    }}
+                  >
+                    {closes.length >=
+                    2 ? (
                       <div
                         style={{
                           borderRadius: 10,
-                          overflow: "hidden",
+                          overflow:
+                            "hidden",
                         }}
                       >
                         <InteractivePriceChart
-                          data={closes}
-                          labels={closeDates}
-                          width={320}
-                          height={80}
+                          data={
+                            closes
+                          }
+                          labels={
+                            closeDates
+                          }
+                          width={
+                            320
+                          }
+                          height={
+                            80
+                          }
                         />
                       </div>
                     ) : (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        no chart data
+                      <div
+                        className="muted"
+                        style={{
+                          fontSize: 12,
+                        }}
+                      >
+                        no chart
+                        data
                       </div>
                     )}
                   </div>
-                  {closes.length >= 2 && (
+                  {closes.length >=
+                    2 && (
                     <div
                       className="muted"
                       style={{
@@ -1116,12 +1290,22 @@ export default function App() {
                         marginTop: 4,
                       }}
                     >
-                      drag to pan • wheel to zoom • double-click to reset
+                      drag to
+                      pan •
+                      wheel to
+                      zoom •
+                      double-click
+                      to reset
                     </div>
                   )}
                 </>
               ) : (
-                <p className="muted" style={{ margin: 0 }}>
+                <p
+                  className="muted"
+                  style={{
+                    margin: 0,
+                  }}
+                >
                   N/A
                 </p>
               )}
@@ -1135,7 +1319,11 @@ export default function App() {
                 flex: "1 1 300px",
               }}
             >
-              <EarningsCard earnings={earnings} />
+              <EarningsCard
+                earnings={
+                  earnings
+                }
+              />
             </div>
 
             {/* Recommendation */}
@@ -1146,20 +1334,51 @@ export default function App() {
                 flex: "1 1 300px",
               }}
             >
-              <RecommendationCard recommendation={recommendation} />
+              <SectionHeader
+                title="📈 Recommendation"
+                infoText={
+                  "We look at all models, pick the one with the lowest error, and read its average short-term move. >1% up = Buy, between -1% and +1% = Hold, < -1% = Sell."
+                }
+              />
+              <RecommendationCard
+                recommendation={
+                  recommendation
+                }
+              />
             </div>
           </div>
+          {/* END top row */}
 
           {/* Market snapshot */}
           {market && (
             <div className="card">
-              <MarketCard market={market} />
+              <SectionHeader
+                title="📊 Market Snapshot"
+                infoText={
+                  "SPY = overall market. XLK = tech. XLF = financials. VIX is 'fear/volatility' (higher = more nervous market). TNX is the 10-year Treasury yield, which pushes borrowing costs up or down."
+                }
+              />
+              <MarketCard
+                market={market}
+              />
             </div>
           )}
 
           {/* sentiment */}
-          <div className="card" style={{ marginTop: 12 }}>
-            <SentimentOverlay ticker={ticker} days={120} />
+          <div
+            className="card"
+            style={{ marginTop: 12 }}
+          >
+            <SectionHeader
+              title={`📰 Sentiment vs Price — ${ticker}`}
+              infoText={
+                "We measure how positive/negative recent headlines and chatter are, then compare that to the stock’s price. Pearson r shows how tightly they move together: +1 = same direction, 0 = no link, -1 = opposite."
+              }
+            />
+            <SentimentOverlay
+              ticker={ticker}
+              days={120}
+            />
           </div>
 
           {/* model metrics */}
@@ -1171,105 +1390,215 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <MetricsList metrics={metrics} />
+              <SectionHeader
+                title="📊 Model Metrics"
+                infoText={
+                  "Proxy-MAPE is the model’s average error vs the latest price (lower = better). avg Δ is how far the model expects the stock to move in the near term, in %."
+                }
+              />
+              <MetricsList
+                metrics={
+                  metrics
+                }
+              />
             </div>
           )}
 
           {/* Actual vs Predicted */}
-          {results.length > 0 && pastLabels.length > 0 && (
-            <div className="card" style={{ marginTop: 12 }}>
-              <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
-
+          {results.length > 0 &&
+            pastLabels.length >
+              0 && (
               <div
+                className="card"
                 style={{
-                  height: 260,
-                  borderRadius: 12,
-                  overflow: "hidden",
-                  background: "rgba(255,255,255,0.03)",
-                  padding: 8,
+                  marginTop: 12,
                 }}
               >
-                <Chart type="line" data={avpChartData} options={avpChartOptions} />
-              </div>
+                <SectionHeader
+                  title="Actual vs. Predicted"
+                  infoText={
+                    "Past rows = model backtests (what it ‘would have said’). Future rows = the live forecast. We rescale backtests if needed so they line up with the real price scale."
+                  }
+                />
 
-              <div className="table-wrap" style={{ marginTop: 12 }}>
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th style={{ whiteSpace: "nowrap" }}>Date</th>
-                      <th>Actual</th>
-                      {results.map((r) => (
-                        <th key={r.model}>
-                          {r.model}
-                          <span
-                            className="muted"
-                            style={{
-                              fontSize: 11,
-                              display: "block",
-                            }}
-                          >
-                            <em>past: backtest • future: current</em>
-                          </span>
+                <div
+                  style={{
+                    height: 260,
+                    borderRadius: 12,
+                    overflow:
+                      "hidden",
+                    background:
+                      "rgba(255,255,255,0.03)",
+                    padding: 8,
+                  }}
+                >
+                  <Chart
+                    type="line"
+                    data={
+                      avpChartData
+                    }
+                    options={
+                      avpChartOptions
+                    }
+                  />
+                </div>
+
+                <div
+                  className="table-wrap"
+                  style={{
+                    marginTop: 12,
+                  }}
+                >
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th
+                          style={{
+                            whiteSpace:
+                              "nowrap",
+                          }}
+                        >
+                          Date
                         </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...pastRows, ...futureRows].map((row, i) => (
-                      <tr key={`${row.kind}-${row.date || i}`}>
-                        <td>
-                          {row.date
-                            ? row.kind === "future"
-                              ? `${row.date} (+${i - pastRows.length + 1}d)`
-                              : row.date
-                            : ""}
-                        </td>
-                        <td>
-                          {row.actual != null
-                            ? Number(row.actual).toFixed(2)
-                            : "—"}
-                        </td>
-                        {row.perModel.map((v, j) => (
-                          <td key={j}>
-                            {v != null ? Number(v).toFixed(2) : "—"}
-                          </td>
-                        ))}
+                        <th>
+                          Actual
+                        </th>
+                        {results.map(
+                          (
+                            r
+                          ) => (
+                            <th
+                              key={
+                                r.model
+                              }
+                            >
+                              {
+                                r.model
+                              }
+                              <span
+                                className="muted"
+                                style={{
+                                  fontSize: 11,
+                                  display:
+                                    "block",
+                                }}
+                              >
+                                <em>
+                                  past:
+                                  backtest
+                                  •
+                                  future:
+                                  current
+                                </em>
+                              </span>
+                            </th>
+                          )
+                        )}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {[
+                        ...pastRows,
+                        ...futureRows,
+                      ].map(
+                        (
+                          row,
+                          i
+                        ) => (
+                          <tr
+                            key={`${
+                              row.kind
+                            }-${
+                              row.date ||
+                              i
+                            }`}
+                          >
+                            <td>
+                              {row.date
+                                ? row.kind ===
+                                  "future"
+                                  ? `${row.date} (+${
+                                      i -
+                                      pastRows.length +
+                                      1
+                                    }d)`
+                                  : row.date
+                                : ""}
+                            </td>
+                            <td>
+                              {row.actual !=
+                              null
+                                ? Number(
+                                    row.actual
+                                  ).toFixed(
+                                    2
+                                  )
+                                : "—"}
+                            </td>
+                            {row.perModel.map(
+                              (
+                                v,
+                                j
+                              ) => (
+                                <td
+                                  key={
+                                    j
+                                  }
+                                >
+                                  {v !=
+                                  null
+                                    ? Number(
+                                        v
+                                      ).toFixed(
+                                        2
+                                      )
+                                    : "—"}
+                                </td>
+                              )
+                            )}
+                          </tr>
+                        )
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-              {!!diagnostic && (
-                <div
-                  className="muted"
-                  style={{
-                    fontSize: 11,
-                    marginTop: 6,
-                  }}
-                >
-                  Note: {diagnostic}
-                </div>
-              )}
-              {!!harmonizeNote && (
-                <div
-                  className="muted"
-                  style={{
-                    fontSize: 11,
-                    marginTop: 4,
-                  }}
-                >
-                  {harmonizeNote}
-                </div>
-              )}
-            </div>
-          )}
+                {!!diagnostic && (
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 11,
+                      marginTop: 6,
+                    }}
+                  >
+                    Note:{" "}
+                    {
+                      diagnostic
+                    }
+                  </div>
+                )}
+                {!!harmonizeNote && (
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 11,
+                      marginTop: 4,
+                    }}
+                  >
+                    {
+                      harmonizeNote
+                    }
+                  </div>
+                )}
+              </div>
+            )}
 
           {diagnostic && (
             <div
               className="card"
               style={{
-                borderLeft: "4px solid #a8b2ff",
+                borderLeft:
+                  "4px solid #a8b2ff",
                 marginTop: 8,
               }}
             >
@@ -1284,7 +1613,8 @@ export default function App() {
               <div
                 className="muted"
                 style={{
-                  whiteSpace: "pre-wrap",
+                  whiteSpace:
+                    "pre-wrap",
                 }}
               >
                 {diagnostic}
@@ -1293,8 +1623,13 @@ export default function App() {
           )}
 
           {error && (
-            <p style={{ color: "red" }}>
-              Prediction Error: {error}
+            <p
+              style={{
+                color: "red",
+              }}
+            >
+              Prediction Error:{" "}
+              {error}
             </p>
           )}
 
@@ -1307,11 +1642,22 @@ export default function App() {
             }}
           >
             {MODEL_OPTIONS.map((m) => (
-              <label key={m} style={{ marginRight: 12 }}>
+              <label
+                key={m}
+                style={{
+                  marginRight: 12,
+                }}
+              >
                 <input
                   type="checkbox"
-                  checked={models.includes(m)}
-                  onChange={() => toggleModel(m)}
+                  checked={models.includes(
+                    m
+                  )}
+                  onChange={() =>
+                    toggleModel(
+                      m
+                    )
+                  }
                 />{" "}
                 {m}
               </label>
@@ -1319,40 +1665,89 @@ export default function App() {
           </div>
 
           {/* forecast table */}
-          {results.length > 0 && (
+          {results.length >
+            0 && (
             <div className="card table-card">
               <div className="table-wrap">
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>Model</th>
-                      {results[0].predictions.map((_, i) => (
-                        <th key={i}>{`+${i + 1}d`}</th>
-                      ))}
+                      <th>
+                        Model
+                      </th>
+                      {results[0].predictions.map(
+                        (
+                          _,
+                          i
+                        ) => (
+                          <th
+                            key={
+                              i
+                            }
+                          >{`+${i + 1}d`}</th>
+                        )
+                      )}
                     </tr>
                   </thead>
                   <tbody>
-                    {results.map(({ model, predictions, confidence }) => (
-                      <tr key={model}>
-                        <td>{model}</td>
-                        {predictions.map((val, i) => (
-                          <td key={i}>
-                            {Number(val).toFixed(2)}
-                            {Array.isArray(confidence) &&
-                              confidence[i] != null && (
-                                <div
-                                  className="muted"
-                                  style={{
-                                    fontSize: 11,
-                                  }}
-                                >
-                                  conf {Number(confidence[i]).toFixed(2)}
-                                </div>
-                              )}
+                    {results.map(
+                      ({
+                        model,
+                        predictions,
+                        confidence,
+                      }) => (
+                        <tr
+                          key={
+                            model
+                          }
+                        >
+                          <td>
+                            {model}
                           </td>
-                        ))}
-                      </tr>
-                    ))}
+                          {predictions.map(
+                            (
+                              val,
+                              i
+                            ) => (
+                              <td
+                                key={
+                                  i
+                                }
+                              >
+                                {Number(
+                                  val
+                                ).toFixed(
+                                  2
+                                )}
+                                {Array.isArray(
+                                  confidence
+                                ) &&
+                                  confidence[
+                                    i
+                                  ] !=
+                                    null && (
+                                    <div
+                                      className="muted"
+                                      style={{
+                                        fontSize: 11,
+                                      }}
+                                    >
+                                      conf{" "}
+                                      {Number(
+                                        confidence[
+                                          i
+                                        ]
+                                      ).toFixed(
+                                        2
+                                      )}
+                                    </div>
+                                  )}
+                              </td>
+                            )
+                          )}
+                        </tr>
+                      )
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -1361,10 +1756,14 @@ export default function App() {
                   className="muted"
                   style={{
                     fontSize: 11,
-                    padding: "6px 12px 10px",
+                    padding:
+                      "6px 12px 10px",
                   }}
                 >
-                  Note: {diagnostic}
+                  Note:{" "}
+                  {
+                    diagnostic
+                  }
                 </div>
               )}
             </div>
@@ -1376,7 +1775,9 @@ export default function App() {
       {showBigPriceChart && (
         <MagnifyModal
           title={`${ticker} • Price`}
-          onClose={() => setShowBigPriceChart(false)}
+          onClose={() =>
+            setShowBigPriceChart(false)
+          }
         >
           <div
             style={{
@@ -1396,7 +1797,12 @@ export default function App() {
       )}
 
       {/* Auth modal */}
-      <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
+      <AuthModal
+        open={showAuth && !user}
+        onClose={() =>
+          setShowAuth(false)
+        }
+      />
     </div>
   );
 }
@@ -1439,7 +1845,10 @@ function InteractivePriceChart({
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
   const vStart = clamp(view.start, 0, data.length - 2);
-  const vEnd = clamp(view.end, vStart + 1, data.length - 1);
+  theVEnd: {
+  }
+  const vEnd = clamp(vStart + 1, vStart + 1, data.length - 1);
+
   const windowData = data.slice(vStart, vEnd + 1);
 
   const min = Math.min(...windowData);
@@ -1452,7 +1861,8 @@ function InteractivePriceChart({
     const t = clamp((x - pad) / w, 0, 1);
     return Math.round(vStart + t * (vEnd - vStart));
   };
-  const yForVal = (v) => pad + h - ((v - min) / range) * h;
+  const yForVal = (v) =>
+    pad + h - ((v - min) / range) * h;
 
   const points = windowData
     .map((v, k) => {
@@ -1461,20 +1871,25 @@ function InteractivePriceChart({
     })
     .join(" ");
 
-  const lastUp = windowData[windowData.length - 1] >= windowData[0];
+  const lastUp =
+    windowData[windowData.length - 1] >=
+    windowData[0];
 
   const onMove = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect =
+      e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     setCursorX(clamp(x, pad, pad + w));
     setHoverIdx(idxForX(x));
     if (drag) {
       const dx = x - drag.startX;
-      theDragHandler: {
-      }
       const frac = dx / w;
-      const windowSize = drag.startView.end - drag.startView.start;
-      let newStart = drag.startView.start - Math.round(frac * windowSize);
+      const windowSize =
+        drag.startView.end -
+        drag.startView.start;
+      let newStart =
+        drag.startView.start -
+        Math.round(frac * windowSize);
       let newEnd = newStart + windowSize;
       if (newStart < 0) {
         newStart = 0;
@@ -1497,7 +1912,8 @@ function InteractivePriceChart({
     setDrag(null);
   };
   const onDown = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect =
+      e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     setDrag({
       startX: x,
@@ -1508,19 +1924,37 @@ function InteractivePriceChart({
 
   const onWheel = (e) => {
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = clamp(e.clientX - rect.left, pad, pad + w);
+    const rect =
+      e.currentTarget.getBoundingClientRect();
+    const x = clamp(
+      e.clientX - rect.left,
+      pad,
+      pad + w
+    );
     const focusIdx = idxForX(x);
 
     const windowSize = vEnd - vStart;
     const delta = Math.sign(e.deltaY); // 1 = zoom out, -1 = zoom in
-    const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
-    let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
-    newSize = Math.max(5, Math.min(newSize, data.length - 1));
+    const zoomStep = Math.max(
+      1,
+      Math.round(windowSize * 0.15)
+    );
+    let newSize =
+      delta < 0
+        ? windowSize - zoomStep
+        : windowSize + zoomStep;
+    newSize = Math.max(
+      5,
+      Math.min(newSize, data.length - 1)
+    );
 
     let newStart =
       focusIdx -
-      Math.round(((focusIdx - vStart) * newSize) / windowSize);
+      Math.round(
+        ((focusIdx - vStart) *
+          newSize) /
+          windowSize
+      );
     let newEnd = newStart + newSize;
 
     if (newStart < 0) {
@@ -1544,31 +1978,51 @@ function InteractivePriceChart({
       end: data.length - 1,
     });
 
-  const showIdx = clamp(hoverIdx ?? vEnd, 0, data.length - 1);
+  const showIdx = clamp(
+    hoverIdx ?? vEnd,
+    0,
+    data.length - 1
+  );
   const showVal = data[showIdx];
   const showX = xForIndex(showIdx);
   const showY = yForVal(showVal);
 
   let label;
-  if (Array.isArray(labels) && labels.length === data.length) {
+  if (
+    Array.isArray(labels) &&
+    labels.length === data.length
+  ) {
     const d = labels[showIdx];
     try {
       const dt = asLocalDate(d);
-      label = dt.toLocaleDateString(undefined, {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-      });
+      label = dt.toLocaleDateString(
+        undefined,
+        {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        }
+      );
     } catch {
       label = String(d);
     }
   } else {
-    const rel = data.length - 1 - showIdx; // 0=latest
-    label = rel === 0 ? "latest" : `t-${rel}d`;
+    const rel =
+      data.length - 1 - showIdx; // 0=latest
+    label =
+      rel === 0
+        ? "latest"
+        : `t-${rel}d`;
   }
 
-  const textW = Math.min(200, 72 + String(label).length * 6);
-  const boxX = Math.min(showX + 8, width - (textW + 10));
+  const textW = Math.min(
+    200,
+    72 + String(label).length * 6
+  );
+  const boxX = Math.min(
+    showX + 8,
+    width - (textW + 10)
+  );
   const boxY = Math.max(showY - 26, 2);
 
   return (
@@ -1576,8 +2030,11 @@ function InteractivePriceChart({
       width={width}
       height={height}
       style={{
-        cursor: drag ? "grabbing" : "crosshair",
-        background: "transparent",
+        cursor: drag
+          ? "grabbing"
+          : "crosshair",
+        background:
+          "transparent",
         borderRadius: 8,
         display: "block",
         maxWidth: "100%",
@@ -1600,8 +2057,14 @@ function InteractivePriceChart({
       />
       <polyline
         fill="none"
-        stroke={lastUp ? "#2e7d32" : "#c62828"}
-        strokeWidth={big ? 2.5 : 2}
+        stroke={
+          lastUp
+            ? "#2e7d32"
+            : "#c62828"
+        }
+        strokeWidth={
+          big ? 2.5 : 2
+        }
         points={points}
       />
       {cursorX != null && (
@@ -1610,28 +2073,59 @@ function InteractivePriceChart({
             x1={showX}
             x2={showX}
             y1={10}
-            y2={height - 10}
+            y2={
+              height -
+              10
+            }
             stroke="#a8b2ff"
             strokeDasharray="3,3"
           />
-          <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
+          <circle
+            cx={showX}
+            cy={showY}
+            r={
+              big
+                ? 4
+                : 3
+            }
+            fill="#a8b2ff"
+          />
           <g>
             <rect
               x={boxX}
               y={boxY}
-              width={textW}
+              width={
+                textW
+              }
               height="22"
               rx="6"
               fill="rgba(0,0,0,0.65)"
               stroke="rgba(255,255,255,0.25)"
             />
             <text
-              x={boxX + 10}
-              y={boxY + 15}
-              fontSize={big ? 12 : 11}
+              x={
+                boxX +
+                10
+              }
+              y={
+                boxY +
+                15
+              }
+              fontSize={
+                big
+                  ? 12
+                  : 11
+              }
               fill="#fff"
             >
-              ${Number(showVal).toFixed(2)} • {label}
+              $
+              {Number(
+                showVal
+              ).toFixed(
+                2
+              )}{" "}
+              •{" "}
+              {label}
             </text>
           </g>
         </>
@@ -1646,8 +2140,10 @@ function MagnifyModal({ title, children, onClose }) {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.6)",
-        backdropFilter: "blur(2px)",
+        background:
+          "rgba(0,0,0,0.6)",
+        backdropFilter:
+          "blur(2px)",
         zIndex: 9999,
         display: "flex",
         alignItems: "center",
@@ -1659,21 +2155,40 @@ function MagnifyModal({ title, children, onClose }) {
       <div
         className="card"
         style={{
-          width: "min(95vw, 1000px)",
+          width:
+            "min(95vw, 1000px)",
           padding: 16,
         }}
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) =>
+          e.stopPropagation()
+        }
       >
         <div
           className="row"
           style={{
-            justifyContent: "space-between",
-            alignItems: "center",
+            justifyContent:
+              "space-between",
+            alignItems:
+              "center",
           }}
         >
-          <h3 style={{ margin: 0 }}>{title}</h3>
-          <div className="row" style={{ gap: 8 }}>
-            <button className="btn ghost" onClick={onClose}>
+          <h3
+            style={{
+              margin: 0,
+            }}
+          >
+            {title}
+          </h3>
+          <div
+            className="row"
+            style={{
+              gap: 8,
+            }}
+          >
+            <button
+              className="btn ghost"
+              onClick={onClose}
+            >
               Close
             </button>
           </div>
@@ -1685,9 +2200,19 @@ function MagnifyModal({ title, children, onClose }) {
             marginTop: 6,
           }}
         >
-          Tip: drag to pan • wheel to zoom • double-click to reset
+          Tip: drag to
+          pan • wheel
+          to zoom •
+          double-click
+          to reset
         </div>
-        <div style={{ marginTop: 12 }}>{children}</div>
+        <div
+          style={{
+            marginTop: 12,
+          }}
+        >
+          {children}
+        </div>
       </div>
     </div>
   );
