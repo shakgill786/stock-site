@@ -123,10 +123,7 @@ function dropDupTailHistory(rows = []) {
   // --- Step 1: drop last row if it's clearly a split-scale mismatch
   if (Number.isFinite(lastA) && Number.isFinite(prevA) && prevA !== 0) {
     const ratio = Math.abs(lastA / prevA);
-    if (
-      ratio > SPLIT_RATIO_THRESHOLD ||
-      ratio < 1 / SPLIT_RATIO_THRESHOLD
-    ) {
+    if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
       arr.pop(); // remove the problematic last row
     }
   }
@@ -236,8 +233,6 @@ export default function App() {
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
   // Compare Mode
-  theCompareMode: {
-  }
   const [compareOpen, setCompareOpen] = useState(false);
   const [compareSymbols, setCompareSymbols] = useState([]);
 
@@ -284,9 +279,7 @@ export default function App() {
     const handler = (e) => {
       const sym = String(e?.detail || "").toUpperCase().trim();
       if (sym) setTicker(sym);
-      requestAnimationFrame(() =>
-        requestAnimationFrame(scrollMainInfoNow)
-      );
+      requestAnimationFrame(() => requestAnimationFrame(scrollMainInfoNow));
     };
     window.addEventListener("ticker:set", handler);
     return () => window.removeEventListener("ticker:set", handler);
@@ -355,6 +348,22 @@ export default function App() {
     () => (historyRows || []).map((r) => dkey(r.date)),
     [historyRows]
   );
+
+  // ---- OPTION A merge logic ----
+  // We extend the known "past" timeline with any newer closeDates
+  // so yesterday shows up as actual history instead of "+1d".
+  const extendedDates = useMemo(() => {
+    if (!histDates.length) {
+      // no predict_history? just fall back to prices timeline
+      return closeDates;
+    }
+    const lastHist = histDates[histDates.length - 1]; // latest date in predict_history
+    // take any closeDates strictly AFTER the lastHist date
+    const tailFromCloses = closeDates.filter(
+      (d) => d > lastHist && !histDates.includes(d)
+    );
+    return [...histDates, ...tailFromCloses];
+  }, [histDates, closeDates]);
 
   const loadData = useCallback(async () => {
     const myVer = ++reqVer.current;
@@ -620,16 +629,16 @@ export default function App() {
   const horizon = results?.[0]?.predictions?.length || 0;
   const pastDaysToShow = 10;
 
-  // Prefer historyRows dates if we have them
-  const basePast = (histDates.length ? histDates : closeDates).slice(
-    -pastDaysToShow
-  );
+  // Use extendedDates (history + any newer closeDates) trimmed to last N days.
+  const basePast = extendedDates.slice(-pastDaysToShow);
   const pastLabels = basePast;
 
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : null;
 
+  // future starts strictly AFTER the last historical date we know,
+  // which can now include "yesterday" from closes[]
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
@@ -639,21 +648,14 @@ export default function App() {
   const chartLabels = [...pastLabels, ...futureLabels];
 
   // For each past date:
-  //  - Use predict_history.actual if available
-  //  - ELSE (non-final rows only) fall back to closes[]
-  //  - For the freshest row, if hist didn't give actual, return null
-  //    (avoid stitching post-split prices into pre-split scale)
-  const actualForPastLabels = pastLabels.map((iso, idx) => {
+  // 1. Use predict_history.actual if available
+  // 2. Else fall back to close price for that exact date
+  const actualForPastLabels = pastLabels.map((iso) => {
     const dkIso = dkey(iso);
     const h = histByDate[dkIso];
-
-    if (Number.isFinite(h?.actual)) return h.actual;
-
-    const isLast = idx === pastLabels.length - 1;
-    if (isLast) {
-      return null;
+    if (Number.isFinite(h?.actual)) {
+      return h.actual;
     }
-
     const idxClose = closeDates.lastIndexOf(iso);
     if (idxClose >= 0 && Number.isFinite(closes[idxClose])) {
       return closes[idxClose];
@@ -831,19 +833,21 @@ export default function App() {
     },
   };
 
-  // Build table rows using same "don't inject mismatch tail" rule
-  const pastRows = pastLabels.map((iso, idx) => {
+  // Build table rows for display
+  const pastRows = pastLabels.map((iso) => {
     const dkIso = dkey(iso);
     const hist = histByDate[dkIso];
 
-    const isLast = idx === pastLabels.length - 1;
-    const idxClose = closeDates.lastIndexOf(iso);
-
-    const actualHere = Number.isFinite(hist?.actual)
-      ? hist.actual
-      : !isLast && idxClose >= 0 && Number.isFinite(closes[idxClose])
-      ? closes[idxClose]
-      : null;
+    // same fallback logic as actualForPastLabels
+    let actualHere = null;
+    if (Number.isFinite(hist?.actual)) {
+      actualHere = hist.actual;
+    } else {
+      const idxClose = closeDates.lastIndexOf(iso);
+      if (idxClose >= 0 && Number.isFinite(closes[idxClose])) {
+        actualHere = closes[idxClose];
+      }
+    }
 
     const perModel = results.map((r) => {
       const v = histPred?.[dkIso]?.[normModel(r.model)];
@@ -879,9 +883,7 @@ export default function App() {
       <div className="hero-wrap">
         <div className="hero hero--center">
           <div>
-            <h1 className="hero-title">
-              Real-Time Stock & Crypto Dashboard
-            </h1>
+            <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
             <p className="hero-sub">
               Live quotes • Movers • This week’s earnings
             </p>
@@ -1293,9 +1295,7 @@ export default function App() {
           )}
 
           {error && (
-            <p style={{ color: "red" }}>
-              Prediction Error: {error}
-            </p>
+            <p style={{ color: "red" }}>Prediction Error: {error}</p>
           )}
 
           {/* model selector */}
@@ -1446,8 +1446,7 @@ function InteractivePriceChart({
   const max = Math.max(...windowData);
   const range = max - min || 1;
 
-  const xForIndex = (i) =>
-    pad + (w * (i - vStart)) / (vEnd - vStart);
+  const xForIndex = (i) => pad + (w * (i - vStart)) / (vEnd - vStart);
   const idxForX = (x) => {
     const t = clamp((x - pad) / w, 0, 1);
     return Math.round(vStart + t * (vEnd - vStart));
@@ -1470,8 +1469,6 @@ function InteractivePriceChart({
     setHoverIdx(idxForX(x));
     if (drag) {
       const dx = x - drag.startX;
-      theDragHandler: {
-      }
       const frac = dx / w;
       const windowSize = drag.startView.end - drag.startView.start;
       let newStart = drag.startView.start - Math.round(frac * windowSize);
