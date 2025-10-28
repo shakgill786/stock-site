@@ -161,23 +161,42 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
     return { dates: [], closes: [] };
   }
 
-  const n = outCloses.length;
-  const providerLastRaw = outCloses[n - 1];
+  const providerLastRaw = outCloses[outCloses.length - 1]; // last price from history API
   const quoteLast = Number(quote?.last_close);
+  const quoteCurr = Number(quote?.current_price);
 
-  if (
-    Number.isFinite(quoteLast) &&
-    quoteLast > 0 &&
-    Number.isFinite(providerLastRaw) &&
-    providerLastRaw > 0
-  ) {
+  const haveProvider = Number.isFinite(providerLastRaw) && providerLastRaw > 0;
+  const haveQuoteLast = Number.isFinite(quoteLast) && quoteLast > 0;
+
+  if (haveProvider && haveQuoteLast) {
     const ratio = quoteLast / providerLastRaw;
-    if (Math.abs(1 - ratio) > 0.08) {
-      // full-series scale if provider is clearly on wrong basis
-      outCloses = outCloses.map((v) => v * ratio);
+
+    // flag: is "last_close" basically just today's live price?
+    const looksLikeNow =
+      Number.isFinite(quoteCurr) &&
+      Math.abs(quoteCurr - quoteLast) /
+        (Math.abs(quoteLast) || 1) <
+        0.02; // <2% off live = sus
+
+    // decide if we are in "obvious split world"
+    // only scale if it's a BIG jump (ex: 2x, 10x, 0.5x, etc)
+    const bigMismatch = ratio > 1.25 || ratio < 0.8;
+
+    if (!looksLikeNow && bigMismatch) {
+      // ok, probably a split / different share class basis
+      let scaled = outCloses.map((v) =>
+        Number.isFinite(v) ? v * ratio : v
+      );
+
+      // pin final data point exactly to quote's last_close
+      scaled[scaled.length - 1] = quoteLast;
+
+      outCloses = scaled;
+    } else {
+      // mild mismatch or sketchy "last_close" -> trust the historical vendor,
+      // DON'T rescale the whole series
+      // (leave outCloses as-is)
     }
-    // always pin last item exactly to the quote
-    outCloses[n - 1] = quoteLast;
   }
 
   const dropped = dropDupTailSeries(outDates, outCloses);
