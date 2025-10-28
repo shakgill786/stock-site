@@ -49,14 +49,18 @@ ChartJS.register(
 
 const MODEL_OPTIONS = ["LSTM", "ARIMA", "RandomForest", "XGBoost"];
 
-// ----- Date helpers -----
+/* =========================
+   Date + math helpers
+   ========================= */
 const asLocalDate = (iso) => new Date(`${String(iso).slice(0, 10)}T00:00:00`);
+
 const fmtLocalISO = (dt) => {
   const y = dt.getFullYear();
   const m = String(dt.getMonth() + 1).padStart(2, "0");
   const d = String(dt.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 };
+
 const addBusinessDays = (start, n) => {
   const dt = start instanceof Date ? new Date(start) : asLocalDate(start);
   let added = 0;
@@ -71,19 +75,19 @@ const addBusinessDays = (start, n) => {
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
-// --- numeric helpers
 const toNum = (x) => (Number.isFinite(+x) ? +x : null);
+
 const safePct = (curr, prev) =>
   Number.isFinite(curr) && Number.isFinite(prev) && prev !== 0
     ? ((curr - prev) / prev) * 100
     : null;
 
-// --- split detection threshold for predict_history tail cleanup ---
-// If the last "actual" is more than 2x or less than 1/2 of the previous row,
-// assume vendor glued post-split data onto pre-split history (or vice versa).
+/* =========================
+   Tail cleanup helpers
+   ========================= */
 const SPLIT_RATIO_THRESHOLD = 2.0;
 
-/** ===== tail de-dupe helpers ===== */
+// Dedupe if vendor duplicated last value across 2 dates
 const dropDupTailSeries = (dates = [], closes = []) => {
   const n = Math.min(dates.length, closes.length);
   if (n >= 2) {
@@ -100,15 +104,12 @@ const dropDupTailSeries = (dates = [], closes = []) => {
   return { dates, closes, dropped: false };
 };
 
-// Clean up weird tail rows in predict_history
-// 1. Kill obvious split/scale jump on the last row
-// 2. Then remove duplicate last-price rows across 2 different dates
+// Clean weird tail rows in predict_history
 function dropDupTailHistory(rows = []) {
   const arr = Array.isArray(rows) ? [...rows] : [];
   const n = arr.length;
   if (n < 2) return arr;
 
-  // helper: numeric "actual" for a row
   const getActual = (row) => {
     const a = Number(row?.actual);
     if (Number.isFinite(a)) return a;
@@ -120,15 +121,15 @@ function dropDupTailHistory(rows = []) {
   const lastA = getActual(arr[n - 1]);
   const prevA = getActual(arr[n - 2]);
 
-  // --- Step 1: drop last row if it's clearly a split-scale mismatch
+  // Step 1: kill obvious split-scale mismatch on last row
   if (Number.isFinite(lastA) && Number.isFinite(prevA) && prevA !== 0) {
     const ratio = Math.abs(lastA / prevA);
     if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
-      arr.pop(); // remove the problematic last row
+      arr.pop();
     }
   }
 
-  // --- Step 2: after possible pop(), do the duplicate-last-price cleanup
+  // Step 2: drop duplicate price across 2 different dates at tail
   const m = arr.length;
   if (m >= 2) {
     const aVal = getActual(arr[m - 1]);
@@ -136,7 +137,6 @@ function dropDupTailHistory(rows = []) {
     const dA = String(arr[m - 1]?.date || "");
     const dB = String(arr[m - 2]?.date || "");
 
-    // if vendor duplicated same price across two different date stamps, drop newest dup
     if (
       dA !== dB &&
       Number.isFinite(aVal) &&
@@ -150,7 +150,12 @@ function dropDupTailHistory(rows = []) {
   return arr;
 }
 
-// align closes vs quote.last_close if there’s a big split-style mismatch
+/* =========================
+   Price-series sanitizing
+   ========================= */
+// We try not to nuke the entire series scale unless it's super obviously split.
+// We DO NOT blindly pin the last element to quote.last_close anymore if
+// quote.last_close looks like today's live price.
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
   let outCloses = Array.isArray(closes)
@@ -161,7 +166,7 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
     return { dates: [], closes: [] };
   }
 
-  const providerLastRaw = outCloses[outCloses.length - 1]; // last price from history API
+  const providerLastRaw = outCloses[outCloses.length - 1]; // last price from vendor history
   const quoteLast = Number(quote?.last_close);
   const quoteCurr = Number(quote?.current_price);
 
@@ -171,39 +176,36 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   if (haveProvider && haveQuoteLast) {
     const ratio = quoteLast / providerLastRaw;
 
-    // flag: is "last_close" basically just today's live price?
+    // is "last_close" basically just today's live price => probably not settled yet
     const looksLikeNow =
       Number.isFinite(quoteCurr) &&
-      Math.abs(quoteCurr - quoteLast) /
-        (Math.abs(quoteLast) || 1) <
-        0.02; // <2% off live = sus
+      Math.abs(quoteCurr - quoteLast) / (Math.abs(quoteLast) || 1) < 0.02;
 
-    // decide if we are in "obvious split world"
-    // only scale if it's a BIG jump (ex: 2x, 10x, 0.5x, etc)
+    // only treat as split if it's a huge mismatch
     const bigMismatch = ratio > 1.25 || ratio < 0.8;
 
     if (!looksLikeNow && bigMismatch) {
-      // ok, probably a split / different share class basis
+      // large scale gap → treat like split, scale whole series
       let scaled = outCloses.map((v) =>
         Number.isFinite(v) ? v * ratio : v
       );
-
-      // pin final data point exactly to quote's last_close
+      // and force the tail to equal quoteLast
       scaled[scaled.length - 1] = quoteLast;
-
       outCloses = scaled;
     } else {
-      // mild mismatch or sketchy "last_close" -> trust the historical vendor,
-      // DON'T rescale the whole series
-      // (leave outCloses as-is)
+      // mild mismatch or quoteLast is sketchy:
+      // leave vendor series as-is
     }
   }
 
+  // drop duplicate last rows if vendor glued same price to 2 dates
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
 }
 
-/* ---------- scroll helpers ---------- */
+/* =========================
+   scroll helpers
+   ========================= */
 function getScrollableAncestor(el) {
   let node = el?.parentElement;
   while (node) {
@@ -244,6 +246,9 @@ function scrollMainInfoNow() {
   }
 }
 
+/* =========================
+   App Component
+   ========================= */
 export default function App() {
   const { user, logout } = useAuth();
   const [showAuth, setShowAuth] = useState(false);
@@ -293,7 +298,7 @@ export default function App() {
   // ref to scroll to ticker block
   const mainSectionRef = useRef(null);
 
-  // listen for "ticker:set" broadcasts
+  /* ---------- Broadcast ticker selection ---------- */
   useEffect(() => {
     const handler = (e) => {
       const sym = String(e?.detail || "").toUpperCase().trim();
@@ -304,7 +309,7 @@ export default function App() {
     return () => window.removeEventListener("ticker:set", handler);
   }, []);
 
-  // warm backend
+  /* ---------- Warm backend ---------- */
   useEffect(() => {
     (async () => {
       try {
@@ -316,7 +321,7 @@ export default function App() {
     })();
   }, []);
 
-  // helpers
+  /* ---------- helpers ---------- */
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
     const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
@@ -344,7 +349,7 @@ export default function App() {
     );
   };
 
-  // Build lookup maps from predict_history
+  /* ---------- Build lookup from predict_history ---------- */
   const { histByDate, histPred } = useMemo(() => {
     const byDate = {};
     const byDateModel = {};
@@ -368,22 +373,33 @@ export default function App() {
     [historyRows]
   );
 
-  // ---- OPTION A merge logic ----
-  // We extend the known "past" timeline with any newer closeDates
-  // so yesterday shows up as actual history instead of "+1d".
+  // OPTION A merge:
+  // extend the backtest timeline with any newer closeDates,
+  // so "yesterday close" becomes part of history (not "+1d").
   const extendedDates = useMemo(() => {
     if (!histDates.length) {
-      // no predict_history? just fall back to prices timeline
       return closeDates;
     }
-    const lastHist = histDates[histDates.length - 1]; // latest date in predict_history
-    // take any closeDates strictly AFTER the lastHist date
+    const lastHist = histDates[histDates.length - 1];
     const tailFromCloses = closeDates.filter(
       (d) => d > lastHist && !histDates.includes(d)
     );
     return [...histDates, ...tailFromCloses];
   }, [histDates, closeDates]);
 
+  // Map date -> close for vendor close series
+  const closeMap = useMemo(() => {
+    const m = {};
+    (closeDates || []).forEach((d, i) => {
+      const v = toNum(closes?.[i]);
+      if (Number.isFinite(v)) {
+        m[dkey(d)] = v;
+      }
+    });
+    return m;
+  }, [closeDates, closes]);
+
+  /* ---------- Load data (quote, earnings, etc.) ---------- */
   const loadData = useCallback(async () => {
     const myVer = ++reqVer.current;
 
@@ -513,7 +529,7 @@ export default function App() {
     }
   }, [ticker, models, live]);
 
-  // run loadData when ticker/models change
+  /* ---------- Run loadData when ticker/models change ---------- */
   useEffect(() => {
     loadData();
     return () => {
@@ -523,7 +539,7 @@ export default function App() {
     };
   }, [loadData]);
 
-  // SSE live quote
+  /* ---------- SSE live quote ---------- */
   useEffect(() => {
     if (!live || !ticker) return;
     const url = buildQuoteStreamURL(ticker, 5);
@@ -581,6 +597,7 @@ export default function App() {
     };
   }, [live, ticker, quote?.last_close]);
 
+  /* ---------- UI handlers ---------- */
   const handleSubmit = (e) => {
     e.preventDefault();
     loadData();
@@ -591,7 +608,6 @@ export default function App() {
       prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]
     );
 
-  // select ticker from movers/earnings
   const handleSelectTicker = (sym) => {
     const t = String(sym || "").toUpperCase().trim();
     if (!t) return;
@@ -600,7 +616,6 @@ export default function App() {
     requestAnimationFrame(() => requestAnimationFrame(go));
   };
 
-  // add watchlist symbol into Compare
   const handleAddToCompare = (sym) => {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return;
@@ -611,7 +626,7 @@ export default function App() {
     setCompareOpen(true);
   };
 
-  // ---------- Metrics & Recommendation ----------
+  /* ---------- Metrics & Recommendation ---------- */
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
     const base = toNum(quote.last_close) || 0;
@@ -644,20 +659,44 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  // ---------- Actual vs. Predicted ----------
+  /* ---------- Actual vs Predicted prep ---------- */
+
   const horizon = results?.[0]?.predictions?.length || 0;
   const pastDaysToShow = 10;
 
-  // Use extendedDates (history + any newer closeDates) trimmed to last N days.
-  const basePast = extendedDates.slice(-pastDaysToShow);
-  const pastLabels = basePast;
+  // grab last N total dates (backtest + any newer closeDates)
+  const rawPastLabels = extendedDates.slice(-pastDaysToShow);
 
+  // check newest two closes; if latest looks sus (lagged or huge jump),
+  // hide that last date from "Actual"
+  let pastLabels = rawPastLabels;
+  if (rawPastLabels.length >= 2) {
+    const lastKey = dkey(rawPastLabels[rawPastLabels.length - 1]);
+    const prevKey = dkey(rawPastLabels[rawPastLabels.length - 2]);
+
+    const lastVal = closeMap[lastKey];
+    const prevVal = closeMap[prevKey];
+
+    if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
+      const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
+
+      // Rule: if newest close == prev close (copied forward),
+      // or jump >15% (screams wrong scale), don't trust this newest day yet.
+      const looksDuplicated = lastVal === prevVal;
+      const looksCrazyJump = jumpPct > 0.15;
+
+      if (looksDuplicated || looksCrazyJump) {
+        pastLabels = rawPastLabels.slice(0, -1);
+      }
+    }
+  }
+
+  // last trusted historical date
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : null;
 
-  // future starts strictly AFTER the last historical date we know,
-  // which can now include "yesterday" from closes[]
+  // future labels = business days AFTER that lastPastDate
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
@@ -666,23 +705,14 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // For each past date:
-  // 1. Use predict_history.actual if available
-  // 2. Else fall back to close price for that exact date
+  // This is our "true actual close" series for the chart.
+  // We ONLY trust closeMap (vendor close series) now.
   const actualForPastLabels = pastLabels.map((iso) => {
-    const dkIso = dkey(iso);
-    const h = histByDate[dkIso];
-    if (Number.isFinite(h?.actual)) {
-      return h.actual;
-    }
-    const idxClose = closeDates.lastIndexOf(iso);
-    if (idxClose >= 0 && Number.isFinite(closes[idxClose])) {
-      return closes[idxClose];
-    }
-    return null;
+    const v = closeMap[dkey(iso)];
+    return Number.isFinite(v) ? v : null;
   });
 
-  // harmonizer to smooth each model's backtest scale into actual scale
+  // harmonizer to rescale model backtest onto actual scale
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
@@ -745,11 +775,10 @@ export default function App() {
     "#edc949",
   ];
 
-  // datasets for AVP chart
+  // datasets for Actual vs Predicted chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
     if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
 
-    // Actual close line (past only)
     const actualSeries = [
       ...actualForPastLabels,
       ...Array(futureLabels.length).fill(null),
@@ -774,7 +803,7 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // past segment (backtest)
+      // build raw backtest line from histPred (past only)
       const backtestRaw = chartLabels.map((lab, i) => {
         if (i >= pastLabels.length) return null;
         const dkIso = dkey(lab);
@@ -800,7 +829,7 @@ export default function App() {
         spanGaps: true,
       });
 
-      // future/current forecast
+      // future/current forecast line
       const lastActual =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ??
         null;
@@ -852,22 +881,16 @@ export default function App() {
     },
   };
 
-  // Build table rows for display
+  // table rows for AVP table
   const pastRows = pastLabels.map((iso) => {
     const dkIso = dkey(iso);
-    const hist = histByDate[dkIso];
 
-    // same fallback logic as actualForPastLabels
-    let actualHere = null;
-    if (Number.isFinite(hist?.actual)) {
-      actualHere = hist.actual;
-    } else {
-      const idxClose = closeDates.lastIndexOf(iso);
-      if (idxClose >= 0 && Number.isFinite(closes[idxClose])) {
-        actualHere = closes[idxClose];
-      }
-    }
+    // Actual column from closeMap ONLY (trusted EOD vendor close)
+    const actualHere = Number.isFinite(closeMap[dkIso])
+      ? closeMap[dkIso]
+      : null;
 
+    // per-model backtest values for that date
     const perModel = results.map((r) => {
       const v = histPred?.[dkIso]?.[normModel(r.model)];
       return Number.isFinite(Number(v)) ? Number(v) : null;
@@ -888,7 +911,7 @@ export default function App() {
     return { date: d, actual: null, perModel, kind: "future" };
   });
 
-  // header pct change
+  /* ---------- Header price / pct change ---------- */
   const curr = toNum(quote?.current_price);
   const prev = toNum(quote?.last_close);
   const derivedPct = safePct(curr, prev);
@@ -896,6 +919,7 @@ export default function App() {
   const absToShow =
     Number.isFinite(curr) && Number.isFinite(prev) ? curr - prev : 0;
 
+  /* ---------- Render ---------- */
   return (
     <div className="app-root">
       {/* hero */}
@@ -1066,7 +1090,10 @@ export default function App() {
               ) : quote ? (
                 <>
                   <p style={{ margin: 0 }}>
-                    Last Close: ${Number(quote.last_close).toFixed(2)}
+                    Last Close: $
+                    {Number.isFinite(quote.last_close)
+                      ? Number(quote.last_close).toFixed(2)
+                      : "—"}
                   </p>
                   <p
                     style={{
@@ -1420,7 +1447,10 @@ export default function App() {
   );
 }
 
-/** InteractivePriceChart + MagnifyModal **/
+/* =========================
+   InteractivePriceChart + MagnifyModal
+   ========================= */
+
 function InteractivePriceChart({
   data = [],
   labels = [],
