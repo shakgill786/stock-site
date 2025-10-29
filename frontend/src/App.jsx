@@ -695,64 +695,91 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-/* ---------- Actual vs Predicted prep ---------- */
+  /* ---------- Actual vs Predicted prep ---------- */
 
-const horizon = results?.[0]?.predictions?.length || 0;
-const pastDaysToShow = 10;
+  const horizon = results?.[0]?.predictions?.length || 0;
+  const pastDaysToShow = 10;
 
-// grab last N total dates (backtest + any newer closeDates)
-const rawPastLabels = extendedDates.slice(-pastDaysToShow);
+  // grab last N total dates (backtest + any newer closeDates)
+  const rawPastLabels = extendedDates.slice(-pastDaysToShow);
 
-// We'll start with rawPastLabels and then sanity-prune the newest entry
-let pastLabels = rawPastLabels;
+  // We'll start with rawPastLabels and then sanity-prune the newest entry
+  let pastLabels = rawPastLabels;
 
-/**
- * RULE 0:
- * If the freshest past date (e.g. "2025-10-28") is NOT in closeMap,
- * that means we don't actually have a confirmed vendor close for that date yet,
- * and predict_history probably stamped a stale "actual" on it.
- *
- * Example bug you saw:
- *   historyRows said 2025-10-28 actual = 262.82 (copied from 10/24),
- *   but vendor closeMap didn't even have 2025-10-28 yet.
- *
- * In that case we should NOT treat that date as "past actual".
- * We just drop it from pastLabels so it rolls into the forecast (+1d) bucket.
- */
-if (pastLabels.length >= 1) {
-  const newestKey = dkey(pastLabels[pastLabels.length - 1]);
-  const haveVendorClose = Number.isFinite(closeMap[newestKey]);
-  if (!haveVendorClose) {
-    pastLabels = pastLabels.slice(0, -1);
-  }
-}
-
-/**
- * RULE 1:
- * Now that we're sure the newest pastLabels point DOES exist in closeMap,
- * run the existing sanity check:
- * - If vendor gave the exact same close two days in a row (copy/paste bug),
- * - OR if there's a >15% jump (split / scale glitch),
- * then drop that newest point as well.
- */
-if (pastLabels.length >= 2) {
-  const lastKey = dkey(pastLabels[pastLabels.length - 1]);
-  const prevKey = dkey(pastLabels[pastLabels.length - 2]);
-
-  const lastVal = closeMap[lastKey];
-  const prevVal = closeMap[prevKey];
-
-  if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
-    const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
-    const looksDuplicated = lastVal === prevVal;
-    const looksCrazyJump = jumpPct > 0.15;
-
-    if (looksDuplicated || looksCrazyJump) {
+  /**
+   * RULE 0:
+   * If the freshest past date is NOT in closeMap,
+   * that means we don't actually have a confirmed vendor close for that date yet,
+   * and predict_history probably stamped a stale "actual" on it.
+   *
+   * In that case we should NOT treat that date as "past actual".
+   * Drop it so it rolls into the forecast (+1d) bucket.
+   */
+  if (pastLabels.length >= 1) {
+    const newestKey = dkey(pastLabels[pastLabels.length - 1]);
+    const haveVendorClose = Number.isFinite(closeMap[newestKey]);
+    if (!haveVendorClose) {
       pastLabels = pastLabels.slice(0, -1);
     }
   }
-}
 
+  /**
+   * RULE 1:
+   * If vendor gave the exact same close two days in a row (copy/paste bug),
+   * OR if there's a >15% jump (split / scale glitch),
+   * drop that newest point.
+   */
+  if (pastLabels.length >= 2) {
+    const lastKey = dkey(pastLabels[pastLabels.length - 1]);
+    const prevKey = dkey(pastLabels[pastLabels.length - 2]);
+
+    const lastVal = closeMap[lastKey];
+    const prevVal = closeMap[prevKey];
+
+    if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
+      const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
+      const looksDuplicated = lastVal === prevVal;
+      const looksCrazyJump = jumpPct > 0.15;
+
+      if (looksDuplicated || looksCrazyJump) {
+        pastLabels = pastLabels.slice(0, -1);
+      }
+    }
+  }
+
+  /**
+   * RULE 2:
+   * Vendors sometimes "replay Friday's close" early Monday / next session
+   * before settlement. Heuristic:
+   *
+   * - newestVal == value from TWO days ago
+   * - BUT differs from yesterday by >2%
+   *
+   * That screams "stale carried-forward number", so drop newest row.
+   */
+  if (pastLabels.length >= 3) {
+    const newestKey = dkey(pastLabels[pastLabels.length - 1]);
+    const prevKey = dkey(pastLabels[pastLabels.length - 2]);
+    const prevPrevKey = dkey(pastLabels[pastLabels.length - 3]);
+
+    const newestVal = closeMap[newestKey];
+    const prevVal = closeMap[prevKey];
+    const prevPrevVal = closeMap[prevPrevKey];
+
+    if (
+      Number.isFinite(newestVal) &&
+      Number.isFinite(prevVal) &&
+      Number.isFinite(prevPrevVal)
+    ) {
+      const clonedFromTwoDaysAgo = newestVal === prevPrevVal;
+      const driftPct =
+        Math.abs(newestVal - prevVal) / (Math.abs(prevVal) || 1);
+
+      if (clonedFromTwoDaysAgo && driftPct > 0.02) {
+        pastLabels = pastLabels.slice(0, -1);
+      }
+    }
+  }
 
   // last trusted historical date
   const lastPastDate = pastLabels.length
@@ -800,6 +827,7 @@ if (pastLabels.length >= 2) {
 
     const medA = median(A);
     const medB = median(B);
+
     const scaleRatio = medB && medA ? medA / medB : 1;
 
     const mape =
@@ -808,10 +836,13 @@ if (pastLabels.length >= 2) {
         0
       ) / A.length;
 
+    // if model history is obviously on a different split scale,
+    // do a linear fit (alpha+beta*x) instead of naive ratio
     if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
       const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
       const meanA = mean(A);
       const meanB = mean(B);
+
       const cov =
         A.reduce((s, a, i) => s + (a - meanA) * (B[i] - meanB), 0) / A.length;
       const varB =
@@ -948,10 +979,39 @@ if (pastLabels.length >= 2) {
     },
   };
 
-  // table rows for AVP table
-  const pastRows = pastLabels.map((iso, idx) => {
-    const dkIso = dkey(iso);
+  // backtest values aligned to "Actual" scale for the table
+  const alignedBacktestsByModel = useMemo(() => {
+    const out = {};
 
+    results.forEach((r) => {
+      const mKey = normModel(r.model);
+
+      // raw model backtest values in the order of pastLabels
+      const rawSeries = pastLabels.map((iso) => {
+        const dkIso = dkey(iso);
+        const v = histPred?.[dkIso]?.[mKey];
+        return Number.isFinite(Number(v)) ? Number(v) : null;
+      });
+
+      // run SAME harmonization as chart
+      const { series: alignedSeries } = harmonize(
+        rawSeries,
+        actualForPastLabels
+      );
+
+      out[mKey] = alignedSeries;
+    });
+
+    return out;
+  }, [
+    results,
+    histPred,
+    pastLabels.join("|"),
+    actualForPastLabels.join("|"),
+  ]);
+
+  // table rows for AVP table (past + future)
+  const pastRows = pastLabels.map((iso, idx) => {
     // Actual column using same pickActualForDate logic for consistency
     const actualHere = pickActualForDate({
       iso,
@@ -961,9 +1021,11 @@ if (pastLabels.length >= 2) {
       closeMap,
     });
 
-    // per-model backtest values for that date
+    // per-model BACKTEST values for that date, but already rescaled/aligned
     const perModel = results.map((r) => {
-      const v = histPred?.[dkIso]?.[normModel(r.model)];
+      const mKey = normModel(r.model);
+      const arr = alignedBacktestsByModel[mKey] || [];
+      const v = arr[idx];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
 
@@ -1311,7 +1373,7 @@ if (pastLabels.length >= 2) {
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
-              {/* 🔽 UPDATED TABLE BLOCK STARTS HERE 🔽 */}
+              {/* Table */}
               <div className="table-wrap" style={{ marginTop: 12 }}>
                 <div
                   className="muted"
@@ -1387,7 +1449,6 @@ if (pastLabels.length >= 2) {
                   </tbody>
                 </table>
               </div>
-              {/* 🔼 UPDATED TABLE BLOCK ENDS HERE 🔼 */}
 
               {!!diagnostic && (
                 <div
