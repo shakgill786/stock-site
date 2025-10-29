@@ -373,9 +373,7 @@ export default function App() {
     [historyRows]
   );
 
-  // OPTION A merge:
-  // extend the backtest timeline with any newer closeDates,
-  // so "yesterday close" becomes part of history (not "+1d").
+  // extend the backtest timeline with any newer closeDates
   const extendedDates = useMemo(() => {
     if (!histDates.length) {
       return closeDates;
@@ -743,8 +741,7 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // Build "actual" price series we draw as the solid gray line.
-  // Uses pickActualForDate() which prefers closeMap for latest day.
+  // Build "actual" price series for the gray line
   const actualForPastLabels = pastLabels.map((iso, idx) =>
     pickActualForDate({
       iso,
@@ -755,7 +752,7 @@ export default function App() {
     })
   );
 
-  // harmonizer to rescale model backtest onto actual scale
+  // harmonizer to rescale model backtest onto actual scale if needed
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
@@ -1287,45 +1284,74 @@ export default function App() {
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
+              {/* 🔽 UPDATED TABLE BLOCK STARTS HERE 🔽 */}
               <div className="table-wrap" style={{ marginTop: 12 }}>
+                <div
+                  className="muted"
+                  style={{
+                    fontSize: 12,
+                    marginBottom: 6,
+                    fontWeight: 500,
+                    color: "#9ea2ff",
+                  }}
+                >
+                  Model Comparison (past: backtest • future: current)
+                </div>
+
                 <table className="table">
                   <thead>
                     <tr>
                       <th style={{ whiteSpace: "nowrap" }}>Date</th>
                       <th>Actual</th>
                       {results.map((r) => (
-                        <th key={r.model}>
-                          {r.model}
-                          <span
-                            className="muted"
-                            style={{
-                              fontSize: 11,
-                              display: "block",
-                            }}
-                          >
-                            <em>past: backtest • future: current</em>
-                          </span>
-                        </th>
+                        <th key={r.model}>{r.model}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {[...pastRows, ...futureRows].map((row, i) => (
-                      <tr key={`${row.kind}-${row.date || i}`}>
-                        <td>
+                      <tr
+                        key={`${row.kind}-${row.date || i}`}
+                        style={
+                          row.kind === "future"
+                            ? { background: "rgba(0,255,0,0.04)" }
+                            : {}
+                        }
+                      >
+                        <td
+                          style={
+                            row.kind === "future"
+                              ? {
+                                  color: "#6cfb8d",
+                                  fontWeight: 600,
+                                }
+                              : { fontWeight: 500 }
+                          }
+                        >
                           {row.date
                             ? row.kind === "future"
-                              ? `${row.date} (+${i - pastRows.length + 1}d)`
+                              ? `${row.date} (+${
+                                  i - pastRows.length + 1
+                                }d)`
                               : row.date
                             : ""}
                         </td>
-                        <td>
+                        <td
+                          style={{
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
                           {row.actual != null
                             ? Number(row.actual).toFixed(2)
                             : "—"}
                         </td>
                         {row.perModel.map((v, j) => (
-                          <td key={j}>
+                          <td
+                            key={j}
+                            style={{
+                              fontVariantNumeric: "tabular-nums",
+                            }}
+                          >
                             {v != null ? Number(v).toFixed(2) : "—"}
                           </td>
                         ))}
@@ -1334,6 +1360,7 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+              {/* 🔼 UPDATED TABLE BLOCK ENDS HERE 🔼 */}
 
               {!!diagnostic && (
                 <div
