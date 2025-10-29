@@ -387,7 +387,7 @@ export default function App() {
     return [...histDates, ...tailFromCloses];
   }, [histDates, closeDates]);
 
-  // Map date -> close for vendor close series
+  // Map date -> close for vendor close series (after sanitizeClosesWithQuote)
   const closeMap = useMemo(() => {
     const m = {};
     (closeDates || []).forEach((d, i) => {
@@ -626,6 +626,44 @@ export default function App() {
     setCompareOpen(true);
   };
 
+  /* ---------- helper: choose best "actual" for a given date ---------- */
+  function pickActualForDate({ iso, idxInPast, pastLabels, histByDate, closeMap }) {
+    const key = dkey(iso);
+
+    const histVal = Number.isFinite(histByDate?.[key]?.actual)
+      ? Number(histByDate[key].actual)
+      : null;
+
+    const closeVal = Number.isFinite(closeMap?.[key])
+      ? Number(closeMap[key])
+      : null;
+
+    const isLastPastRow = idxInPast === pastLabels.length - 1;
+
+    // freshest row: prefer closeMap (EOD vendor) because predict_history might lag
+    if (isLastPastRow) {
+      if (Number.isFinite(closeVal)) return closeVal;
+      if (Number.isFinite(histVal)) return histVal;
+      return null;
+    }
+
+    // older rows: if both exist but differ by >3%, trust closeVal
+    if (Number.isFinite(histVal) && Number.isFinite(closeVal)) {
+      const diffPct =
+        Math.abs(closeVal - histVal) / (Math.abs(closeVal) || 1);
+      if (diffPct > 0.03) {
+        return closeVal;
+      }
+      return histVal;
+    }
+
+    // otherwise whichever exists
+    if (Number.isFinite(closeVal)) return closeVal;
+    if (Number.isFinite(histVal)) return histVal;
+
+    return null;
+  }
+
   /* ---------- Metrics & Recommendation ---------- */
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
@@ -705,12 +743,17 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // This is our "true actual close" series for the chart.
-  // We ONLY trust closeMap (vendor close series) now.
-  const actualForPastLabels = pastLabels.map((iso) => {
-    const v = closeMap[dkey(iso)];
-    return Number.isFinite(v) ? v : null;
-  });
+  // Build "actual" price series we draw as the solid gray line.
+  // Uses pickActualForDate() which prefers closeMap for latest day.
+  const actualForPastLabels = pastLabels.map((iso, idx) =>
+    pickActualForDate({
+      iso,
+      idxInPast: idx,
+      pastLabels,
+      histByDate,
+      closeMap,
+    })
+  );
 
   // harmonizer to rescale model backtest onto actual scale
   function harmonize(series, actual) {
@@ -882,13 +925,17 @@ export default function App() {
   };
 
   // table rows for AVP table
-  const pastRows = pastLabels.map((iso) => {
+  const pastRows = pastLabels.map((iso, idx) => {
     const dkIso = dkey(iso);
 
-    // Actual column from closeMap ONLY (trusted EOD vendor close)
-    const actualHere = Number.isFinite(closeMap[dkIso])
-      ? closeMap[dkIso]
-      : null;
+    // Actual column using same pickActualForDate logic for consistency
+    const actualHere = pickActualForDate({
+      iso,
+      idxInPast: idx,
+      pastLabels,
+      histByDate,
+      closeMap,
+    });
 
     // per-model backtest values for that date
     const perModel = results.map((r) => {
@@ -1040,7 +1087,7 @@ export default function App() {
 
           {/* Top info row */}
           <div
-            className={`row`}
+            className={`row ${blinkClass ? blinkClass : ""}`}
             style={{
               gap: 16,
               marginBottom: 12,
@@ -1090,9 +1137,9 @@ export default function App() {
               ) : quote ? (
                 <>
                   <p style={{ margin: 0 }}>
-                    Last Close: $
+                    Last Close:{" "}
                     {Number.isFinite(quote.last_close)
-                      ? Number(quote.last_close).toFixed(2)
+                      ? `$${Number(quote.last_close).toFixed(2)}`
                       : "—"}
                   </p>
                   <p
