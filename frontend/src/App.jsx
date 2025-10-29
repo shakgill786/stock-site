@@ -695,37 +695,64 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  /* ---------- Actual vs Predicted prep ---------- */
+/* ---------- Actual vs Predicted prep ---------- */
 
-  const horizon = results?.[0]?.predictions?.length || 0;
-  const pastDaysToShow = 10;
+const horizon = results?.[0]?.predictions?.length || 0;
+const pastDaysToShow = 10;
 
-  // grab last N total dates (backtest + any newer closeDates)
-  const rawPastLabels = extendedDates.slice(-pastDaysToShow);
+// grab last N total dates (backtest + any newer closeDates)
+const rawPastLabels = extendedDates.slice(-pastDaysToShow);
 
-  // check newest two closes; if latest looks sus (lagged or huge jump),
-  // hide that last date from "Actual"
-  let pastLabels = rawPastLabels;
-  if (rawPastLabels.length >= 2) {
-    const lastKey = dkey(rawPastLabels[rawPastLabels.length - 1]);
-    const prevKey = dkey(rawPastLabels[rawPastLabels.length - 2]);
+// We'll start with rawPastLabels and then sanity-prune the newest entry
+let pastLabels = rawPastLabels;
 
-    const lastVal = closeMap[lastKey];
-    const prevVal = closeMap[prevKey];
+/**
+ * RULE 0:
+ * If the freshest past date (e.g. "2025-10-28") is NOT in closeMap,
+ * that means we don't actually have a confirmed vendor close for that date yet,
+ * and predict_history probably stamped a stale "actual" on it.
+ *
+ * Example bug you saw:
+ *   historyRows said 2025-10-28 actual = 262.82 (copied from 10/24),
+ *   but vendor closeMap didn't even have 2025-10-28 yet.
+ *
+ * In that case we should NOT treat that date as "past actual".
+ * We just drop it from pastLabels so it rolls into the forecast (+1d) bucket.
+ */
+if (pastLabels.length >= 1) {
+  const newestKey = dkey(pastLabels[pastLabels.length - 1]);
+  const haveVendorClose = Number.isFinite(closeMap[newestKey]);
+  if (!haveVendorClose) {
+    pastLabels = pastLabels.slice(0, -1);
+  }
+}
 
-    if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
-      const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
+/**
+ * RULE 1:
+ * Now that we're sure the newest pastLabels point DOES exist in closeMap,
+ * run the existing sanity check:
+ * - If vendor gave the exact same close two days in a row (copy/paste bug),
+ * - OR if there's a >15% jump (split / scale glitch),
+ * then drop that newest point as well.
+ */
+if (pastLabels.length >= 2) {
+  const lastKey = dkey(pastLabels[pastLabels.length - 1]);
+  const prevKey = dkey(pastLabels[pastLabels.length - 2]);
 
-      // Rule: if newest close == prev close (copied forward),
-      // or jump >15% (screams wrong scale), don't trust this newest day yet.
-      const looksDuplicated = lastVal === prevVal;
-      const looksCrazyJump = jumpPct > 0.15;
+  const lastVal = closeMap[lastKey];
+  const prevVal = closeMap[prevKey];
 
-      if (looksDuplicated || looksCrazyJump) {
-        pastLabels = rawPastLabels.slice(0, -1);
-      }
+  if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
+    const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
+    const looksDuplicated = lastVal === prevVal;
+    const looksCrazyJump = jumpPct > 0.15;
+
+    if (looksDuplicated || looksCrazyJump) {
+      pastLabels = pastLabels.slice(0, -1);
     }
   }
+}
+
 
   // last trusted historical date
   const lastPastDate = pastLabels.length
