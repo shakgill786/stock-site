@@ -72,6 +72,20 @@ const addBusinessDays = (start, n) => {
   return dt;
 };
 
+const isWeekend = (dt) => [0, 6].includes(dt.getDay());
+const prevBiz = (iso) => {
+  let d = asLocalDate(iso);
+  do d.setDate(d.getDate() - 1);
+  while (isWeekend(d));
+  return fmtLocalISO(d);
+};
+const nextBiz = (iso) => {
+  let d = asLocalDate(iso);
+  do d.setDate(d.getDate() + 1);
+  while (isWeekend(d));
+  return fmtLocalISO(d);
+};
+
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
@@ -186,9 +200,7 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
 
     if (!looksLikeNow && bigMismatch) {
       // large scale gap → treat like split, scale whole series
-      let scaled = outCloses.map((v) =>
-        Number.isFinite(v) ? v * ratio : v
-      );
+      let scaled = outCloses.map((v) => (Number.isFinite(v) ? v * ratio : v));
       // and force the tail to equal quoteLast
       scaled[scaled.length - 1] = quoteLast;
       outCloses = scaled;
@@ -350,40 +362,18 @@ export default function App() {
   };
 
   /* ---------- Build lookup from predict_history ---------- */
-  const { histByDate, histPred } = useMemo(() => {
-    const byDate = {};
+  const { histPred } = useMemo(() => {
     const byDateModel = {};
     (historyRows || []).forEach((r) => {
       const dk = dkey(r.date);
-      byDate[dk] = {
-        ...r,
-        actual: toNum(r.actual) ?? toNum(r.close) ?? null,
-      };
       const perModel = {};
       Object.entries(r.pred || {}).forEach(([m, v]) => {
         perModel[normModel(m)] = toNum(v);
       });
       byDateModel[dk] = perModel;
     });
-    return { histByDate: byDate, histPred: byDateModel };
+    return { histPred: byDateModel };
   }, [historyRows]);
-
-  const histDates = useMemo(
-    () => (historyRows || []).map((r) => dkey(r.date)),
-    [historyRows]
-  );
-
-  // extend the backtest timeline with any newer closeDates
-  const extendedDates = useMemo(() => {
-    if (!histDates.length) {
-      return closeDates;
-    }
-    const lastHist = histDates[histDates.length - 1];
-    const tailFromCloses = closeDates.filter(
-      (d) => d > lastHist && !histDates.includes(d)
-    );
-    return [...histDates, ...tailFromCloses];
-  }, [histDates, closeDates]);
 
   // Map date -> close for vendor close series (after sanitizeClosesWithQuote)
   const closeMap = useMemo(() => {
@@ -624,43 +614,21 @@ export default function App() {
     setCompareOpen(true);
   };
 
-  /* ---------- helper: choose best "actual" for a given date ---------- */
-  function pickActualForDate({ iso, idxInPast, pastLabels, histByDate, closeMap }) {
+  /* ---------- Strict Actuals & aligned backtests ---------- */
+
+  // Actual must come from vendor closes ONLY
+  function pickActualForDateStrict(iso, closeMap) {
     const key = dkey(iso);
-
-    const histVal = Number.isFinite(histByDate?.[key]?.actual)
-      ? Number(histByDate[key].actual)
-      : null;
-
-    const closeVal = Number.isFinite(closeMap?.[key])
-      ? Number(closeMap[key])
-      : null;
-
-    const isLastPastRow = idxInPast === pastLabels.length - 1;
-
-    // freshest row: prefer closeMap (EOD vendor) because predict_history might lag
-    if (isLastPastRow) {
-      if (Number.isFinite(closeVal)) return closeVal;
-      if (Number.isFinite(histVal)) return histVal;
-      return null;
-    }
-
-    // older rows: if both exist but differ by >3%, trust closeVal
-    if (Number.isFinite(histVal) && Number.isFinite(closeVal)) {
-      const diffPct =
-        Math.abs(closeVal - histVal) / (Math.abs(closeVal) || 1);
-      if (diffPct > 0.03) {
-        return closeVal;
-      }
-      return histVal;
-    }
-
-    // otherwise whichever exists
-    if (Number.isFinite(closeVal)) return closeVal;
-    if (Number.isFinite(histVal)) return histVal;
-
-    return null;
+    const v = toNum(closeMap?.[key]);
+    return Number.isFinite(v) ? v : null;
   }
+
+  // Get model backtest for date with ±1 business day fallback
+  const getHistPredForDate = (iso, mKey, histPred) =>
+    toNum(histPred?.[iso]?.[mKey]) ??
+    toNum(histPred?.[prevBiz(iso)]?.[mKey]) ??
+    toNum(histPred?.[nextBiz(iso)]?.[mKey]) ??
+    null;
 
   /* ---------- Metrics & Recommendation ---------- */
   const metrics = useMemo(() => {
@@ -700,81 +668,37 @@ export default function App() {
   const horizon = results?.[0]?.predictions?.length || 0;
   const pastDaysToShow = 10;
 
-  // grab last N total dates (backtest + any newer closeDates)
-  const rawPastLabels = extendedDates.slice(-pastDaysToShow);
+  // PAST: strictly from vendor closes (no mixing with predict_history dates)
+  let pastLabels = (closeDates || []).slice(-pastDaysToShow);
 
-  // We'll start with rawPastLabels and then sanity-prune the newest entry
-  let pastLabels = rawPastLabels;
-
-  /**
-   * RULE 0:
-   * If the freshest past date is NOT in closeMap,
-   * that means we don't actually have a confirmed vendor close for that date yet,
-   * and predict_history probably stamped a stale "actual" on it.
-   *
-   * In that case we should NOT treat that date as "past actual".
-   * Drop it so it rolls into the forecast (+1d) bucket.
-   */
-  if (pastLabels.length >= 1) {
-    const newestKey = dkey(pastLabels[pastLabels.length - 1]);
-    const haveVendorClose = Number.isFinite(closeMap[newestKey]);
-    if (!haveVendorClose) {
-      pastLabels = pastLabels.slice(0, -1);
-    }
-  }
-
-  /**
-   * RULE 1:
-   * If vendor gave the exact same close two days in a row (copy/paste bug),
-   * OR if there's a >15% jump (split / scale glitch),
-   * drop that newest point.
-   */
+  // Guard: drop a weird duplicated final point or >15% jump
   if (pastLabels.length >= 2) {
     const lastKey = dkey(pastLabels[pastLabels.length - 1]);
     const prevKey = dkey(pastLabels[pastLabels.length - 2]);
-
-    const lastVal = closeMap[lastKey];
-    const prevVal = closeMap[prevKey];
-
+    const lastVal = toNum(closeMap?.[lastKey]);
+    const prevVal = toNum(closeMap?.[prevKey]);
     if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
-      const jumpPct = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1);
-      const looksDuplicated = lastVal === prevVal;
-      const looksCrazyJump = jumpPct > 0.15;
-
-      if (looksDuplicated || looksCrazyJump) {
-        pastLabels = pastLabels.slice(0, -1);
-      }
+      const looksDup = lastVal === prevVal;
+      const looksSplit = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1) > 0.15;
+      if (looksDup || looksSplit) pastLabels = pastLabels.slice(0, -1);
     }
   }
 
-  /**
-   * RULE 2:
-   * Vendors sometimes "replay Friday's close" early Monday / next session
-   * before settlement. Heuristic:
-   *
-   * - newestVal == value from TWO days ago
-   * - BUT differs from yesterday by >2%
-   *
-   * That screams "stale carried-forward number", so drop newest row.
-   */
+  // Guard: carried-forward pattern (e.g., replayed Friday)
   if (pastLabels.length >= 3) {
     const newestKey = dkey(pastLabels[pastLabels.length - 1]);
     const prevKey = dkey(pastLabels[pastLabels.length - 2]);
     const prevPrevKey = dkey(pastLabels[pastLabels.length - 3]);
-
-    const newestVal = closeMap[newestKey];
-    const prevVal = closeMap[prevKey];
-    const prevPrevVal = closeMap[prevPrevKey];
-
+    const newestVal = toNum(closeMap?.[newestKey]);
+    const prevVal = toNum(closeMap?.[prevKey]);
+    const prevPrevVal = toNum(closeMap?.[prevPrevKey]);
     if (
       Number.isFinite(newestVal) &&
       Number.isFinite(prevVal) &&
       Number.isFinite(prevPrevVal)
     ) {
       const clonedFromTwoDaysAgo = newestVal === prevPrevVal;
-      const driftPct =
-        Math.abs(newestVal - prevVal) / (Math.abs(prevVal) || 1);
-
+      const driftPct = Math.abs(newestVal - prevVal) / (Math.abs(prevVal) || 1);
       if (clonedFromTwoDaysAgo && driftPct > 0.02) {
         pastLabels = pastLabels.slice(0, -1);
       }
@@ -786,7 +710,7 @@ export default function App() {
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : null;
 
-  // future labels = business days AFTER that lastPastDate
+  // FUTURE: business days AFTER lastPastDate
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
@@ -795,18 +719,12 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // Build "actual" price series for the gray line
-  const actualForPastLabels = pastLabels.map((iso, idx) =>
-    pickActualForDate({
-      iso,
-      idxInPast: idx,
-      pastLabels,
-      histByDate,
-      closeMap,
-    })
+  // "Actual" strictly from vendor closes
+  const actualForPastLabels = pastLabels.map((iso) =>
+    pickActualForDateStrict(iso, closeMap)
   );
 
-  // harmonizer to rescale model backtest onto actual scale if needed
+  // Harmonizer to rescale model backtest onto actual scale if needed
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
@@ -827,22 +745,16 @@ export default function App() {
 
     const medA = median(A);
     const medB = median(B);
-
     const scaleRatio = medB && medA ? medA / medB : 1;
 
     const mape =
-      A.reduce(
-        (acc, a, i) => acc + Math.abs(a - B[i]) / (Math.abs(a) || 1),
-        0
-      ) / A.length;
+      A.reduce((acc, a, i) => acc + Math.abs(a - B[i]) / (Math.abs(a) || 1), 0) /
+      A.length;
 
-    // if model history is obviously on a different split scale,
-    // do a linear fit (alpha+beta*x) instead of naive ratio
     if (mape > 0.2 && (scaleRatio < 0.8 || scaleRatio > 1.2)) {
       const mean = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
       const meanA = mean(A);
       const meanB = mean(B);
-
       const cov =
         A.reduce((s, a, i) => s + (a - meanA) * (B[i] - meanB), 0) / A.length;
       const varB =
@@ -850,28 +762,17 @@ export default function App() {
       const beta = cov / varB;
       const alpha = meanA - beta * meanB;
 
-      const adjusted = series.map((b) =>
-        Number.isFinite(b) ? alpha + beta * b : null
-      );
+      const adjusted = series.map((b) => (Number.isFinite(b) ? alpha + beta * b : null));
       return {
         series: adjusted,
-        note: `Backtests rescaled (α=${alpha.toFixed(
-          2
-        )}, β=${beta.toFixed(3)}) to match actuals.`,
+        note: `Backtests rescaled (α=${alpha.toFixed(2)}, β=${beta.toFixed(3)}) to match actuals.`,
       };
     }
 
     return { series, note: null };
   }
 
-  const colorPalette = [
-    "#4e79a7",
-    "#f28e2b",
-    "#e15759",
-    "#76b7b2",
-    "#59a14f",
-    "#edc949",
-  ];
+  const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
   // datasets for Actual vs Predicted chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
@@ -901,13 +802,10 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // build raw backtest line from histPred (past only)
-      const backtestRaw = chartLabels.map((lab, i) => {
-        if (i >= pastLabels.length) return null;
-        const dkIso = dkey(lab);
-        const v = histPred?.[dkIso]?.[mKey];
-        return Number.isFinite(Number(v)) ? Number(v) : null;
-      });
+      // backtest aligned to vendor pastLabels with ±1d fallback
+      const backtestRaw = pastLabels.map((iso) =>
+        getHistPredForDate(dkey(iso), mKey, histPred)
+      );
 
       const { series: backtestSeries, note: n } = harmonize(
         backtestRaw,
@@ -929,8 +827,7 @@ export default function App() {
 
       // future/current forecast line
       const lastActual =
-        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ??
-        null;
+        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
 
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
@@ -982,59 +879,26 @@ export default function App() {
   // backtest values aligned to "Actual" scale for the table
   const alignedBacktestsByModel = useMemo(() => {
     const out = {};
-
     results.forEach((r) => {
       const mKey = normModel(r.model);
-
-      // raw model backtest values in the order of pastLabels
-      const rawSeries = pastLabels.map((iso) => {
-        const dkIso = dkey(iso);
-        const v = histPred?.[dkIso]?.[mKey];
-        return Number.isFinite(Number(v)) ? Number(v) : null;
-      });
-
-      // run SAME harmonization as chart
-      const { series: alignedSeries } = harmonize(
-        rawSeries,
-        actualForPastLabels
+      const rawSeries = pastLabels.map((iso) =>
+        getHistPredForDate(dkey(iso), mKey, histPred)
       );
-
-      out[mKey] = alignedSeries;
+      const { series } = harmonize(rawSeries, actualForPastLabels);
+      out[mKey] = series;
     });
-
     return out;
-  }, [
-    results,
-    histPred,
-    pastLabels.join("|"),
-    actualForPastLabels.join("|"),
-  ]);
+  }, [results, histPred, pastLabels.join("|"), actualForPastLabels.join("|")]);
 
   // table rows for AVP table (past + future)
   const pastRows = pastLabels.map((iso, idx) => {
-    // Actual column using same pickActualForDate logic for consistency
-    const actualHere = pickActualForDate({
-      iso,
-      idxInPast: idx,
-      pastLabels,
-      histByDate,
-      closeMap,
-    });
-
-    // per-model BACKTEST values for that date, but already rescaled/aligned
+    const actualHere = pickActualForDateStrict(iso, closeMap);
     const perModel = results.map((r) => {
       const mKey = normModel(r.model);
-      const arr = alignedBacktestsByModel[mKey] || [];
-      const v = arr[idx];
+      const v = alignedBacktestsByModel[mKey]?.[idx];
       return Number.isFinite(Number(v)) ? Number(v) : null;
     });
-
-    return {
-      date: iso,
-      actual: actualHere,
-      perModel,
-      kind: "past",
-    };
+    return { date: iso, actual: actualHere, perModel, kind: "past" };
   });
 
   const futureRows = futureLabels.map((d, i) => {
@@ -1060,9 +924,7 @@ export default function App() {
         <div className="hero hero--center">
           <div>
             <h1 className="hero-title">Real-Time Stock & Crypto Dashboard</h1>
-            <p className="hero-sub">
-              Live quotes • Movers • This week’s earnings
-            </p>
+            <p className="hero-sub">Live quotes • Movers • This week’s earnings</p>
           </div>
           <div className="hero-right" style={{ display: "flex", gap: 8 }}>
             {user ? (
@@ -1079,10 +941,7 @@ export default function App() {
                 Sign in / Create account
               </button>
             )}
-            <button
-              className="btn ghost"
-              onClick={() => window.location.reload()}
-            >
+            <button className="btn ghost" onClick={() => window.location.reload()}>
               ↻ Refresh
             </button>
           </div>
@@ -1112,13 +971,7 @@ export default function App() {
         {/* RIGHT: Main content */}
         <section>
           {/* Compare Mode Toggle */}
-          <div
-            className="row"
-            style={{
-              justifyContent: "space-between",
-              marginBottom: 8,
-            }}
-          >
+          <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
             <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
               {compareOpen ? "Close Compare" : "Open Compare"}
             </button>
@@ -1138,14 +991,7 @@ export default function App() {
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
           {/* ticker input */}
-          <form
-            onSubmit={handleSubmit}
-            className="row"
-            style={{
-              marginBottom: 16,
-              marginTop: 8,
-            }}
-          >
+          <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
               value={ticker}
               onChange={(e) => setTicker(e.target.value.toUpperCase())}
@@ -1163,46 +1009,21 @@ export default function App() {
           <div
             id="main-stock-info"
             ref={mainSectionRef}
-            style={{
-              scrollMarginTop: 12,
-              height: 0,
-              overflow: "hidden",
-            }}
+            style={{ scrollMarginTop: 12, height: 0, overflow: "hidden" }}
             aria-hidden
           />
 
           {/* Top info row */}
-          <div
-            className={`row ${blinkClass ? blinkClass : ""}`}
-            style={{
-              gap: 16,
-              marginBottom: 12,
-            }}
-          >
+          <div className={`row ${blinkClass ? blinkClass : ""}`} style={{ gap: 16, marginBottom: 12 }}>
             {/* Quote card */}
-            <div
-              className={`card ${blinkClass}`}
-              style={{
-                minWidth: 0,
-                flex: "1 1 300px",
-              }}
-            >
-              <div
-                className="row"
-                style={{
-                  justifyContent: "space-between",
-                  alignItems: "baseline",
-                }}
-              >
+            <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
                 {closes.length > 0 && (
                   <button
                     className="btn ghost"
                     onClick={() => setShowBigPriceChart(true)}
-                    style={{
-                      padding: "2px 8px",
-                      fontSize: 12,
-                    }}
+                    style={{ padding: "2px 8px", fontSize: 12 }}
                     title="Magnify chart"
                   >
                     🔍 Magnify
@@ -1211,13 +1032,7 @@ export default function App() {
               </div>
 
               {quoteErr ? (
-                <p
-                  className="muted"
-                  style={{
-                    color: "#ff6b6b",
-                    margin: 0,
-                  }}
-                >
+                <p className="muted" style={{ color: "#ff6b6b", margin: 0 }}>
                   Error loading quote
                 </p>
               ) : quote ? (
@@ -1228,20 +1043,8 @@ export default function App() {
                       ? `$${Number(quote.last_close).toFixed(2)}`
                       : "—"}
                   </p>
-                  <p
-                    style={{
-                      margin: "2px 0",
-                      display: "flex",
-                      alignItems: "baseline",
-                      gap: 6,
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontSize: "1.3em",
-                        fontWeight: 600,
-                      }}
-                    >
+                  <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
+                    <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
                       ${tweenPrice.toFixed(2)}
                     </span>
                     {Number.isFinite(pctToShow) && (
@@ -1254,12 +1057,8 @@ export default function App() {
                           gap: 4,
                           fontSize: "0.9em",
                         }}
-                        aria-label={`${
-                          pctToShow >= 0 ? "Up" : "Down"
-                        } ${Math.abs(pctToShow).toFixed(2)} percent`}
-                        title={`${
-                          pctToShow >= 0 ? "Up" : "Down"
-                        } ${Math.abs(pctToShow).toFixed(2)}%`}
+                        aria-label={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)} percent`}
+                        title={`${pctToShow >= 0 ? "Up" : "Down"} ${Math.abs(pctToShow).toFixed(2)}%`}
                       >
                         {pctToShow >= 0 ? "▲" : "▼"} {Number(absToShow).toFixed(2)} (
                         {Math.abs(pctToShow).toFixed(2)}%)
@@ -1270,18 +1069,8 @@ export default function App() {
                   {/* mini chart */}
                   <div style={{ marginTop: 6 }}>
                     {closes.length >= 2 ? (
-                      <div
-                        style={{
-                          borderRadius: 10,
-                          overflow: "hidden",
-                        }}
-                      >
-                        <InteractivePriceChart
-                          data={closes}
-                          labels={closeDates}
-                          width={320}
-                          height={80}
-                        />
+                      <div style={{ borderRadius: 10, overflow: "hidden" }}>
+                        <InteractivePriceChart data={closes} labels={closeDates} width={320} height={80} />
                       </div>
                     ) : (
                       <div className="muted" style={{ fontSize: 12 }}>
@@ -1290,13 +1079,7 @@ export default function App() {
                     )}
                   </div>
                   {closes.length >= 2 && (
-                    <div
-                      className="muted"
-                      style={{
-                        fontSize: 11,
-                        marginTop: 4,
-                      }}
-                    >
+                    <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
                       drag to pan • wheel to zoom • double-click to reset
                     </div>
                   )}
@@ -1309,24 +1092,12 @@ export default function App() {
             </div>
 
             {/* Earnings card */}
-            <div
-              className="card"
-              style={{
-                minWidth: 0,
-                flex: "1 1 300px",
-              }}
-            >
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <EarningsCard earnings={earnings} />
             </div>
 
             {/* Recommendation */}
-            <div
-              className="card"
-              style={{
-                minWidth: 0,
-                flex: "1 1 300px",
-              }}
-            >
+            <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <RecommendationCard recommendation={recommendation} />
             </div>
           </div>
@@ -1345,13 +1116,7 @@ export default function App() {
 
           {/* model metrics */}
           {!!metrics.length && (
-            <div
-              className="card"
-              style={{
-                marginTop: 12,
-                marginBottom: 12,
-              }}
-            >
+            <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
               <MetricsList metrics={metrics} />
             </div>
           )}
@@ -1377,12 +1142,7 @@ export default function App() {
               <div className="table-wrap" style={{ marginTop: 12 }}>
                 <div
                   className="muted"
-                  style={{
-                    fontSize: 12,
-                    marginBottom: 6,
-                    fontWeight: 500,
-                    color: "#9ea2ff",
-                  }}
+                  style={{ fontSize: 12, marginBottom: 6, fontWeight: 500, color: "#9ea2ff" }}
                 >
                   Model Comparison (past: backtest • future: current)
                 </div>
@@ -1401,46 +1161,26 @@ export default function App() {
                     {[...pastRows, ...futureRows].map((row, i) => (
                       <tr
                         key={`${row.kind}-${row.date || i}`}
-                        style={
-                          row.kind === "future"
-                            ? { background: "rgba(0,255,0,0.04)" }
-                            : {}
-                        }
+                        style={row.kind === "future" ? { background: "rgba(0,255,0,0.04)" } : {}}
                       >
                         <td
                           style={
                             row.kind === "future"
-                              ? {
-                                  color: "#6cfb8d",
-                                  fontWeight: 600,
-                                }
+                              ? { color: "#6cfb8d", fontWeight: 600 }
                               : { fontWeight: 500 }
                           }
                         >
                           {row.date
                             ? row.kind === "future"
-                              ? `${row.date} (+${
-                                  i - pastRows.length + 1
-                                }d)`
+                              ? `${row.date} (+${i - pastRows.length + 1}d)`
                               : row.date
                             : ""}
                         </td>
-                        <td
-                          style={{
-                            fontVariantNumeric: "tabular-nums",
-                          }}
-                        >
-                          {row.actual != null
-                            ? Number(row.actual).toFixed(2)
-                            : "—"}
+                        <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                          {row.actual != null ? Number(row.actual).toFixed(2) : "—"}
                         </td>
                         {row.perModel.map((v, j) => (
-                          <td
-                            key={j}
-                            style={{
-                              fontVariantNumeric: "tabular-nums",
-                            }}
-                          >
+                          <td key={j} style={{ fontVariantNumeric: "tabular-nums" }}>
                             {v != null ? Number(v).toFixed(2) : "—"}
                           </td>
                         ))}
@@ -1451,24 +1191,12 @@ export default function App() {
               </div>
 
               {!!diagnostic && (
-                <div
-                  className="muted"
-                  style={{
-                    fontSize: 11,
-                    marginTop: 6,
-                  }}
-                >
+                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
                   Note: {diagnostic}
                 </div>
               )}
               {!!harmonizeNote && (
-                <div
-                  className="muted"
-                  style={{
-                    fontSize: 11,
-                    marginTop: 4,
-                  }}
-                >
+                <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
                   {harmonizeNote}
                 </div>
               )}
@@ -1476,44 +1204,18 @@ export default function App() {
           )}
 
           {diagnostic && (
-            <div
-              className="card"
-              style={{
-                borderLeft: "4px solid #a8b2ff",
-                marginTop: 8,
-              }}
-            >
-              <div
-                style={{
-                  fontWeight: 600,
-                  marginBottom: 4,
-                }}
-              >
-                Diagnostics
-              </div>
-              <div
-                className="muted"
-                style={{
-                  whiteSpace: "pre-wrap",
-                }}
-              >
+            <div className="card" style={{ borderLeft: "4px solid #a8b2ff", marginTop: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Diagnostics</div>
+              <div className="muted" style={{ whiteSpace: "pre-wrap" }}>
                 {diagnostic}
               </div>
             </div>
           )}
 
-          {error && (
-            <p style={{ color: "red" }}>Prediction Error: {error}</p>
-          )}
+          {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
           {/* model selector */}
-          <div
-            className="row"
-            style={{
-              marginTop: 12,
-              marginBottom: 8,
-            }}
-          >
+          <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
             {MODEL_OPTIONS.map((m) => (
               <label key={m} style={{ marginRight: 12 }}>
                 <input
@@ -1534,9 +1236,11 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Model</th>
-                      {results[0].predictions.map((_, i) => (
-                        <th key={i}>{`+${i + 1}d`}</th>
-                      ))}
+                      {Array.from({ length: results?.[0]?.predictions?.length || 0 }).map(
+                        (_, i) => (
+                          <th key={i}>{`+${i + 1}d`}</th>
+                        )
+                      )}
                     </tr>
                   </thead>
                   <tbody>
@@ -1546,17 +1250,11 @@ export default function App() {
                         {predictions.map((val, i) => (
                           <td key={i}>
                             {Number(val).toFixed(2)}
-                            {Array.isArray(confidence) &&
-                              confidence[i] != null && (
-                                <div
-                                  className="muted"
-                                  style={{
-                                    fontSize: 11,
-                                  }}
-                                >
-                                  conf {Number(confidence[i]).toFixed(2)}
-                                </div>
-                              )}
+                            {Array.isArray(confidence) && confidence[i] != null && (
+                              <div className="muted" style={{ fontSize: 11 }}>
+                                conf {Number(confidence[i]).toFixed(2)}
+                              </div>
+                            )}
                           </td>
                         ))}
                       </tr>
@@ -1565,13 +1263,7 @@ export default function App() {
                 </table>
               </div>
               {!!diagnostic && (
-                <div
-                  className="muted"
-                  style={{
-                    fontSize: 11,
-                    padding: "6px 12px 10px",
-                  }}
-                >
+                <div className="muted" style={{ fontSize: 11, padding: "6px 12px 10px" }}>
                   Note: {diagnostic}
                 </div>
               )}
@@ -1582,16 +1274,8 @@ export default function App() {
 
       {/* Big chart modal */}
       {showBigPriceChart && (
-        <MagnifyModal
-          title={`${ticker} • Price`}
-          onClose={() => setShowBigPriceChart(false)}
-        >
-          <div
-            style={{
-              borderRadius: 12,
-              overflow: "hidden",
-            }}
-          >
+        <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
+          <div style={{ borderRadius: 12, overflow: "hidden" }}>
             <InteractivePriceChart
               data={closes || []}
               labels={closeDates || []}
@@ -1613,13 +1297,7 @@ export default function App() {
    InteractivePriceChart + MagnifyModal
    ========================= */
 
-function InteractivePriceChart({
-  data = [],
-  labels = [],
-  width = 320,
-  height = 80,
-  big = false,
-}) {
+function InteractivePriceChart({ data = [], labels = [], width = 320, height = 80, big = false }) {
   const pad = 10;
   const w = width - pad * 2;
   const h = height - pad * 2;
@@ -1692,10 +1370,7 @@ function InteractivePriceChart({
         newEnd = data.length - 1;
         newStart = newEnd - windowSize;
       }
-      setView({
-        start: newStart,
-        end: newEnd,
-      });
+      setView({ start: newStart, end: newEnd });
     }
   };
 
@@ -1707,10 +1382,7 @@ function InteractivePriceChart({
   const onDown = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    setDrag({
-      startX: x,
-      startView: { ...view },
-    });
+    setDrag({ startX: x, startView: { ...view } });
   };
   const onUp = () => setDrag(null);
 
@@ -1726,9 +1398,7 @@ function InteractivePriceChart({
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = Math.max(5, Math.min(newSize, data.length - 1));
 
-    let newStart =
-      focusIdx -
-      Math.round(((focusIdx - vStart) * newSize) / windowSize);
+    let newStart = focusIdx - Math.round(((focusIdx - vStart) * newSize) / windowSize);
     let newEnd = newStart + newSize;
 
     if (newStart < 0) {
@@ -1740,10 +1410,7 @@ function InteractivePriceChart({
       newStart = newEnd - newSize;
     }
 
-    setView({
-      start: newStart,
-      end: newEnd,
-    });
+    setView({ start: newStart, end: newEnd });
   };
 
   const onDblClick = () =>
@@ -1797,31 +1464,11 @@ function InteractivePriceChart({
       onWheel={onWheel}
       onDoubleClick={onDblClick}
     >
-      <rect
-        x="0"
-        y="0"
-        width={width}
-        height={height}
-        rx="8"
-        ry="8"
-        fill="rgba(255,255,255,0.03)"
-      />
-      <polyline
-        fill="none"
-        stroke={lastUp ? "#2e7d32" : "#c62828"}
-        strokeWidth={big ? 2.5 : 2}
-        points={points}
-      />
+      <rect x="0" y="0" width={width} height={height} rx="8" ry="8" fill="rgba(255,255,255,0.03)" />
+      <polyline fill="none" stroke={lastUp ? "#2e7d32" : "#c62828"} strokeWidth={big ? 2.5 : 2} points={points} />
       {cursorX != null && (
         <>
-          <line
-            x1={showX}
-            x2={showX}
-            y1={10}
-            y2={height - 10}
-            stroke="#a8b2ff"
-            strokeDasharray="3,3"
-          />
+          <line x1={showX} x2={showX} y1={10} y2={height - 10} stroke="#a8b2ff" strokeDasharray="3,3" />
           <circle cx={showX} cy={showY} r={big ? 4 : 3} fill="#a8b2ff" />
           <g>
             <rect
@@ -1833,12 +1480,7 @@ function InteractivePriceChart({
               fill="rgba(0,0,0,0.65)"
               stroke="rgba(255,255,255,0.25)"
             />
-            <text
-              x={boxX + 10}
-              y={boxY + 15}
-              fontSize={big ? 12 : 11}
-              fill="#fff"
-            >
+            <text x={boxX + 10} y={boxY + 15} fontSize={big ? 12 : 11} fill="#fff">
               ${Number(showVal).toFixed(2)} • {label}
             </text>
           </g>
@@ -1872,13 +1514,7 @@ function MagnifyModal({ title, children, onClose }) {
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div
-          className="row"
-          style={{
-            justifyContent: "space-between",
-            alignItems: "center",
-          }}
-        >
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>{title}</h3>
           <div className="row" style={{ gap: 8 }}>
             <button className="btn ghost" onClick={onClose}>
@@ -1886,13 +1522,7 @@ function MagnifyModal({ title, children, onClose }) {
             </button>
           </div>
         </div>
-        <div
-          className="muted"
-          style={{
-            fontSize: 12,
-            marginTop: 6,
-          }}
-        >
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
           Tip: drag to pan • wheel to zoom • double-click to reset
         </div>
         <div style={{ marginTop: 12 }}>{children}</div>
