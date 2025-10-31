@@ -1,6 +1,7 @@
 # backend/app/services/finance_service.py
 
 import os
+import logging
 import requests
 from fastapi import HTTPException
 from datetime import date, datetime, timedelta
@@ -15,12 +16,13 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
-# Optional: yfinance for accurate historical closes
+# Optional: yfinance for accurate historical closes or breadth fallback
 try:
     import yfinance as yf  # type: ignore
 except Exception:  # pragma: no cover
     yf = None
 
+log = logging.getLogger(__name__)
 load_dotenv()  # loads FINNHUB_*, TWELVEDATA_API_KEY, ALPHAVANTAGE_API_KEY
 
 # Finnhub for quote, earnings, candles
@@ -36,15 +38,16 @@ TD_DIVIDENDS_URL     = "https://api.twelvedata.com/dividends"
 TD_QUOTE_URL         = "https://api.twelvedata.com/quote"
 TD_TIME_SERIES_URL   = "https://api.twelvedata.com/time_series"
 
-# Alpha Vantage (optional) for last-resort quote fallback
+# Alpha Vantage (optional) for last-resort quote fallback (not used directly here)
 AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 AV_URL = "https://www.alphavantage.co/query"
 
-if not FINNHUB_API_KEY or not FINNHUB_SECRET:
-    raise RuntimeError("Missing Finnhub credentials in environment")
-if not TD_KEY:
-    raise RuntimeError("Missing TWELVEDATA_API_KEY in environment")
-# AV_KEY is optional
+# We no longer hard-fail if keys are missing; we degrade gracefully.
+def _has_finnhub() -> bool:
+    return bool(FINNHUB_API_KEY and FINNHUB_SECRET)
+
+def _has_td() -> bool:
+    return bool(TD_KEY)
 
 # -------------------------
 # Utils
@@ -117,25 +120,26 @@ def get_quote(ticker: str):
     """
     symbol = ticker.upper()
 
-    live_price = None  # from Finnhub/Twelve/AV
-    # 1) Finnhub: get current/prev (but we'll trust daily series for last_close)
-    try:
-        r1 = requests.get(
-            FINNHUB_QUOTE_URL,
-            params={"symbol": symbol, "token": FINNHUB_API_KEY},
-            headers={"X-Finnhub-Secret": FINNHUB_SECRET},
-            timeout=6,
-        )
-        r1.raise_for_status()
-        d1 = r1.json()
-        c = d1.get("c")
-        if c is not None:
-            live_price = float(c)
-    except Exception:
-        pass
+    live_price = None  # from Finnhub/Twelve
+    # 1) Finnhub: get current/prev (we'll trust daily series for last_close)
+    if _has_finnhub():
+        try:
+            r1 = requests.get(
+                FINNHUB_QUOTE_URL,
+                params={"symbol": symbol, "token": FINNHUB_API_KEY},
+                headers={"X-Finnhub-Secret": FINNHUB_SECRET},
+                timeout=6,
+            )
+            r1.raise_for_status()
+            d1 = r1.json()
+            c = d1.get("c")
+            if c is not None:
+                live_price = float(c)
+        except Exception:
+            pass
 
     # 2) Twelve Data (if we still need live price)
-    if live_price is None:
+    if live_price is None and _has_td():
         try:
             r2 = requests.get(TD_QUOTE_URL, params={"symbol": symbol, "apikey": TD_KEY}, timeout=6)
             r2.raise_for_status()
@@ -184,6 +188,8 @@ def get_quote(ticker: str):
 @lru_cache(maxsize=128)
 def get_earnings(ticker: str):
     symbol = ticker.upper()
+    if not _has_finnhub():
+        return {"ticker": symbol, "nextEarningsDate": None, "available": False, "reason": "FINNHUB_API_KEY missing"}
     today, to_date = date.today().isoformat(), (date.today() + timedelta(days=90)).isoformat()
     try:
         resp = requests.get(
@@ -204,6 +210,8 @@ def get_earnings(ticker: str):
 @lru_cache(maxsize=128)
 def get_dividends(ticker: str):
     symbol = ticker.upper()
+    if not _has_td():
+        return {"ticker": symbol, "available": False, "reason": "TWELVEDATA_API_KEY missing"}
     try:
         r = requests.get(TD_DIVIDENDS_URL, params={"symbol": symbol, "apikey": TD_KEY}, timeout=6)
         r.raise_for_status()
@@ -228,29 +236,63 @@ def get_dividends(ticker: str):
 
 @lru_cache(maxsize=1)
 def get_market_breadth():
+    """
+    Return a consistent structure:
+      { "items": [{"symbol","current_price","last_close","change_pct"} ...] }
+    Uses TwelveData if key exists; otherwise falls back to yfinance (best effort).
+    """
     symbols = ["VIX", "TNX", "SPY", "XLK", "XLF"]
-    try:
-        r = requests.get(TD_QUOTE_URL, params={"symbol": ",".join(symbols), "apikey": TD_KEY}, timeout=6)
-        r.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            raise HTTPException(503, "Rate limited by Twelve Data market API.")
-        raise HTTPException(502, f"Error fetching market breadth: {e.response.text if e.response else str(e)}")
+    items: List[Dict] = []
 
-    js = r.json()
-    out = {}
-    for sym in symbols:
-        info = (js.get(sym) or {}) if isinstance(js, dict) else {}
+    # Try TwelveData multi-quote
+    if _has_td():
         try:
-            price = float(info.get("close", 0))
-            prev  = float(info.get("previous_close", price))
-        except (TypeError, ValueError):
-            continue
-        pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
-        out[sym] = {"current_price": price, "last_close": prev, "change_pct": pct}
-    if not out:
-        raise HTTPException(404, "No market breadth data found")
-    return out
+            r = requests.get(TD_QUOTE_URL, params={"symbol": ",".join(symbols), "apikey": TD_KEY}, timeout=6)
+            r.raise_for_status()
+            js = r.json()
+            for sym in symbols:
+                info = (js.get(sym) or {}) if isinstance(js, dict) else {}
+                try:
+                    price = float(info.get("close", 0))
+                    prev  = float(info.get("previous_close", price))
+                except (TypeError, ValueError):
+                    continue
+                pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
+                items.append({"symbol": sym, "current_price": price, "last_close": prev, "change_pct": pct})
+            if items:
+                return {"items": items}
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise HTTPException(503, "Rate limited by Twelve Data market API.")
+        except Exception:
+            pass
+
+    # Fallback: yfinance (note symbol mapping differences)
+    if yf is not None:
+        yf_map = {"VIX": "^VIX", "TNX": "^TNX", "SPY": "SPY", "XLK": "XLK", "XLF": "XLF"}
+        for sym in symbols:
+            ysym = yf_map.get(sym, sym)
+            try:
+                df = yf.download(ysym, period="5d", interval="1d", auto_adjust=False, progress=False, threads=False)
+                if df is None or df.empty or "Close" not in df.columns:
+                    continue
+                closes = [float(v) for v in df["Close"].dropna().tolist()]
+                if not closes:
+                    continue
+                if len(closes) == 1:
+                    price = prev = closes[-1]
+                else:
+                    price = closes[-1]
+                    prev = closes[-2]
+                pct = 0.0 if prev == 0 else round(((price - prev) / prev) * 100, 2)
+                items.append({"symbol": sym, "current_price": price, "last_close": prev, "change_pct": pct})
+            except Exception:
+                continue
+        if items:
+            return {"items": items}
+
+    # If all fails
+    raise HTTPException(404, "No market breadth data found")
 
 # -------------------------
 # Historical closes helpers
@@ -289,6 +331,8 @@ def _yf_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
 
 def _twelve_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
     """Twelve Data daily time series -> unadjusted Close."""
+    if not _has_td():
+        return None
     try:
         outsize = max(int(days) + 15, 40)
         r = requests.get(
@@ -328,6 +372,8 @@ def _twelve_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
         return None
 
 def _finnhub_download(symbol: str, days: int) -> Optional[Dict[str, List]]:
+    if not _has_finnhub():
+        return None
     now = int(time())
     frm = now - days * 86400 * 3
     try:

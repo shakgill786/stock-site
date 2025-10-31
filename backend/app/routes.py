@@ -1,4 +1,4 @@
-# app/routes.py
+# backend/app/routes.py
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple, Optional
@@ -14,6 +14,7 @@ from app.services.finance_service import (
     get_daily_closes_with_dates,
     get_daily_closes,  # used by movers fallback + predict() fallback
     get_52w_stats,
+    get_dividends,     # NEW: expose dividends endpoint
 )
 
 router = APIRouter()
@@ -441,21 +442,41 @@ async def quote_endpoint(ticker: str):
 async def earnings_endpoint(ticker: str):
     return await asyncio.to_thread(get_earnings, ticker)
 
+@router.get("/dividends", summary="Dividends Endpoint")  # NEW to match frontend fetchDividends()
+async def dividends_endpoint(ticker: str):
+    return await asyncio.to_thread(get_dividends, ticker)
+
 @router.get("/market", summary="Market Endpoint")
 async def market_endpoint():
+    """
+    Always return { items: [...] } with normalized rows.
+    """
     data = await asyncio.to_thread(get_market_breadth)
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        items = []
-        for r in data["items"]:
-            row = {
-                "symbol": r.get("symbol") or r.get("ticker"),
-                "price": r.get("price") or r.get("last"),
-                "change": r.get("change"),
-                "change_pct": r.get("change_pct") or r.get("percent"),
-            }
-            items.append(_normalize_tile_row(row))
-        return {"items": items, "ts": int(time.time() * 1000)}
-    return data
+    items_in = []
+    if isinstance(data, dict):
+        if isinstance(data.get("items"), list):
+            items_in = data["items"]
+        else:
+            # If a dict mapping symbols → objects leaks through, convert to list.
+            for k, v in (data or {}).items():
+                if isinstance(v, dict):
+                    items_in.append({
+                        "symbol": k,
+                        "price": v.get("current_price") or v.get("last"),
+                        "change": v.get("change"),
+                        "change_pct": v.get("change_pct") or v.get("percent"),
+                    })
+    # Normalize rows for UI safety
+    items = []
+    for r in items_in:
+        row = {
+            "symbol": r.get("symbol") or r.get("ticker"),
+            "price": r.get("price") or r.get("current_price"),
+            "change": r.get("change"),
+            "change_pct": r.get("change_pct"),
+        }
+        items.append(_normalize_tile_row(row))
+    return {"items": items, "ts": int(time.time() * 1000)}
 
 # ----------------------- Live quote stream (SSE) -----------------------
 @router.get("/quote_stream", summary="Quote Stream")
@@ -666,43 +687,6 @@ async def top_gainers():
 async def top_losers():
     res = await movers()
     return res.get("losers", [])
-
-# ----------------------- Earnings Calendar (this week) -----------------------
-@router.get("/earnings_week", summary="Earnings Week")
-async def earnings_week():
-    """
-    Returns an array of earnings items for the current week: [{date, symbol, name, session}]
-    """
-    token = os.getenv("FINNHUB_API_KEY")
-    if not token:
-        return {"items": [], "error": "FINNHUB_API_KEY missing"}
-
-    start_iso, end_iso = _this_week_range()
-    url = "https://finnhub.io/api/v1/calendar/earnings"
-    params = {"from": start_iso, "to": end_iso, "token": token}
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(url, params=params)
-        data = r.json() if r.content else {}
-
-    rows = data.get("earningsCalendar") or data.get("earnings") or []
-    out: List[Dict[str, Any]] = []
-    for it in rows:
-        dt = (it.get("date") or it.get("reportDate") or "")[:10]
-        sym = _norm_symbol(it.get("symbol") or it.get("ticker"))
-        session = (it.get("hour") or it.get("time") or "").upper()
-        if session not in {"BMO", "AMC"}:
-            session = "UNK"
-        name = it.get("company") or it.get("name") or sym
-        if sym and dt:
-            out.append({"date": dt, "symbol": sym, "name": name, "session": session})
-
-    out.sort(key=lambda x: (x["date"], x["symbol"]))
-    return {"items": out[:500]}
-
-@router.get("/earnings_week/", summary="Earnings Week (alias)")
-async def earnings_week_alias():
-    return await earnings_week()
 
 # ======================= Sentiment =======================
 def _iso_date(s: str) -> str:
@@ -930,37 +914,3 @@ async def sentiment_correlation(ticker: str, days: int = 120):
 @router.get("/sentiment/correlate", summary="Alias to /sentiment/correlation")
 async def sentiment_correlate(ticker: str, days: int = 120):
     return await sentiment_correlation(ticker=ticker, days=days)
-
-# ----------------------- Sentiment alerts SSE -----------------------
-@router.get("/sentiment/alerts_stream", summary="Sentiment Alerts (SSE)")
-async def sentiment_alerts_stream(ticker: str, days: int = 60, interval: float = 30.0):
-    """
-    Emits a lightweight alert when the latest daily sentiment mean crosses thresholds.
-    Levels: strong_pos (>= +0.4), pos (>= +0.2), neg (<= -0.2), strong_neg (<= -0.4)
-    """
-    symbol = _norm_symbol(ticker)
-    interval = max(10.0, min(float(interval), 300.0))
-
-    async def event_gen():
-        try:
-            while True:
-                daily = await _fetch_av_news_sentiment(symbol, days)
-                payload: Dict[str, Any]
-                if not daily:
-                    payload = {"ticker": symbol, "error": "no sentiment", "ts": int(time.time())}
-                else:
-                    last = daily[-1]
-                    s = float(last["mean"])
-                    level = "neutral"
-                    if s >= 0.4: level = "strong_pos"
-                    elif s >= 0.2: level = "pos"
-                    elif s <= -0.4: level = "strong_neg"
-                    elif s <= -0.2: level = "neg"
-                    payload = {"ticker": symbol, "date": last["date"], "score": s, "level": level, "ts": int(time.time())}
-
-                yield f"data: {json.dumps(payload)}\n\n"
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
-
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
