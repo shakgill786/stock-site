@@ -9,29 +9,22 @@ import {
 } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
-const SPLIT_RATIO_THRESHOLD = 2.0; // tolerate up to ~100% gap day/day before calling it a split
-const SANE_PCT_LIMIT = 80; // kill <-80% / >+80% "moves"
-const MIN_MOVE_PCT = 0.05; // (kept for calibration targets if you expand later)
+const SPLIT_RATIO_THRESHOLD = 2.0;
+const SANE_PCT_LIMIT = 80;
 
-const HYDRATE_BATCH = 6;
-const CALIBRATE_FIRST = 60;
+// 🔧 NEW: require a non-trivial move to display (drop ~0% rows)
+const MIN_MOVE_PCT = 0.25;
 
 const EPS = 1e-6;
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
-  if (typeof v === "number") return v;
-  if (typeof v === "string") {
-    const s = v.trim().replace(/[%,$]/g, "");
-    if (!s) return NaN;
-    const n = Number(s);
-    return Number.isFinite(n) ? n : NaN;
-  }
-  return NaN;
+  if (typeof v === "string" && v.trim() === "") return NaN;
+  const n = +v;
+  return Number.isFinite(n) ? n : NaN;
 };
 const isNum = (v) => Number.isFinite(toNum(v));
 const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
-// formatting helpers
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
   isNum(v)
@@ -59,29 +52,14 @@ const fmtDateHuman = (iso) => {
 const SESSION_BADGE = (s) => {
   const S = String(s || "").toUpperCase();
   if (S === "BMO")
-    return {
-      text: "BMO",
-      bg: "rgba(25,118,210,0.15)",
-      fg: "#64b5f6",
-      br: "rgba(100,181,246,0.35)",
-    };
+    return { text: "BMO", bg: "rgba(25,118,210,0.15)", fg: "#64b5f6", br: "rgba(100,181,246,0.35)" };
   if (S === "AMC")
-    return {
-      text: "AMC",
-      bg: "rgba(244,67,54,0.15)",
-      fg: "#ef9a9a",
-      br: "rgba(239,154,154,0.35)",
-    };
-  return {
-    text: S || "—",
-    bg: "rgba(255,255,255,0.08)",
-    fg: "#bbb",
-    br: "rgba(255,255,255,0.12)",
-  };
+    return { text: "AMC", bg: "rgba(244,67,54,0.15)", fg: "#ef9a9a", br: "rgba(239,154,154,0.35)" };
+  return { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
 };
 
 const looksClamped = (pct) =>
-  isNum(pct) && Math.abs(toNum(pct)) >= 24.9; // vendor "max ±25%" circuit breaker look
+  isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
 
 function firstNum(obj, keys) {
   for (const k of keys) {
@@ -99,10 +77,6 @@ const signMismatch = (a, b) =>
   !nearZero(b) &&
   Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
-/**
- * normalizeRow: try to coerce whatever junk vendor sent into:
- * { symbol, price, last_close, change, change_pct }
- */
 function normalizeRow(row) {
   const symbol = String(
     row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || ""
@@ -162,7 +136,6 @@ function normalizeRow(row) {
 
   const open = firstNum(row, ["open", "Open"]);
 
-  // unclamp vendor's ±25% wall if possible
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const base = toNum(price) - toNum(change);
     if (isNum(base) && !nearZero(base)) {
@@ -171,7 +144,6 @@ function normalizeRow(row) {
     }
   }
 
-  // recompute from prevClose if we have it
   if (isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
@@ -179,7 +151,6 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback to open (intraday reference)
   if (
     !(isNum(change) && isNum(change_pct)) &&
     isNum(price) &&
@@ -192,13 +163,11 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = intradayPct;
   }
 
-  // derive missing piece from pct
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
     if (isNum(base) && !nearZero(base))
       change = (toNum(change_pct) / 100) * toNum(base);
   }
-  // derive pct from change
   if (!isNum(change_pct) && isNum(change)) {
     const base = isNum(prevClose)
       ? prevClose
@@ -212,7 +181,6 @@ function normalizeRow(row) {
     if (isNum(p2)) change_pct = p2;
   }
 
-  // pct might be fractional (0.8 = 80%)
   if (
     isNum(change_pct) &&
     Math.abs(toNum(change_pct)) <= 2.5 &&
@@ -229,7 +197,6 @@ function normalizeRow(row) {
     change_pct = err2 < err1 ? asPercentTimes100 : asPercent;
   }
 
-  // fix sign mismatch
   if (signMismatch(change, change_pct)) {
     const base = isNum(prevClose)
       ? prevClose
@@ -253,7 +220,6 @@ function normalizeRow(row) {
   };
 }
 
-// quote fallback row
 function pickFromQuote(q) {
   const lastClose = toNum(
     firstNum(q, [
@@ -265,7 +231,6 @@ function pickFromQuote(q) {
     ])
   );
 
-  // choose extended/session price if present, else regular
   const extPrice = firstNum(q, [
     "extended_price",
     "ext_price",
@@ -328,7 +293,6 @@ function pickFromQuote(q) {
   });
 }
 
-// use last 2 unique closes to compute sane pct move
 function pickLastTwoCloses(resp) {
   const ds = Array.isArray(resp?.dates) ? resp.dates : [];
   const cs = Array.isArray(resp?.closes) ? resp.closes : [];
@@ -363,7 +327,6 @@ function pickLastTwoCloses(resp) {
   if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
   const ratio = Math.abs(toNum(last.c) / toNum(prev.c));
 
-  // looks like a split or garbage → bail
   if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
     return null;
   }
@@ -380,7 +343,6 @@ function pickLastTwoCloses(resp) {
   };
 }
 
-// hydrate with /closes then /quote fallbacks
 async function calibrateRow(row) {
   const sym = row.symbol;
   try {
@@ -395,9 +357,7 @@ async function calibrateRow(row) {
         change_pct: eod.change_pct,
       });
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 
   try {
     const q = await fetchQuote(sym);
@@ -410,11 +370,10 @@ async function calibrateRow(row) {
 async function calibrateList(rows) {
   const base = rows.map((r) => normalizeRow(r));
 
-  // mark "sketchy" rows for hydration with slower calls
   const badIdx = base
     .map((r, i) => {
       const pct = toNum(r.change_pct);
-      const huge = isNum(pct) && Math.abs(pct) > SANE_PCT_LIMIT;
+      const huge = Number.isFinite(pct) && Math.abs(pct) > SANE_PCT_LIMIT;
       const missingBoth = !isNum(r.change) && !isNum(r.change_pct);
       return huge || missingBoth ? i : -1;
     })
@@ -422,13 +381,13 @@ async function calibrateList(rows) {
 
   const targets = [
     ...new Set([
-      ...[...Array(Math.min(base.length, CALIBRATE_FIRST)).keys()],
+      ...[...Array(Math.min(base.length, 60)).keys()],
       ...badIdx,
     ]),
   ];
 
-  for (let k = 0; k < targets.length; k += HYDRATE_BATCH) {
-    const slice = targets.slice(k, k + HYDRATE_BATCH);
+  for (let k = 0; k < targets.length; k += 6) {
+    const slice = targets.slice(k, k + 6);
     await Promise.all(
       slice.map(async (i) => {
         base[i] = await calibrateRow(base[i]);
@@ -438,7 +397,6 @@ async function calibrateList(rows) {
   return base;
 }
 
-// make sure $chg and %chg line up with price vs last_close
 function recomputeFromClose(r) {
   if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
@@ -448,15 +406,15 @@ function recomputeFromClose(r) {
   return r;
 }
 
-// how "big" is the move? (0% is allowed now)
 function saneAbsPct(row) {
   if (!isNum(row.change_pct)) return NaN;
   const absPct = Math.abs(toNum(row.change_pct));
   if (absPct > SANE_PCT_LIMIT) return NaN;
+  // 🔧 NEW: treat tiny moves as unusable for ranking
+  if (absPct < MIN_MOVE_PCT) return NaN;
   return absPct;
 }
 
-// we choose best duplicate ticker row by "better" pct info
 function mergeBestBySymbol(rows) {
   const out = new Map();
   for (const raw of rows) {
@@ -472,13 +430,11 @@ function mergeBestBySymbol(rows) {
     const prevAbs = saneAbsPct(prev);
     const currAbs = saneAbsPct(r);
 
-    // prefer the one that has *valid* saneAbsPct at all
     if (Number.isFinite(currAbs) && !Number.isFinite(prevAbs)) {
       out.set(r.symbol, r);
       continue;
     }
     if (Number.isFinite(currAbs) && Number.isFinite(prevAbs)) {
-      // if both valid, prefer the one with larger |pct|
       if (currAbs > prevAbs) {
         out.set(r.symbol, r);
         continue;
@@ -488,33 +444,34 @@ function mergeBestBySymbol(rows) {
   return [...out.values()];
 }
 
-// classify + / -
+// 🔧 NEW: return 0 for neutral rows so they are excluded
 function rowSign(r) {
   if (isNum(r.change_pct)) {
     const v = toNum(r.change_pct);
-    if (!nearZero(v)) return Math.sign(v);
-    return v >= 0 ? 1 : -1;
+    if (nearZero(v)) return 0;
+    return Math.sign(v);
   }
   if (isNum(r.change)) {
     const v = toNum(r.change);
-    if (!nearZero(v)) return Math.sign(v);
-    return v >= 0 ? 1 : -1;
+    if (nearZero(v)) return 0;
+    return Math.sign(v);
   }
   if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
-    if (!nearZero(ch)) return Math.sign(ch);
-    return ch >= 0 ? 1 : -1;
+    if (nearZero(ch)) return 0;
+    return Math.sign(ch);
   }
   return 0;
 }
 
-// final display filter (loosened)
+// 🔧 NEW: drop neutral/near-zero moves from display
 function validRowForDisplay(r) {
   if (!isNum(r.price)) return false;
   if (toNum(r.price) < 1) return false;
   if (!isNum(r.change_pct)) return false;
   const absPct = Math.abs(toNum(r.change_pct));
   if (absPct > SANE_PCT_LIMIT) return false;
+  if (absPct < MIN_MOVE_PCT) return false;
   return true;
 }
 
@@ -623,16 +580,14 @@ function MoversCard({
                   className="num th-click"
                   onClick={() => onHeaderClick("price")}
                 >
-                  Price{" "}
-                  {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                  Price {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
                   onClick={() => onHeaderClick("change")}
                   title="Sort by $ change"
                 >
-                  $ Change{" "}
-                  {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                  $ Change {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
@@ -640,11 +595,7 @@ function MoversCard({
                   title="Sort by % change"
                 >
                   % Change{" "}
-                  {sortKey === "change_pct"
-                    ? sortDir === "desc"
-                      ? "▾"
-                      : "▴"
-                    : ""}
+                  {sortKey === "change_pct" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
               </tr>
             </thead>
@@ -663,9 +614,7 @@ function MoversCard({
                         onClick={() => {
                           onPick?.(sym);
                           window.dispatchEvent(
-                            new CustomEvent("ticker:set", {
-                              detail: sym,
-                            })
+                            new CustomEvent("ticker:set", { detail: sym })
                           );
                         }}
                         title={`Load ${sym}`}
@@ -694,7 +643,6 @@ function MoversCard({
 function EarningsListCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
-  // filter client-side as user types
   const filtered = useMemo(() => {
     const list = Array.isArray(items) ? items : [];
     const needle = q.trim().toUpperCase();
@@ -704,7 +652,6 @@ function EarningsListCard({ items = [], loading, error, onPick }) {
     );
   }, [items, q]);
 
-  // group by date and dedupe tickers *within that date*
   const groups = useMemo(() => {
     const map = new Map();
     for (const row of filtered) {
@@ -777,7 +724,7 @@ function EarningsListCard({ items = [], loading, error, onPick }) {
                     const sym = String(r.symbol || "").toUpperCase();
                     return (
                       <tr key={`${date}-${sym}-${i}`}>
-                        <td className="muted">{/* intentionally blank */}</td>
+                        <td className="muted">{/* spacer */}</td>
                         <td
                           style={{
                             textAlign: "center",
@@ -790,9 +737,7 @@ function EarningsListCard({ items = [], loading, error, onPick }) {
                             onClick={() => {
                               onPick?.(sym);
                               window.dispatchEvent(
-                                new CustomEvent("ticker:set", {
-                                  detail: sym,
-                                })
+                                new CustomEvent("ticker:set", { detail: sym })
                               );
                             }}
                             title={`Load ${sym}`}
@@ -859,24 +804,22 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const rawG = Array.isArray(mv?.gainers) ? mv.gainers : [];
       const rawL = Array.isArray(mv?.losers) ? mv.losers : [];
 
-      // "hydrate" & normalize
       const [gCal, lCal] = await Promise.all([
         calibrateList(rawG),
         calibrateList(rawL),
       ]);
 
-      // dedupe symbol-level, recompute change_pct from price vs last_close
       const merged = mergeBestBySymbol([...gCal, ...lCal]);
 
-      // split them into positive/negative buckets
       const pos = [];
       const neg = [];
       for (const r0 of merged) {
         const r = recomputeFromClose(r0);
         if (!validRowForDisplay(r)) continue;
-        const sgn = rowSign(r); // >=0 goes to pos, <0 to neg
-        if (sgn >= 0) pos.push(r);
-        else neg.push(r);
+        const sgn = rowSign(r);
+        if (sgn > 0) pos.push(r);
+        else if (sgn < 0) neg.push(r);
+        // neutral (0%) dropped
       }
 
       setGainers(pos);
@@ -899,7 +842,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
       if (!wk && typeof wk !== "object") wk = {};
       const items = Array.isArray(wk?.items) ? wk.items : [];
 
-      // fallback endpoint if needed
       if (!items.length) {
         try {
           const res = await fetch(`${API_BASE}/earnings_week/`, {
@@ -919,9 +861,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
               return;
             }
           }
-        } catch {
-          /* ignore */
-        }
+        } catch {}
       }
 
       setEarnings(items.slice(0, 500));
@@ -943,7 +883,6 @@ export default function HotAndEarnings({ onSelectTicker }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // supply symbols to TopBuysCard (model scoring)
   const topBuyCandidates = useMemo(() => {
     const fromMovers = [...gainers, ...losers].map((r) => r.symbol);
     const uniq = Array.from(new Set(fromMovers));
@@ -951,22 +890,8 @@ export default function HotAndEarnings({ onSelectTicker }) {
     return Array.from(
       new Set(
         uniq.concat([
-          "AAPL",
-          "MSFT",
-          "NVDA",
-          "AMZN",
-          "META",
-          "GOOGL",
-          "TSLA",
-          "AVGO",
-          "JPM",
-          "V",
-          "MA",
-          "LLY",
-          "UNH",
-          "HD",
-          "PEP",
-          "KO",
+          "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","JPM","V","MA",
+          "LLY","UNH","HD","PEP","KO"
         ])
       )
     );
@@ -1019,160 +944,31 @@ export default function HotAndEarnings({ onSelectTicker }) {
       />
 
       <style>{`
-        .he-grid {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 12px;
-          width: 100%;
-          margin-top: 8px;
-        }
-        @media (min-width: 980px) {
-          .he-grid { grid-template-columns: 1fr 1fr; }
-          .he-grid > :nth-last-child(1) { grid-column: 1 / -1; }
-        }
-
-        .he-toolbar {
-          grid-column: 1 / -1;
-          display: flex;
-          justify-content: flex-end;
-          align-items: center;
-        }
-        .he-toolbar .btn {
-          width: auto !important;
-          min-width: unset;
-          display: inline-flex;
-          align-items: center;
-        }
-        .he-refresh {
-          padding: 6px 10px;
-          font-size: 12px;
-        }
-
-        .he-card {
-          padding: 12px;
-          overflow: hidden;
-          border-radius: 14px;
-          background: radial-gradient(
-              120% 120% at 100% 0%,
-              rgba(160,170,255,0.06),
-              rgba(25,28,45,0.6) 55%,
-              rgba(17,20,35,0.8)
-            );
-          border: 1px solid rgba(255,255,255,0.07);
-          box-shadow: 0 6px 18px rgba(0,0,0,0.25);
-        }
-        .he-card-head {
-          display: flex;
-          align-items: baseline;
-          justify-content: space-between;
-          margin-bottom: 6px;
-        }
-        .he-head-right,
-        .he-controls {
-          display: flex;
-          gap: 8px;
-          align-items: center;
-        }
-        .he-source {
-          font-size: 12px;
-          color: #a8b2ff;
-        }
-        .he-scroll {
-          max-height: 420px;
-          overflow: auto;
-          border-radius: 12px;
-          background: rgba(255,255,255,0.02);
-          border: 1px solid rgba(255,255,255,0.06);
-        }
-        .he-table {
-          width: 100%;
-          table-layout: fixed;
-          font-size: 13px;
-          border-collapse: separate;
-          border-spacing: 0;
-        }
-        .he-table thead th {
-          position: sticky;
-          top: 0;
-          background: rgba(12,14,24,0.85);
-          backdrop-filter: blur(2px);
-          z-index: 2;
-          padding: 8px 10px;
-        }
-        .he-table tbody tr:nth-child(odd) {
-          background: rgba(255,255,255,0.02);
-        }
-        .he-table td,
-        .he-table th {
-          vertical-align: middle;
-          padding: 8px 10px;
-        }
-        .num {
-          text-align: right;
-          font-variant-numeric: tabular-nums;
-        }
-        .th-click {
-          cursor: pointer;
-          user-select: none;
-        }
-        .pos {
-          color: #2e7d32;
-          font-weight: 600;
-        }
-        .neg {
-          color: #c62828;
-          font-weight: 600;
-        }
-        .he-toprow td {
-          background: linear-gradient(
-            90deg,
-            rgba(168,178,255,0.07),
-            transparent 60%
-          );
-        }
-
-        .he-group-row td {
-          position: sticky;
-          top: 28px;
-          background: rgba(70,80,130,0.16);
-          border-top: 1px solid rgba(255,255,255,0.06);
-          z-index: 1;
-          font-weight: 700;
-        }
-
-        .he-badge {
-          display: inline-block;
-          padding: 2px 8px;
-          border-radius: 999px;
-          font-size: 12px;
-          line-height: 1.3;
-        }
-
-        .ticker-link {
-          background: transparent;
-          border: none;
-          padding: 0;
-          margin: 0;
-          cursor: pointer;
-          color: #a2c4ff;
-          text-decoration: underline;
-          text-underline-offset: 2px;
-          font: inherit;
-          font-weight: 700;
-          letter-spacing: .2px;
-        }
-        .ticker-link:hover {
-          color: #d6e3ff;
-          text-shadow: 0 0 6px rgba(110,168,255,.45);
-          text-decoration-thickness: 2px;
-        }
-
-        .muted {
-          color: #a7adbc;
-        }
-        .muted.error {
-          color: #ff6b6b;
-        }
+        .he-grid { display:grid; grid-template-columns:1fr; gap:12px; width:100%; margin-top:8px; }
+        @media (min-width: 980px) { .he-grid { grid-template-columns: 1fr 1fr; } .he-grid > :nth-last-child(1) { grid-column: 1 / -1; } }
+        .he-toolbar { grid-column:1/-1; display:flex; justify-content:flex-end; align-items:center; }
+        .he-toolbar .btn { width:auto!important; min-width:unset; display:inline-flex; align-items:center; }
+        .he-refresh { padding:6px 10px; font-size:12px; }
+        .he-card { padding:12px; overflow:hidden; border-radius:14px; background: radial-gradient(120% 120% at 100% 0%, rgba(160,170,255,0.06), rgba(25,28,45,0.6) 55%, rgba(17,20,35,0.8)); border:1px solid rgba(255,255,255,0.07); box-shadow:0 6px 18px rgba(0,0,0,0.25); }
+        .he-card-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }
+        .he-head-right, .he-controls { display:flex; gap:8px; align-items:center; }
+        .he-source { font-size:12px; color:#a8b2ff; }
+        .he-scroll { max-height:420px; overflow:auto; border-radius:12px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); }
+        .he-table { width:100%; table-layout:fixed; font-size:13px; border-collapse:separate; border-spacing:0; }
+        .he-table thead th { position:sticky; top:0; background:rgba(12,14,24,0.85); backdrop-filter:blur(2px); z-index:2; padding:8px 10px; }
+        .he-table tbody tr:nth-child(odd) { background:rgba(255,255,255,0.02); }
+        .he-table td, .he-table th { vertical-align:middle; padding:8px 10px; }
+        .num { text-align:right; font-variant-numeric:tabular-nums; }
+        .th-click { cursor:pointer; user-select:none; }
+        .pos { color:#2e7d32; font-weight:600; }
+        .neg { color:#c62828; font-weight:600; }
+        .he-toprow td { background: linear-gradient(90deg, rgba(168,178,255,0.07), transparent 60%); }
+        .he-group-row td { position:sticky; top:28px; background:rgba(70,80,130,0.16); border-top:1px solid rgba(255,255,255,0.06); z-index:1; font-weight:700; }
+        .he-badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; line-height:1.3; }
+        .ticker-link { background:transparent; border:none; padding:0; margin:0; cursor:pointer; color:#a2c4ff; text-decoration:underline; text-underline-offset:2px; font:inherit; font-weight:700; letter-spacing:.2px; }
+        .ticker-link:hover { color:#d6e3ff; text-shadow:0 0 6px rgba(110,168,255,.45); text-decoration-thickness:2px; }
+        .muted { color:#a7adbc; }
+        .muted.error { color:#ff6b6b; }
       `}</style>
     </div>
   );

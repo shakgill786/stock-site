@@ -89,7 +89,13 @@ const nextBiz = (iso) => {
 const normModel = (s) => String(s || "").trim().toUpperCase();
 const dkey = (s) => String(s).slice(0, 10);
 
-const toNum = (x) => (Number.isFinite(+x) ? +x : null);
+// SAFER numeric parser: null/undefined/"" => null (never coerce to 0)
+const toNum = (x) => {
+  if (x === null || x === undefined) return null;
+  if (typeof x === "string" && x.trim() === "") return null;
+  const n = +x;
+  return Number.isFinite(n) ? n : null;
+};
 
 const safePct = (curr, prev) =>
   Number.isFinite(curr) && Number.isFinite(prev) && prev !== 0
@@ -101,7 +107,6 @@ const safePct = (curr, prev) =>
    ========================= */
 const SPLIT_RATIO_THRESHOLD = 2.0;
 
-// Dedupe if vendor duplicated last value across 2 dates
 const dropDupTailSeries = (dates = [], closes = []) => {
   const n = Math.min(dates.length, closes.length);
   if (n >= 2) {
@@ -118,32 +123,28 @@ const dropDupTailSeries = (dates = [], closes = []) => {
   return { dates, closes, dropped: false };
 };
 
-// Clean weird tail rows in predict_history
 function dropDupTailHistory(rows = []) {
   const arr = Array.isArray(rows) ? [...rows] : [];
   const n = arr.length;
   if (n < 2) return arr;
 
   const getActual = (row) => {
-    const a = Number(row?.actual);
-    if (Number.isFinite(a)) return a;
-    const c = Number(row?.close);
-    if (Number.isFinite(c)) return c;
-    return null;
+    const a = toNum(row?.actual);
+    if (a != null) return a;
+    const c = toNum(row?.close);
+    return c != null ? c : null;
   };
 
   const lastA = getActual(arr[n - 1]);
   const prevA = getActual(arr[n - 2]);
 
-  // Step 1: kill obvious split-scale mismatch on last row
-  if (Number.isFinite(lastA) && Number.isFinite(prevA) && prevA !== 0) {
+  if (lastA != null && prevA != null && prevA !== 0) {
     const ratio = Math.abs(lastA / prevA);
     if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
       arr.pop();
     }
   }
 
-  // Step 2: drop duplicate price across 2 different dates at tail
   const m = arr.length;
   if (m >= 2) {
     const aVal = getActual(arr[m - 1]);
@@ -151,12 +152,7 @@ function dropDupTailHistory(rows = []) {
     const dA = String(arr[m - 1]?.date || "");
     const dB = String(arr[m - 2]?.date || "");
 
-    if (
-      dA !== dB &&
-      Number.isFinite(aVal) &&
-      Number.isFinite(bVal) &&
-      aVal === bVal
-    ) {
+    if (dA !== dB && aVal != null && bVal != null && aVal === bVal) {
       arr.pop();
     }
   }
@@ -170,7 +166,7 @@ function dropDupTailHistory(rows = []) {
 function sanitizeClosesWithQuote({ dates, closes, quote }) {
   let outDates = Array.isArray(dates) ? [...dates] : [];
   let outCloses = Array.isArray(closes)
-    ? closes.map(Number).filter(Number.isFinite)
+    ? closes.map((v) => toNum(v)).filter((v) => v != null)
     : [];
 
   if (!outDates.length || outDates.length !== outCloses.length) {
@@ -178,30 +174,28 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   }
 
   const providerLastRaw = outCloses[outCloses.length - 1];
-  const quoteLast = Number(quote?.last_close);
-  const quoteCurr = Number(quote?.current_price);
+  const quoteLast = toNum(quote?.last_close);
+  const quoteCurr = toNum(quote?.current_price);
 
-  const haveProvider = Number.isFinite(providerLastRaw) && providerLastRaw > 0;
-  const haveQuoteLast = Number.isFinite(quoteLast) && quoteLast > 0;
+  const haveProvider = providerLastRaw != null && providerLastRaw > 0;
+  const haveQuoteLast = quoteLast != null && quoteLast > 0;
 
   if (haveProvider && haveQuoteLast) {
     const ratio = quoteLast / providerLastRaw;
 
-    // is "last_close" basically today's live price => probably not settled yet
     const looksLikeNow =
-      Number.isFinite(quoteCurr) &&
+      quoteCurr != null &&
       Math.abs(quoteCurr - quoteLast) / (Math.abs(quoteLast) || 1) < 0.02;
 
     const bigMismatch = ratio > 1.25 || ratio < 0.8;
 
     if (!looksLikeNow && bigMismatch) {
-      let scaled = outCloses.map((v) => (Number.isFinite(v) ? v * ratio : v));
+      let scaled = outCloses.map((v) => (v != null ? v * ratio : v));
       scaled[scaled.length - 1] = quoteLast;
       outCloses = scaled;
     }
   }
 
-  // drop duplicate last rows if vendor glued same price to 2 dates
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
 }
@@ -259,49 +253,36 @@ export default function App() {
   const [ticker, setTicker] = useState("AAPL");
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
-  // Compare Mode
   const [compareOpen, setCompareOpen] = useState(false);
   const [compareSymbols, setCompareSymbols] = useState([]);
 
-  // Data
   const [quote, setQuote] = useState(null);
   const [earnings, setEarnings] = useState(null);
   const [market, setMarket] = useState(null);
 
-  // Errors / diag
   const [quoteErr, setQuoteErr] = useState(false);
   const [earningsErr, setEarningsErr] = useState(false);
   const [error, setError] = useState("");
   const [diagnostic, setDiagnostic] = useState("");
 
-  // Predictions
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  // Live stream
   const [live, setLive] = useState(true);
   const prevPriceRef = useRef(null);
   const tweenPrice = useTweenNumber(quote?.current_price ?? 0, { duration: 450 });
   const [blinkClass, setBlinkClass] = useState("");
 
-  // price chart data
   const [closes, setCloses] = useState([]);
   const [closeDates, setCloseDates] = useState([]);
   const [showBigPriceChart, setShowBigPriceChart] = useState(false);
 
-  // history rows from backend
   const [historyRows, setHistoryRows] = useState([]);
 
-  // loader version guard
   const reqVer = useRef(0);
-
-  // abort controller
   const abortRef = useRef(null);
-
-  // ref to scroll to ticker block
   const mainSectionRef = useRef(null);
 
-  /* ---------- Broadcast ticker selection ---------- */
   useEffect(() => {
     const handler = (e) => {
       const sym = String(e?.detail || "").toUpperCase().trim();
@@ -312,7 +293,6 @@ export default function App() {
     return () => window.removeEventListener("ticker:set", handler);
   }, []);
 
-  /* ---------- Warm backend ---------- */
   useEffect(() => {
     (async () => {
       try {
@@ -324,10 +304,9 @@ export default function App() {
     })();
   }, []);
 
-  /* ---------- helpers ---------- */
   const normalizeCloses = (arr) => {
     if (!Array.isArray(arr)) return [];
-    const cleaned = arr.map(Number).filter((v) => Number.isFinite(v));
+    const cleaned = arr.map((v) => toNum(v)).filter((v) => v != null);
     return cleaned.length >= 2 ? cleaned : [];
   };
 
@@ -352,33 +331,29 @@ export default function App() {
     );
   };
 
-  /* ---------- Build lookup from predict_history ---------- */
   const { histPred } = useMemo(() => {
     const byDateModel = {};
     (historyRows || []).forEach((r) => {
       const dk = dkey(r.date);
       const perModel = {};
       Object.entries(r.pred || {}).forEach(([m, v]) => {
-        perModel[normModel(m)] = toNum(v);
+        const nv = toNum(v);
+        if (nv != null) perModel[normModel(m)] = nv;
       });
       byDateModel[dk] = perModel;
     });
     return { histPred: byDateModel };
   }, [historyRows]);
 
-  // Map date -> close for vendor close series (after sanitizeClosesWithQuote)
   const closeMap = useMemo(() => {
     const m = {};
     (closeDates || []).forEach((d, i) => {
       const v = toNum(closes?.[i]);
-      if (Number.isFinite(v)) {
-        m[dkey(d)] = v;
-      }
+      if (v != null) m[dkey(d)] = v;
     });
     return m;
   }, [closeDates, closes]);
 
-  /* ---------- Load data (quote, earnings, etc.) ---------- */
   const loadData = useCallback(async () => {
     const myVer = ++reqVer.current;
 
@@ -396,13 +371,12 @@ export default function App() {
 
     const t = String(ticker || "").toUpperCase().trim();
 
-    // Quote
     const pQuote = (async () => {
       try {
         const q = await fetchQuote(t, { signal: ctrl.signal });
         if (reqVer.current !== myVer) return null;
         setQuote(q);
-        prevPriceRef.current = q?.current_price ?? null;
+        prevPriceRef.current = toNum(q?.current_price);
         if (!live) setLive(true);
         return q;
       } catch {
@@ -413,7 +387,6 @@ export default function App() {
       }
     })();
 
-    // Earnings
     const pEarn = (async () => {
       try {
         const e = await fetchEarnings(t, { signal: ctrl.signal });
@@ -425,18 +398,14 @@ export default function App() {
       }
     })();
 
-    // Market
     const pMkt = (async () => {
       try {
         const m = await fetchMarket({ signal: ctrl.signal });
         if (reqVer.current !== myVer) return;
         setMarket(m);
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     })();
 
-    // Closes (chart series)
     const pCloses = (async () => {
       try {
         const raw = await fetchClosesSafe(t, ctrl.signal);
@@ -461,7 +430,6 @@ export default function App() {
       }
     })();
 
-    // Past predict history rows
     const pHist = (async () => {
       try {
         const hist = await fetchPredictHistory(
@@ -480,7 +448,6 @@ export default function App() {
       }
     })();
 
-    // forward predictions
     const pPredict = (async () => {
       try {
         const res = await fetchPredict({ ticker: t, models }, { signal: ctrl.signal });
@@ -508,7 +475,6 @@ export default function App() {
     }
   }, [ticker, models, live]);
 
-  /* ---------- Run loadData when ticker/models change ---------- */
   useEffect(() => {
     loadData();
     return () => {
@@ -518,7 +484,6 @@ export default function App() {
     };
   }, [loadData]);
 
-  /* ---------- SSE live quote ---------- */
   useEffect(() => {
     if (!live || !ticker) return;
     const url = buildQuoteStreamURL(ticker, 5);
@@ -533,18 +498,14 @@ export default function App() {
         const payload = JSON.parse(ev.data);
         const prev = prevPriceRef.current;
         const next = toNum(payload.current_price);
-        const lastClose =
-          toNum(payload.last_close) ?? toNum(quote?.last_close) ?? null;
+        const lastClose = toNum(payload.last_close) ?? toNum(quote?.last_close) ?? null;
 
         if (next != null) {
           setQuote((q) => {
             const base = q || {};
             const derivedPct = safePct(next, lastClose);
             const pct =
-              toNum(payload.change_pct) ??
-              derivedPct ??
-              toNum(base.change_pct) ??
-              0;
+              toNum(payload.change_pct) ?? derivedPct ?? toNum(base.change_pct) ?? 0;
             return {
               ...base,
               ticker: payload.ticker ?? base.ticker ?? ticker,
@@ -560,9 +521,7 @@ export default function App() {
           }
           prevPriceRef.current = next;
         }
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     };
     es.onerror = () => {
       try {
@@ -576,7 +535,6 @@ export default function App() {
     };
   }, [live, ticker, quote?.last_close]);
 
-  /* ---------- UI handlers ---------- */
   const handleSubmit = (e) => {
     e.preventDefault();
     loadData();
@@ -605,29 +563,29 @@ export default function App() {
     setCompareOpen(true);
   };
 
-  /* ---------- Strict Actuals & aligned backtests ---------- */
-
   function pickActualForDateStrict(iso, closeMap) {
     const key = dkey(iso);
     const v = toNum(closeMap?.[key]);
-    return Number.isFinite(v) ? v : null;
+    return v != null ? v : null;
   }
 
-  const getHistPredForDate = (iso, mKey, histPred) =>
-    toNum(histPred?.[iso]?.[mKey]) ??
-    toNum(histPred?.[prevBiz(iso)]?.[mKey]) ??
-    toNum(histPred?.[nextBiz(iso)]?.[mKey]) ??
-    null;
+  const getHistPredForDate = (iso, mKey, histPred) => {
+    const v =
+      toNum(histPred?.[iso]?.[mKey]) ??
+      toNum(histPred?.[prevBiz(iso)]?.[mKey]) ??
+      toNum(histPred?.[nextBiz(iso)]?.[mKey]) ??
+      null;
+    return v;
+  };
 
-  /* ---------- Metrics & Recommendation ---------- */
   const metrics = useMemo(() => {
     if (!quote || !results?.length) return [];
     const base = toNum(quote.last_close) || 0;
     if (base <= 0) return [];
     return results.map((r) => {
       const preds = (Array.isArray(r.predictions) ? r.predictions : [])
-        .map(Number)
-        .filter(Number.isFinite);
+        .map(toNum)
+        .filter((v) => v != null);
       if (!preds.length)
         return {
           model: r.model,
@@ -652,28 +610,23 @@ export default function App() {
     return { ...best, action };
   }, [metrics]);
 
-  /* ---------- Actual vs Predicted prep ---------- */
-
   const horizon = results?.[0]?.predictions?.length || 0;
   const pastDaysToShow = 10;
 
-  // PAST: strictly from vendor closes (no mixing with predict_history dates)
   let pastLabels = (closeDates || []).slice(-pastDaysToShow);
 
-  // Guard: drop a weird duplicated final point or >15% jump
   if (pastLabels.length >= 2) {
     const lastKey = dkey(pastLabels[pastLabels.length - 1]);
     const prevKey = dkey(pastLabels[pastLabels.length - 2]);
     const lastVal = toNum(closeMap?.[lastKey]);
     const prevVal = toNum(closeMap?.[prevKey]);
-    if (Number.isFinite(lastVal) && Number.isFinite(prevVal)) {
+    if (lastVal != null && prevVal != null) {
       const looksDup = lastVal === prevVal;
       const looksSplit = Math.abs(lastVal - prevVal) / (Math.abs(prevVal) || 1) > 0.15;
       if (looksDup || looksSplit) pastLabels = pastLabels.slice(0, -1);
     }
   }
 
-  // Guard: carried-forward pattern (e.g., replayed Friday)
   if (pastLabels.length >= 3) {
     const newestKey = dkey(pastLabels[pastLabels.length - 1]);
     const prevKey = dkey(pastLabels[pastLabels.length - 2]);
@@ -681,11 +634,7 @@ export default function App() {
     const newestVal = toNum(closeMap?.[newestKey]);
     const prevVal = toNum(closeMap?.[prevKey]);
     const prevPrevVal = toNum(closeMap?.[prevPrevKey]);
-    if (
-      Number.isFinite(newestVal) &&
-      Number.isFinite(prevVal) &&
-      Number.isFinite(prevPrevVal)
-    ) {
+    if (newestVal != null && prevVal != null && prevPrevVal != null) {
       const clonedFromTwoDaysAgo = newestVal === prevPrevVal;
       const driftPct = Math.abs(newestVal - prevVal) / (Math.abs(prevVal) || 1);
       if (clonedFromTwoDaysAgo && driftPct > 0.02) {
@@ -694,12 +643,10 @@ export default function App() {
     }
   }
 
-  // last trusted historical date
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : null;
 
-  // FUTURE: business days AFTER lastPastDate
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
@@ -708,18 +655,16 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
-  // "Actual" strictly from vendor closes
   const actualForPastLabels = pastLabels.map((iso) =>
     pickActualForDateStrict(iso, closeMap)
   );
 
-  // Harmonizer to rescale model backtest onto actual scale if needed
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
       const a = actual[i];
-      const b = series[i];
-      if (Number.isFinite(a) && Number.isFinite(b)) pairs.push([a, b]);
+      const b = toNum(series[i]);
+      if (a != null && b != null) pairs.push([a, b]);
     }
     if (pairs.length < 5) return { series, note: null };
 
@@ -751,7 +696,10 @@ export default function App() {
       const beta = cov / varB;
       const alpha = meanA - beta * meanB;
 
-      const adjusted = series.map((b) => (Number.isFinite(b) ? alpha + beta * b : null));
+      const adjusted = series.map((b) => {
+        const nb = toNum(b);
+        return nb != null ? alpha + beta * nb : null;
+      });
       return {
         series: adjusted,
         note: `Backtests rescaled (α=${alpha.toFixed(2)}, β=${beta.toFixed(3)}) to match actuals.`,
@@ -763,7 +711,6 @@ export default function App() {
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
-  // datasets for Actual vs Predicted chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
     if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
 
@@ -791,7 +738,6 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
-      // backtest aligned to vendor pastLabels with ±1d fallback
       const backtestRaw = pastLabels.map((iso) =>
         getHistPredForDate(dkey(iso), mKey, histPred)
       );
@@ -814,14 +760,14 @@ export default function App() {
         spanGaps: true,
       });
 
-      // future/current forecast line
       const lastActual =
-        [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
+        [...actualForPastLabels].reverse().find((v) => v != null) ?? null;
 
+      const preds = Array.isArray(r.predictions) ? r.predictions : [];
       const currentSeries = [
         ...Array(Math.max(0, pastLabels.length - 1)).fill(null),
         lastActual,
-        ...(r.predictions || []).slice(0, futureLabels.length),
+        ...preds.slice(0, futureLabels.length).map((v) => toNum(v)),
       ];
 
       ds.push({
@@ -865,7 +811,6 @@ export default function App() {
     },
   };
 
-  // backtest values aligned to "Actual" scale for the table
   const alignedBacktestsByModel = useMemo(() => {
     const out = {};
     results.forEach((r) => {
@@ -879,33 +824,33 @@ export default function App() {
     return out;
   }, [results, histPred, pastLabels.join("|"), actualForPastLabels.join("|")]);
 
-  // table rows for AVP table (past + future)
   const pastRows = pastLabels.map((iso, idx) => {
     const actualHere = pickActualForDateStrict(iso, closeMap);
     const perModel = results.map((r) => {
       const mKey = normModel(r.model);
       const v = alignedBacktestsByModel[mKey]?.[idx];
-      return Number.isFinite(Number(v)) ? Number(v) : null;
+      const nv = toNum(v);
+      return nv != null ? nv : null;
     });
     return { date: iso, actual: actualHere, perModel, kind: "past" };
   });
 
   const futureRows = futureLabels.map((d, i) => {
-    const perModel = results.map((r) =>
-      Array.isArray(r.predictions) ? r.predictions[i] ?? null : null
-    );
+    const perModel = results.map((r) => {
+      const arr = Array.isArray(r.predictions) ? r.predictions : [];
+      const nv = toNum(arr[i]);
+      return nv != null ? nv : null;
+    });
     return { date: d, actual: null, perModel, kind: "future" };
   });
 
-  /* ---------- Header price / pct change ---------- */
   const curr = toNum(quote?.current_price);
   const prev = toNum(quote?.last_close);
   const derivedPct = safePct(curr, prev);
   const pctToShow = toNum(quote?.change_pct) ?? derivedPct ?? 0;
   const absToShow =
-    Number.isFinite(curr) && Number.isFinite(prev) ? curr - prev : 0;
+    curr != null && prev != null ? curr - prev : 0;
 
-  /* ---------- Render ---------- */
   return (
     <div className="app-root">
       {/* hero */}
@@ -959,7 +904,6 @@ export default function App() {
 
         {/* RIGHT: Main content */}
         <section>
-          {/* Compare Mode Toggle */}
           <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
             <button className="btn" onClick={() => setCompareOpen((v) => !v)}>
               {compareOpen ? "Close Compare" : "Open Compare"}
@@ -976,10 +920,8 @@ export default function App() {
             />
           )}
 
-          {/* Movers + Earnings */}
           <HotAndEarnings onSelectTicker={handleSelectTicker} />
 
-          {/* ticker input */}
           <form onSubmit={handleSubmit} className="row" style={{ marginBottom: 16, marginTop: 8 }}>
             <input
               value={ticker}
@@ -994,7 +936,6 @@ export default function App() {
             </button>
           </form>
 
-          {/* anchor for scroller */}
           <div
             id="main-stock-info"
             ref={mainSectionRef}
@@ -1002,9 +943,7 @@ export default function App() {
             aria-hidden
           />
 
-          {/* Top info row */}
           <div className={`row ${blinkClass ? blinkClass : ""}`} style={{ gap: 16, marginBottom: 12 }}>
-            {/* Quote card */}
             <div className={`card ${blinkClass}`} style={{ minWidth: 0, flex: "1 1 300px" }}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h2 style={{ marginTop: 0 }}>💰 Current Price ({ticker})</h2>
@@ -1028,15 +967,15 @@ export default function App() {
                 <>
                   <p style={{ margin: 0 }}>
                     Last Close:{" "}
-                    {Number.isFinite(quote.last_close)
-                      ? `$${Number(quote.last_close).toFixed(2)}`
+                    {toNum(quote.last_close) != null
+                      ? `$${toNum(quote.last_close).toFixed(2)}`
                       : "—"}
                   </p>
                   <p style={{ margin: "2px 0", display: "flex", alignItems: "baseline", gap: 6 }}>
                     <span style={{ fontSize: "1.3em", fontWeight: 600 }}>
                       ${tweenPrice.toFixed(2)}
                     </span>
-                    {Number.isFinite(pctToShow) && (
+                    {toNum(pctToShow) != null && (
                       <span
                         style={{
                           color: pctToShow >= 0 ? "#2e7d32" : "#c62828",
@@ -1055,7 +994,6 @@ export default function App() {
                     )}
                   </p>
 
-                  {/* mini chart */}
                   <div style={{ marginTop: 6 }}>
                     {closes.length >= 2 ? (
                       <div style={{ borderRadius: 10, overflow: "hidden" }}>
@@ -1080,37 +1018,31 @@ export default function App() {
               )}
             </div>
 
-            {/* Earnings card */}
             <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <EarningsCard earnings={earnings} />
             </div>
 
-            {/* Recommendation */}
             <div className="card" style={{ minWidth: 0, flex: "1 1 300px" }}>
               <RecommendationCard recommendation={recommendation} />
             </div>
           </div>
 
-          {/* Market snapshot */}
           {market && (
             <div className="card">
               <MarketCard market={market} />
             </div>
           )}
 
-          {/* sentiment */}
           <div className="card" style={{ marginTop: 12 }}>
             <SentimentOverlay ticker={ticker} days={120} />
           </div>
 
-          {/* model metrics */}
           {!!metrics.length && (
             <div className="card" style={{ marginTop: 12, marginBottom: 12 }}>
               <MetricsList metrics={metrics} />
             </div>
           )}
 
-          {/* Actual vs Predicted */}
           {results.length > 0 && pastLabels.length > 0 && (
             <div className="card" style={{ marginTop: 12 }}>
               <h3 style={{ marginTop: 0 }}>Actual vs. Predicted</h3>
@@ -1127,7 +1059,6 @@ export default function App() {
                 <Chart type="line" data={avpChartData} options={avpChartOptions} />
               </div>
 
-              {/* Table */}
               <div className="table-wrap" style={{ marginTop: 12 }}>
                 <div
                   className="muted"
@@ -1203,7 +1134,6 @@ export default function App() {
 
           {error && <p style={{ color: "red" }}>Prediction Error: {error}</p>}
 
-          {/* model selector */}
           <div className="row" style={{ marginTop: 12, marginBottom: 8 }}>
             {MODEL_OPTIONS.map((m) => (
               <label key={m} style={{ marginRight: 12 }}>
@@ -1217,7 +1147,6 @@ export default function App() {
             ))}
           </div>
 
-          {/* forecast table */}
           {results.length > 0 && (
             <div className="card table-card">
               <div className="table-wrap">
@@ -1236,16 +1165,19 @@ export default function App() {
                     {results.map(({ model, predictions, confidence }) => (
                       <tr key={model}>
                         <td>{model}</td>
-                        {predictions.map((val, i) => (
-                          <td key={i}>
-                            {Number(val).toFixed(2)}
-                            {Array.isArray(confidence) && confidence[i] != null && (
-                              <div className="muted" style={{ fontSize: 11 }}>
-                                conf {Number(confidence[i]).toFixed(2)}
-                              </div>
-                            )}
-                          </td>
-                        ))}
+                        {(predictions || []).map((val, i) => {
+                          const v = toNum(val);
+                          return (
+                            <td key={i}>
+                              {v != null ? v.toFixed(2) : "—"}
+                              {Array.isArray(confidence) && confidence[i] != null && (
+                                <div className="muted" style={{ fontSize: 11 }}>
+                                  conf {Number(confidence[i]).toFixed(2)}
+                                </div>
+                              )}
+                            </td>
+                          );
+                        })}
                       </tr>
                     ))}
                   </tbody>
@@ -1261,7 +1193,6 @@ export default function App() {
         </section>
       </main>
 
-      {/* Big chart modal */}
       {showBigPriceChart && (
         <MagnifyModal title={`${ticker} • Price`} onClose={() => setShowBigPriceChart(false)}>
           <div style={{ borderRadius: 12, overflow: "hidden" }}>
@@ -1276,7 +1207,6 @@ export default function App() {
         </MagnifyModal>
       )}
 
-      {/* Auth modal */}
       <AuthModal open={showAuth && !user} onClose={() => setShowAuth(false)} />
     </div>
   );
@@ -1297,7 +1227,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
   });
   const [cursorX, setCursorX] = useState(null);
   const [hoverIdx, setHoverIdx] = useState(null);
-  const [drag, setDrag] = useState(null); // {startX, startView}
+  const [drag, setDrag] = useState(null);
 
   useEffect(() => {
     setView({
@@ -1382,7 +1312,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
     const focusIdx = idxForX(x);
 
     const windowSize = vEnd - vStart;
-    const delta = Math.sign(e.deltaY); // 1 = zoom out, -1 = zoom in
+    const delta = Math.sign(e.deltaY);
     const zoomStep = Math.max(1, Math.round(windowSize * 0.15));
     let newSize = delta < 0 ? windowSize - zoomStep : windowSize + zoomStep;
     newSize = Math.max(5, Math.min(newSize, data.length - 1));
@@ -1427,7 +1357,7 @@ function InteractivePriceChart({ data = [], labels = [], width = 320, height = 8
       label = String(d);
     }
   } else {
-    const rel = data.length - 1 - showIdx; // 0=latest
+    const rel = data.length - 1 - showIdx;
     label = rel === 0 ? "latest" : `t-${rel}d`;
   }
 
