@@ -45,10 +45,12 @@ def _safe_pct(last: Optional[float], prev: Optional[float]) -> float:
 def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize a movers/top_gainers/top_losers row.
-    Output:
-      - change_pct (display-safe, clamped)
-      - change_pct_raw (original vendor pct if provided / computed)
-      - display_change (display $ change aligned to clamped %)
+
+    Output (for UI):
+      - change_pct  : clamped to CLAMP_PCT_BOUNDS
+      - change      : dollar change aligned to clamped %  (DISPLAY-SAFE)
+    Debug fields:
+      - change_pct_raw, change_raw
     """
     sym = str(row.get("symbol") or row.get("ticker") or "").upper()
     price = _to_float(row.get("price"))
@@ -62,10 +64,12 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
     normalized_reason: List[str] = []
     was_clamped = False
 
+    # If vendor didn't give pct, compute it from price/prev
     if pct is None:
         pct = _safe_pct(price, prev)
         normalized_reason.append("computed_percent_from_prices")
 
+    # Some vendors accidentally put a dollar delta in the percent field
     if pct is not None and abs(pct) > 60 and prev and prev != 0:
         as_dollars_pct = (pct / prev) * 100.0
         if abs(as_dollars_pct) <= 60:
@@ -73,6 +77,7 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
             pct = _safe_pct(price, prev)
             normalized_reason.append("vendor_percent_was_dollars")
 
+    # If last is wildly off vs prev, try recomputing last from prev + change
     if prev and price and (price <= (1 - HARD_LAST_MULTIPLIER) * prev or price >= HARD_LAST_MULTIPLIER * prev):
         if chg is not None:
             recomputed_last = prev + chg
@@ -81,28 +86,34 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 pct = _safe_pct(price, prev)
                 normalized_reason.append("recomputed_last_from_change")
 
+    # If we still don't have change but have pct/prev, derive change
     if prev and pct is not None and chg is None:
         chg = (pct / 100.0) * prev
 
+    # Clamp percent to sane bounds
     lb, ub = CLAMP_PCT_BOUNDS
     pct_raw = pct
     if pct is not None and pct < lb:
-        pct = lb
-        was_clamped = True
+        pct = lb; was_clamped = True
     elif pct is not None and pct > ub:
-        pct = ub
-        was_clamped = True
+        pct = ub; was_clamped = True
 
+    # Recompute display $ change to match the (possibly clamped) percent
     base_for_delta = prev if prev is not None else price
-    chg_display = ((pct or 0.0) / 100.0 * base_for_delta) if (base_for_delta is not None and pct is not None) else chg
+    ui_change = ((pct or 0.0) / 100.0 * base_for_delta) if (base_for_delta is not None and pct is not None) else chg
+    ui_change = round((ui_change or 0.0), 4)
+    ui_pct = round((pct or 0.0), 4)
 
     return {
         "symbol": sym,
         "price": price,
-        "change": chg,
-        "change_pct": round(pct or 0.0, 4),
+        # 🔒 Display-safe fields (used by UI)
+        "change": ui_change,
+        "change_pct": ui_pct,
+        # 🛠️ Debug/raw
+        "change_raw": chg,
         "change_pct_raw": pct_raw,
-        "display_change": round((chg_display or 0.0), 4),
+        "display_change": ui_change,
         "normalized": bool(normalized_reason or was_clamped),
         "normalized_reason": "|".join(normalized_reason) if normalized_reason else None,
         "was_clamped": was_clamped,
@@ -379,7 +390,7 @@ async def predict_history(
         try:
             import yfinance as yf
             df = await asyncio.to_thread(
-                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=False
             )
             if df is not None and not df.empty and "Close" in df:
                 s = df["Close"].dropna().astype(float)
@@ -527,7 +538,7 @@ async def closes_endpoint(ticker: str, days: int = 60):
         try:
             import yfinance as yf
             df = await asyncio.to_thread(
-                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=False
             )
             if df is not None and not df.empty and "Close" in df:
                 s = df["Close"].dropna().astype(float)
@@ -563,7 +574,7 @@ async def stats_endpoint(ticker: str):
     try:
         import yfinance as yf
         df = await asyncio.to_thread(
-            yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=True
+            yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=False
         )
         if df is not None and not df.empty and "Close" in df:
             s = df["Close"].dropna().astype(float)
@@ -636,7 +647,7 @@ async def movers():
             chg = None
             if price is not None and last is not None:
                 chg = price - last
-            if isinstance(price, float) and isinstance(pct, float):
+            if isinstance(price, float) and isinstance(pct, float) and math.isfinite(price) and math.isfinite(pct):
                 return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
         except Exception:
             pass
@@ -648,7 +659,8 @@ async def movers():
                 last = float(closes[-1]); prev = float(closes[-2])
                 chg = last - prev
                 pct = (chg / prev) * 100.0 if prev else 0.0
-                return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
+                if math.isfinite(last) and math.isfinite(pct):
+                    return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
         except Exception:
             pass
         return None
