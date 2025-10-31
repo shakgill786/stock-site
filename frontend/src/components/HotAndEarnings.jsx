@@ -1,5 +1,5 @@
 // frontend/src/components/HotAndEarnings.jsx
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   API_BASE,
   fetchMovers,
@@ -9,13 +9,14 @@ import {
 } from "../api";
 import TopBuysCard from "./TopBuysCard";
 
-/** ====== Tunables & helpers ====== */
-const SPLIT_RATIO_THRESHOLD = 2.0; // treat >2x (or <0.5x) as split/garbage
-const SANE_PCT_LIMIT = 80;         // drop absolute % moves > 80% from display
-const HYDRATE_BATCH = 6;           // parallelism for calibration
-const CALIBRATE_FIRST = 60;        // always calibrate first N rows
-const EPS = 1e-6;
+const SPLIT_RATIO_THRESHOLD = 2.0; // tolerate up to ~100% gap day/day before calling it a split
+const SANE_PCT_LIMIT = 80; // kill <-80% / >+80% "moves"
+const MIN_MOVE_PCT = 0.05; // (kept for calibration targets if you expand later)
 
+const HYDRATE_BATCH = 6;
+const CALIBRATE_FIRST = 60;
+
+const EPS = 1e-6;
 const toNum = (v) => {
   if (v === null || v === undefined) return NaN;
   if (typeof v === "number") return v;
@@ -30,13 +31,57 @@ const toNum = (v) => {
 const isNum = (v) => Number.isFinite(toNum(v));
 const nearZero = (v) => Math.abs(toNum(v)) < EPS;
 
+// formatting helpers
 const fmtMoney = (v) => (isNum(v) ? `$${toNum(v).toFixed(2)}` : "—");
 const fmtSignMoney = (v) =>
-  isNum(v) ? `${toNum(v) >= 0 ? "+" : "-"}$${Math.abs(toNum(v)).toFixed(2)}` : "—";
+  isNum(v)
+    ? `${toNum(v) >= 0 ? "+" : "-"}$${Math.abs(toNum(v)).toFixed(2)}`
+    : "—";
 const fmtPct = (v) =>
-  isNum(v) ? `${toNum(v) >= 0 ? "+" : ""}${toNum(v).toFixed(2)}%` : "—";
+  isNum(v)
+    ? `${toNum(v) >= 0 ? "+" : ""}${toNum(v).toFixed(2)}%`
+    : "—";
 
-const looksClamped = (pct) => isNum(pct) && Math.abs(toNum(pct)) >= 24.9;
+const fmtDateHuman = (iso) => {
+  if (!iso) return "—";
+  try {
+    const d = new Date(`${String(iso).slice(0, 10)}T00:00:00`);
+    return d.toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return iso;
+  }
+};
+
+const SESSION_BADGE = (s) => {
+  const S = String(s || "").toUpperCase();
+  if (S === "BMO")
+    return {
+      text: "BMO",
+      bg: "rgba(25,118,210,0.15)",
+      fg: "#64b5f6",
+      br: "rgba(100,181,246,0.35)",
+    };
+  if (S === "AMC")
+    return {
+      text: "AMC",
+      bg: "rgba(244,67,54,0.15)",
+      fg: "#ef9a9a",
+      br: "rgba(239,154,154,0.35)",
+    };
+  return {
+    text: S || "—",
+    bg: "rgba(255,255,255,0.08)",
+    fg: "#bbb",
+    br: "rgba(255,255,255,0.12)",
+  };
+};
+
+const looksClamped = (pct) =>
+  isNum(pct) && Math.abs(toNum(pct)) >= 24.9; // vendor "max ±25%" circuit breaker look
 
 function firstNum(obj, keys) {
   for (const k of keys) {
@@ -48,36 +93,76 @@ function firstNum(obj, keys) {
   return undefined;
 }
 const signMismatch = (a, b) =>
-  isNum(a) && isNum(b) && !nearZero(a) && !nearZero(b) && Math.sign(toNum(a)) !== Math.sign(toNum(b));
+  isNum(a) &&
+  isNum(b) &&
+  !nearZero(a) &&
+  !nearZero(b) &&
+  Math.sign(toNum(a)) !== Math.sign(toNum(b));
 
-/** normalize various vendor row shapes into a single one */
+/**
+ * normalizeRow: try to coerce whatever junk vendor sent into:
+ * { symbol, price, last_close, change, change_pct }
+ */
 function normalizeRow(row) {
-  const symbol = String(row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || "").toUpperCase();
+  const symbol = String(
+    row?.symbol || row?.ticker || row?.Symbol || row?.Ticker || ""
+  ).toUpperCase();
 
   const price = firstNum(row, [
-    "price", "last", "last_price", "current", "close", "Close",
-    "extended_price", "ext_price", "postmarket_price", "postMarketPrice",
-    "after_hours_price", "afterHoursPrice", "premarket_price", "preMarketPrice",
+    "price",
+    "last",
+    "last_price",
+    "current",
+    "close",
+    "Close",
+    "extended_price",
+    "ext_price",
+    "postmarket_price",
+    "postMarketPrice",
+    "after_hours_price",
+    "afterHoursPrice",
+    "premarket_price",
+    "preMarketPrice",
   ]);
 
   let change = firstNum(row, [
-    "change", "chg", "delta", "Change",
-    "extended_change", "after_hours_change", "postmarket_change",
+    "change",
+    "chg",
+    "delta",
+    "Change",
+    "extended_change",
+    "after_hours_change",
+    "postmarket_change",
   ]);
   let change_pct = firstNum(row, [
-    "change_pct", "change_percent", "percent_change", "pct_change", "pct",
-    "ChangePercent", "changePct", "percentChange",
-    "extended_change_pct", "after_hours_change_pct", "postmarket_change_pct",
+    "change_pct",
+    "change_percent",
+    "percent_change",
+    "pct_change",
+    "pct",
+    "ChangePercent",
+    "changePct",
+    "percentChange",
+    "extended_change_pct",
+    "after_hours_change_pct",
+    "postmarket_change_pct",
   ]);
 
   const prevClose = firstNum(row, [
-    "prev_close", "previous_close", "previousClose", "priorClose",
-    "last_close", "PrevClose", "PreviousClose", "close_prev", "yesterday_close",
+    "prev_close",
+    "previous_close",
+    "previousClose",
+    "priorClose",
+    "last_close",
+    "PrevClose",
+    "PreviousClose",
+    "close_prev",
+    "yesterday_close",
   ]);
 
   const open = firstNum(row, ["open", "Open"]);
 
-  // unclamp ±25% wall if computable from price/change
+  // unclamp vendor's ±25% wall if possible
   if (looksClamped(change_pct) && isNum(price) && isNum(change)) {
     const base = toNum(price) - toNum(change);
     if (isNum(base) && !nearZero(base)) {
@@ -86,7 +171,7 @@ function normalizeRow(row) {
     }
   }
 
-  // recompute from prevClose
+  // recompute from prevClose if we have it
   if (isNum(price) && isNum(prevClose) && !nearZero(prevClose)) {
     const derivedChange = toNum(price) - toNum(prevClose);
     const derivedPct = (derivedChange / toNum(prevClose)) * 100;
@@ -94,7 +179,7 @@ function normalizeRow(row) {
     if (!isNum(change_pct) || looksClamped(change_pct)) change_pct = derivedPct;
   }
 
-  // fallback to open (intraday)
+  // fallback to open (intraday reference)
   if (
     !(isNum(change) && isNum(change_pct)) &&
     isNum(price) &&
@@ -110,16 +195,24 @@ function normalizeRow(row) {
   // derive missing piece from pct
   if (!isNum(change) && isNum(change_pct)) {
     const base = isNum(prevClose) ? prevClose : price;
-    if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
+    if (isNum(base) && !nearZero(base))
+      change = (toNum(change_pct) / 100) * toNum(base);
   }
   // derive pct from change
   if (!isNum(change_pct) && isNum(change)) {
-    const base = isNum(prevClose) ? prevClose : isNum(price) ? toNum(price) - toNum(change) : NaN;
-    const p2 = isNum(base) && !nearZero(base) ? (toNum(change) / toNum(base)) * 100 : NaN;
+    const base = isNum(prevClose)
+      ? prevClose
+      : isNum(price)
+      ? toNum(price) - toNum(change)
+      : NaN;
+    const p2 =
+      isNum(base) && !nearZero(base)
+        ? (toNum(change) / toNum(base)) * 100
+        : NaN;
     if (isNum(p2)) change_pct = p2;
   }
 
-  // fix fractional % (0.8 vs 80)
+  // pct might be fractional (0.8 = 80%)
   if (
     isNum(change_pct) &&
     Math.abs(toNum(change_pct)) <= 2.5 &&
@@ -127,7 +220,8 @@ function normalizeRow(row) {
     isNum(prevClose) &&
     !nearZero(prevClose)
   ) {
-    const recomputed = ((toNum(price) - toNum(prevClose)) / toNum(prevClose)) * 100;
+    const recomputed =
+      ((toNum(price) - toNum(prevClose)) / toNum(prevClose)) * 100;
     const asPercent = toNum(change_pct);
     const asPercentTimes100 = asPercent * 100;
     const err1 = Math.abs(recomputed - asPercent);
@@ -142,7 +236,8 @@ function normalizeRow(row) {
       : isNum(price)
       ? toNum(price) - toNum(change)
       : NaN;
-    if (isNum(base) && !nearZero(base)) change = (toNum(change_pct) / 100) * toNum(base);
+    if (isNum(base) && !nearZero(base))
+      change = (toNum(change_pct) / 100) * toNum(base);
   }
 
   if (isNum(change) && nearZero(change)) change = 0;
@@ -158,7 +253,7 @@ function normalizeRow(row) {
   };
 }
 
-/** quote → normalized row */
+// quote fallback row
 function pickFromQuote(q) {
   const lastClose = toNum(
     firstNum(q, [
@@ -170,6 +265,7 @@ function pickFromQuote(q) {
     ])
   );
 
+  // choose extended/session price if present, else regular
   const extPrice = firstNum(q, [
     "extended_price",
     "ext_price",
@@ -232,8 +328,8 @@ function pickFromQuote(q) {
   });
 }
 
-/** pick last two DISTINCT closes (by value) to avoid 0.00% noise */
-function lastTwoDistinctCloses(resp) {
+// use last 2 unique closes to compute sane pct move
+function pickLastTwoCloses(resp) {
   const ds = Array.isArray(resp?.dates) ? resp.dates : [];
   const cs = Array.isArray(resp?.closes) ? resp.closes : [];
   const rows = [];
@@ -241,24 +337,36 @@ function lastTwoDistinctCloses(resp) {
     const d = String(ds[i]).slice(0, 10);
     const t = Date.parse(d);
     const c = toNum(cs[i]);
-    if (Number.isFinite(t) && isNum(c)) rows.push({ t, d, c });
+    if (Number.isFinite(t) && isNum(c)) {
+      rows.push({ t, d, c });
+    }
   }
   if (rows.length < 2) return null;
 
   rows.sort((a, b) => a.t - b.t);
+  const uniq = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (!uniq.length || uniq[uniq.length - 1].d !== rows[i].d) {
+      uniq.push(rows[i]);
+    } else {
+      uniq[uniq.length - 1] = rows[i];
+    }
+  }
+  if (uniq.length < 2) return null;
 
-  // walk from tail to find last and previous with DIFFERENT values
-  const last = rows[rows.length - 1];
-  let j = rows.length - 2;
-  while (j >= 0 && rows[j].c === last.c) j--;
-  if (j < 0) return null; // entire tail flat
-
-  const prev = rows[j];
+  const last = uniq[uniq.length - 1];
+  let j = uniq.length - 2;
+  while (j >= 0 && uniq[j].d === last.d) j--;
+  if (j < 0) return null;
+  const prev = uniq[j];
 
   if (!isNum(prev.c) || !isNum(last.c) || nearZero(prev.c)) return null;
-
   const ratio = Math.abs(toNum(last.c) / toNum(prev.c));
-  if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) return null;
+
+  // looks like a split or garbage → bail
+  if (ratio > SPLIT_RATIO_THRESHOLD || ratio < 1 / SPLIT_RATIO_THRESHOLD) {
+    return null;
+  }
 
   const ch = toNum(last.c) - toNum(prev.c);
   const pct = (ch / toNum(prev.c)) * 100;
@@ -272,12 +380,12 @@ function lastTwoDistinctCloses(resp) {
   };
 }
 
-/** Calibrate one row: prefer EOD closes; else fall back to quote */
+// hydrate with /closes then /quote fallbacks
 async function calibrateRow(row) {
   const sym = row.symbol;
   try {
-    const closeResp = await fetchCloses(sym, 90);
-    const eod = lastTwoDistinctCloses(closeResp);
+    const closeResp = await fetchCloses(sym, 10);
+    const eod = pickLastTwoCloses(closeResp);
     if (eod) {
       return normalizeRow({
         symbol: sym,
@@ -299,10 +407,10 @@ async function calibrateRow(row) {
   }
 }
 
-/** Calibrate a list: normalize → target subset hydrate in batches */
 async function calibrateList(rows) {
   const base = rows.map((r) => normalizeRow(r));
 
+  // mark "sketchy" rows for hydration with slower calls
   const badIdx = base
     .map((r, i) => {
       const pct = toNum(r.change_pct);
@@ -330,7 +438,7 @@ async function calibrateList(rows) {
   return base;
 }
 
-/** recompute change/percent from price vs last_close if both present */
+// make sure $chg and %chg line up with price vs last_close
 function recomputeFromClose(r) {
   if (isNum(r.price) && isNum(r.last_close) && !nearZero(r.last_close)) {
     const ch = toNum(r.price) - toNum(r.last_close);
@@ -340,6 +448,7 @@ function recomputeFromClose(r) {
   return r;
 }
 
+// how "big" is the move? (0% is allowed now)
 function saneAbsPct(row) {
   if (!isNum(row.change_pct)) return NaN;
   const absPct = Math.abs(toNum(row.change_pct));
@@ -347,7 +456,7 @@ function saneAbsPct(row) {
   return absPct;
 }
 
-/** dedupe by symbol, keep the more "informative" % row */
+// we choose best duplicate ticker row by "better" pct info
 function mergeBestBySymbol(rows) {
   const out = new Map();
   for (const raw of rows) {
@@ -363,18 +472,23 @@ function mergeBestBySymbol(rows) {
     const prevAbs = saneAbsPct(prev);
     const currAbs = saneAbsPct(r);
 
+    // prefer the one that has *valid* saneAbsPct at all
     if (Number.isFinite(currAbs) && !Number.isFinite(prevAbs)) {
       out.set(r.symbol, r);
       continue;
     }
     if (Number.isFinite(currAbs) && Number.isFinite(prevAbs)) {
-      if (currAbs > prevAbs) out.set(r.symbol, r);
+      // if both valid, prefer the one with larger |pct|
+      if (currAbs > prevAbs) {
+        out.set(r.symbol, r);
+        continue;
+      }
     }
   }
   return [...out.values()];
 }
 
-/** classify to gainers/losers (0% → gainers so the table isn't empty) */
+// classify + / -
 function rowSign(r) {
   if (isNum(r.change_pct)) {
     const v = toNum(r.change_pct);
@@ -394,7 +508,7 @@ function rowSign(r) {
   return 0;
 }
 
-/** final display validity */
+// final display filter (loosened)
 function validRowForDisplay(r) {
   if (!isNum(r.price)) return false;
   if (toNum(r.price) < 1) return false;
@@ -404,7 +518,7 @@ function validRowForDisplay(r) {
   return true;
 }
 
-/** ====== UI bits ====== */
+/* ---------- UI bits ---------- */
 function Card({ title, right, children }) {
   return (
     <div className="he-card">
@@ -509,21 +623,28 @@ function MoversCard({
                   className="num th-click"
                   onClick={() => onHeaderClick("price")}
                 >
-                  Price {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                  Price{" "}
+                  {sortKey === "price" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
                   onClick={() => onHeaderClick("change")}
                   title="Sort by $ change"
                 >
-                  $ Change {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                  $ Change{" "}
+                  {sortKey === "change" ? (sortDir === "desc" ? "▾" : "▴") : ""}
                 </th>
                 <th
                   className="num th-click"
                   onClick={() => onHeaderClick("change_pct")}
                   title="Sort by % change"
                 >
-                  % Change {sortKey === "change_pct" ? (sortDir === "desc" ? "▾" : "▴") : ""}
+                  % Change{" "}
+                  {sortKey === "change_pct"
+                    ? sortDir === "desc"
+                      ? "▾"
+                      : "▴"
+                    : ""}
                 </th>
               </tr>
             </thead>
@@ -542,7 +663,9 @@ function MoversCard({
                         onClick={() => {
                           onPick?.(sym);
                           window.dispatchEvent(
-                            new CustomEvent("ticker:set", { detail: sym })
+                            new CustomEvent("ticker:set", {
+                              detail: sym,
+                            })
                           );
                         }}
                         title={`Load ${sym}`}
@@ -568,17 +691,20 @@ function MoversCard({
   );
 }
 
-/** earnings list */
-function EarningsCard({ items = [], loading, error, onPick }) {
+function EarningsListCard({ items = [], loading, error, onPick }) {
   const [q, setQ] = useState("");
 
+  // filter client-side as user types
   const filtered = useMemo(() => {
     const list = Array.isArray(items) ? items : [];
     const needle = q.trim().toUpperCase();
     if (!needle) return list;
-    return list.filter((r) => String(r.symbol || "").toUpperCase().includes(needle));
+    return list.filter((r) =>
+      String(r.symbol || "").toUpperCase().includes(needle)
+    );
   }, [items, q]);
 
+  // group by date and dedupe tickers *within that date*
   const groups = useMemo(() => {
     const map = new Map();
     for (const row of filtered) {
@@ -596,7 +722,9 @@ function EarningsCard({ items = [], loading, error, onPick }) {
           if (!uniqMap.has(sym)) uniqMap.set(sym, r);
         });
         const deduped = Array.from(uniqMap.values());
-        deduped.sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
+        deduped.sort((a, b) =>
+          String(a.symbol || "").localeCompare(String(b.symbol || ""))
+        );
         return [date, deduped];
       });
   }, [filtered]);
@@ -641,30 +769,31 @@ function EarningsCard({ items = [], loading, error, onPick }) {
                 <FragmentBlock key={date}>
                   <tr className="he-group-row">
                     <td colSpan={3} style={{ fontWeight: 700 }}>
-                      {new Date(`${String(date).slice(0,10)}T00:00:00`).toLocaleDateString(undefined, {
-                        weekday: "short", month: "short", day: "numeric",
-                      })}
+                      {fmtDateHuman(date)}
                     </td>
                   </tr>
                   {rows.map((r, i) => {
-                    const S = String(r.session || "").toUpperCase();
-                    const badge =
-                      S === "BMO"
-                        ? { text: "BMO", bg: "rgba(25,118,210,0.15)", fg: "#64b5f6", br: "rgba(100,181,246,0.35)" }
-                        : S === "AMC"
-                        ? { text: "AMC", bg: "rgba(244,67,54,0.15)", fg: "#ef9a9a", br: "rgba(239,154,154,0.35)" }
-                        : { text: S || "—", bg: "rgba(255,255,255,0.08)", fg: "#bbb", br: "rgba(255,255,255,0.12)" };
+                    const badge = SESSION_BADGE(r.session);
                     const sym = String(r.symbol || "").toUpperCase();
                     return (
                       <tr key={`${date}-${sym}-${i}`}>
-                        <td className="muted">{/* spacer */}</td>
-                        <td style={{ textAlign: "center", fontWeight: 700 }}>
+                        <td className="muted">{/* intentionally blank */}</td>
+                        <td
+                          style={{
+                            textAlign: "center",
+                            fontWeight: 700,
+                          }}
+                        >
                           <button
                             type="button"
                             className="ticker-link"
                             onClick={() => {
                               onPick?.(sym);
-                              window.dispatchEvent(new CustomEvent("ticker:set", { detail: sym }));
+                              window.dispatchEvent(
+                                new CustomEvent("ticker:set", {
+                                  detail: sym,
+                                })
+                              );
                             }}
                             title={`Load ${sym}`}
                           >
@@ -700,7 +829,6 @@ function FragmentBlock({ children }) {
   return <>{children}</>;
 }
 
-/** ====== Main combined section ====== */
 export default function HotAndEarnings({ onSelectTicker }) {
   const [loadingMovers, setLoadingMovers] = useState(true);
   const [loadingEarnings, setLoadingEarnings] = useState(true);
@@ -731,30 +859,24 @@ export default function HotAndEarnings({ onSelectTicker }) {
       const rawG = Array.isArray(mv?.gainers) ? mv.gainers : [];
       const rawL = Array.isArray(mv?.losers) ? mv.losers : [];
 
-      // normalize + hydrate/calibrate (uses last two DISTINCT closes)
+      // "hydrate" & normalize
       const [gCal, lCal] = await Promise.all([
         calibrateList(rawG),
         calibrateList(rawL),
       ]);
 
-      // dedupe at symbol level, recompute from closes, split by sign
+      // dedupe symbol-level, recompute change_pct from price vs last_close
       const merged = mergeBestBySymbol([...gCal, ...lCal]);
 
+      // split them into positive/negative buckets
       const pos = [];
       const neg = [];
       for (const r0 of merged) {
         const r = recomputeFromClose(r0);
         if (!validRowForDisplay(r)) continue;
-        const sgn = rowSign(r);
+        const sgn = rowSign(r); // >=0 goes to pos, <0 to neg
         if (sgn >= 0) pos.push(r);
         else neg.push(r);
-      }
-
-      // if a ton of zeros slipped through, try sorting by $ change then pct
-      const manyZeroPct =
-        pos.filter((x) => Math.abs(toNum(x.change_pct)) < EPS).length > Math.max(4, pos.length * 0.3);
-      if (manyZeroPct) {
-        pos.sort((a, b) => Math.abs(toNum(b.change)) - Math.abs(toNum(a.change)));
       }
 
       setGainers(pos);
@@ -777,7 +899,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
       if (!wk && typeof wk !== "object") wk = {};
       const items = Array.isArray(wk?.items) ? wk.items : [];
 
-      // fallback HTTP call if helper returns nothing
+      // fallback endpoint if needed
       if (!items.length) {
         try {
           const res = await fetch(`${API_BASE}/earnings_week/`, {
@@ -829,8 +951,22 @@ export default function HotAndEarnings({ onSelectTicker }) {
     return Array.from(
       new Set(
         uniq.concat([
-          "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO",
-          "JPM","V","MA","LLY","UNH","HD","PEP","KO",
+          "AAPL",
+          "MSFT",
+          "NVDA",
+          "AMZN",
+          "META",
+          "GOOGL",
+          "TSLA",
+          "AVGO",
+          "JPM",
+          "V",
+          "MA",
+          "LLY",
+          "UNH",
+          "HD",
+          "PEP",
+          "KO",
         ])
       )
     );
@@ -875,7 +1011,7 @@ export default function HotAndEarnings({ onSelectTicker }) {
         max={25}
       />
 
-      <EarningsCard
+      <EarningsListCard
         items={earnings}
         loading={loadingEarnings}
         error={errEarnings}
@@ -907,7 +1043,10 @@ export default function HotAndEarnings({ onSelectTicker }) {
           display: inline-flex;
           align-items: center;
         }
-        .he-refresh { padding: 6px 10px; font-size: 12px; }
+        .he-refresh {
+          padding: 6px 10px;
+          font-size: 12px;
+        }
 
         .he-card {
           padding: 12px;
@@ -928,8 +1067,16 @@ export default function HotAndEarnings({ onSelectTicker }) {
           justify-content: space-between;
           margin-bottom: 6px;
         }
-        .he-head-right, .he-controls { display: flex; gap: 8px; align-items: center; }
-        .he-source { font-size: 12px; color: #a8b2ff; }
+        .he-head-right,
+        .he-controls {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+        .he-source {
+          font-size: 12px;
+          color: #a8b2ff;
+        }
         .he-scroll {
           max-height: 420px;
           overflow: auto;
@@ -952,14 +1099,36 @@ export default function HotAndEarnings({ onSelectTicker }) {
           z-index: 2;
           padding: 8px 10px;
         }
-        .he-table tbody tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
-        .he-table td, .he-table th { vertical-align: middle; padding: 8px 10px; }
-        .num { text-align: right; font-variant-numeric: tabular-nums; }
-        .th-click { cursor: pointer; user-select: none; }
-        .pos { color: #2e7d32; font-weight: 600; }
-        .neg { color: #c62828; font-weight: 600; }
+        .he-table tbody tr:nth-child(odd) {
+          background: rgba(255,255,255,0.02);
+        }
+        .he-table td,
+        .he-table th {
+          vertical-align: middle;
+          padding: 8px 10px;
+        }
+        .num {
+          text-align: right;
+          font-variant-numeric: tabular-nums;
+        }
+        .th-click {
+          cursor: pointer;
+          user-select: none;
+        }
+        .pos {
+          color: #2e7d32;
+          font-weight: 600;
+        }
+        .neg {
+          color: #c62828;
+          font-weight: 600;
+        }
         .he-toprow td {
-          background: linear-gradient(90deg, rgba(168,178,255,0.07), transparent 60%);
+          background: linear-gradient(
+            90deg,
+            rgba(168,178,255,0.07),
+            transparent 60%
+          );
         }
 
         .he-group-row td {
@@ -980,9 +1149,17 @@ export default function HotAndEarnings({ onSelectTicker }) {
         }
 
         .ticker-link {
-          background: transparent; border: none; padding: 0; margin: 0;
-          cursor: pointer; color: #a2c4ff; text-decoration: underline;
-          text-underline-offset: 2px; font: inherit; font-weight: 700; letter-spacing: .2px;
+          background: transparent;
+          border: none;
+          padding: 0;
+          margin: 0;
+          cursor: pointer;
+          color: #a2c4ff;
+          text-decoration: underline;
+          text-underline-offset: 2px;
+          font: inherit;
+          font-weight: 700;
+          letter-spacing: .2px;
         }
         .ticker-link:hover {
           color: #d6e3ff;
@@ -990,8 +1167,12 @@ export default function HotAndEarnings({ onSelectTicker }) {
           text-decoration-thickness: 2px;
         }
 
-        .muted { color: #a7adbc; }
-        .muted.error { color: #ff6b6b; }
+        .muted {
+          color: #a7adbc;
+        }
+        .muted.error {
+          color: #ff6b6b;
+        }
       `}</style>
     </div>
   );

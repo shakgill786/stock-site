@@ -73,7 +73,6 @@ const addBusinessDays = (start, n) => {
 };
 
 const isWeekend = (dt) => [0, 6].includes(dt.getDay());
-const dkey = (s) => String(s).slice(0, 10);
 const prevBiz = (iso) => {
   let d = asLocalDate(iso);
   do d.setDate(d.getDate() - 1);
@@ -88,6 +87,8 @@ const nextBiz = (iso) => {
 };
 
 const normModel = (s) => String(s || "").trim().toUpperCase();
+const dkey = (s) => String(s).slice(0, 10);
+
 const toNum = (x) => (Number.isFinite(+x) ? +x : null);
 
 const safePct = (curr, prev) =>
@@ -186,6 +187,7 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
   if (haveProvider && haveQuoteLast) {
     const ratio = quoteLast / providerLastRaw;
 
+    // is "last_close" basically today's live price => probably not settled yet
     const looksLikeNow =
       Number.isFinite(quoteCurr) &&
       Math.abs(quoteCurr - quoteLast) / (Math.abs(quoteLast) || 1) < 0.02;
@@ -199,6 +201,7 @@ function sanitizeClosesWithQuote({ dates, closes, quote }) {
     }
   }
 
+  // drop duplicate last rows if vendor glued same price to 2 dates
   const dropped = dropDupTailSeries(outDates, outCloses);
   return { dates: dropped.dates, closes: dropped.closes };
 }
@@ -257,9 +260,6 @@ export default function App() {
   const [models, setModels] = useState(["LSTM", "ARIMA"]);
 
   // Compare Mode
-  the; // <-- REMOVE IF YOU STILL HAVE THIS FROM A PREVIOUS COPY/PASTE!
-  // (Keeping the warning as a reminder: that stray "the" caused your "Unexpected keyword or identifier".)
-
   const [compareOpen, setCompareOpen] = useState(false);
   const [compareSymbols, setCompareSymbols] = useState([]);
 
@@ -366,7 +366,7 @@ export default function App() {
     return { histPred: byDateModel };
   }, [historyRows]);
 
-  // Map date -> close
+  // Map date -> close for vendor close series (after sanitizeClosesWithQuote)
   const closeMap = useMemo(() => {
     const m = {};
     (closeDates || []).forEach((d, i) => {
@@ -606,11 +606,12 @@ export default function App() {
   };
 
   /* ---------- Strict Actuals & aligned backtests ---------- */
-  const pickActualForDateStrict = (iso, closeMap) => {
+
+  function pickActualForDateStrict(iso, closeMap) {
     const key = dkey(iso);
     const v = toNum(closeMap?.[key]);
     return Number.isFinite(v) ? v : null;
-  };
+  }
 
   const getHistPredForDate = (iso, mKey, histPred) =>
     toNum(histPred?.[iso]?.[mKey]) ??
@@ -652,9 +653,11 @@ export default function App() {
   }, [metrics]);
 
   /* ---------- Actual vs Predicted prep ---------- */
+
   const horizon = results?.[0]?.predictions?.length || 0;
   const pastDaysToShow = 10;
 
+  // PAST: strictly from vendor closes (no mixing with predict_history dates)
   let pastLabels = (closeDates || []).slice(-pastDaysToShow);
 
   // Guard: drop a weird duplicated final point or >15% jump
@@ -670,31 +673,33 @@ export default function App() {
     }
   }
 
-  // Guard: carried-forward pattern
+  // Guard: carried-forward pattern (e.g., replayed Friday)
   if (pastLabels.length >= 3) {
     const newestKey = dkey(pastLabels[pastLabels.length - 1]);
-    const prevKey2 = dkey(pastLabels[pastLabels.length - 2]);
+    const prevKey = dkey(pastLabels[pastLabels.length - 2]);
     const prevPrevKey = dkey(pastLabels[pastLabels.length - 3]);
     const newestVal = toNum(closeMap?.[newestKey]);
-    const prevVal2 = toNum(closeMap?.[prevKey2]);
+    const prevVal = toNum(closeMap?.[prevKey]);
     const prevPrevVal = toNum(closeMap?.[prevPrevKey]);
     if (
       Number.isFinite(newestVal) &&
-      Number.isFinite(prevVal2) &&
+      Number.isFinite(prevVal) &&
       Number.isFinite(prevPrevVal)
     ) {
       const clonedFromTwoDaysAgo = newestVal === prevPrevVal;
-      const driftPct = Math.abs(newestVal - prevVal2) / (Math.abs(prevVal2) || 1);
+      const driftPct = Math.abs(newestVal - prevVal) / (Math.abs(prevVal) || 1);
       if (clonedFromTwoDaysAgo && driftPct > 0.02) {
         pastLabels = pastLabels.slice(0, -1);
       }
     }
   }
 
+  // last trusted historical date
   const lastPastDate = pastLabels.length
     ? asLocalDate(pastLabels[pastLabels.length - 1])
     : null;
 
+  // FUTURE: business days AFTER lastPastDate
   const futureLabels = Array.from({ length: horizon }, (_, i) => {
     if (!lastPastDate) return `+${i + 1}d`;
     const d = addBusinessDays(lastPastDate, i + 1);
@@ -703,10 +708,12 @@ export default function App() {
 
   const chartLabels = [...pastLabels, ...futureLabels];
 
+  // "Actual" strictly from vendor closes
   const actualForPastLabels = pastLabels.map((iso) =>
     pickActualForDateStrict(iso, closeMap)
   );
 
+  // Harmonizer to rescale model backtest onto actual scale if needed
   function harmonize(series, actual) {
     const pairs = [];
     for (let i = 0; i < pastLabels.length; i++) {
@@ -756,6 +763,7 @@ export default function App() {
 
   const colorPalette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949"];
 
+  // datasets for Actual vs Predicted chart
   const { avpDatasets, harmonizeNote } = useMemo(() => {
     if (!chartLabels.length) return { avpDatasets: [], harmonizeNote: null };
 
@@ -783,8 +791,9 @@ export default function App() {
       const color = colorPalette[idx % colorPalette.length];
       const mKey = normModel(r.model);
 
+      // backtest aligned to vendor pastLabels with ±1d fallback
       const backtestRaw = pastLabels.map((iso) =>
-        (histPred?.[dkey(iso)] && histPred[dkey(iso)][mKey]) ?? null
+        getHistPredForDate(dkey(iso), mKey, histPred)
       );
 
       const { series: backtestSeries, note: n } = harmonize(
@@ -805,6 +814,7 @@ export default function App() {
         spanGaps: true,
       });
 
+      // future/current forecast line
       const lastActual =
         [...actualForPastLabels].reverse().find((v) => Number.isFinite(v)) ?? null;
 
@@ -855,12 +865,13 @@ export default function App() {
     },
   };
 
+  // backtest values aligned to "Actual" scale for the table
   const alignedBacktestsByModel = useMemo(() => {
     const out = {};
     results.forEach((r) => {
       const mKey = normModel(r.model);
       const rawSeries = pastLabels.map((iso) =>
-        (histPred?.[dkey(iso)] && histPred[dkey(iso)][mKey]) ?? null
+        getHistPredForDate(dkey(iso), mKey, histPred)
       );
       const { series } = harmonize(rawSeries, actualForPastLabels);
       out[mKey] = series;
@@ -868,6 +879,7 @@ export default function App() {
     return out;
   }, [results, histPred, pastLabels.join("|"), actualForPastLabels.join("|")]);
 
+  // table rows for AVP table (past + future)
   const pastRows = pastLabels.map((iso, idx) => {
     const actualHere = pickActualForDateStrict(iso, closeMap);
     const perModel = results.map((r) => {
