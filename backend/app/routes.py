@@ -14,7 +14,7 @@ from app.services.finance_service import (
     get_daily_closes_with_dates,
     get_daily_closes,  # used by movers fallback + predict() fallback
     get_52w_stats,
-    get_dividends,     # NEW: expose dividends endpoint
+    get_dividends,     # dividends endpoint
 )
 
 router = APIRouter()
@@ -26,7 +26,10 @@ HARD_LAST_MULTIPLIER = 1.95  # reject last beyond ±95% of prevClose (vendor gli
 def _to_float(x):
     try:
         s = str(x).strip().replace("%", "").replace(",", "")
-        return float(s)
+        v = float(s)
+        if math.isfinite(v):
+            return v
+        return None
     except Exception:
         return None
 
@@ -45,12 +48,11 @@ def _safe_pct(last: Optional[float], prev: Optional[float]) -> float:
 def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize a movers/top_gainers/top_losers row.
-
-    Output (for UI):
-      - change_pct  : clamped to CLAMP_PCT_BOUNDS
-      - change      : dollar change aligned to clamped %  (DISPLAY-SAFE)
-    Debug fields:
-      - change_pct_raw, change_raw
+    Output keys include:
+      - change_pct (display-safe, clamped)
+      - change_pct_raw (original vendor pct if provided / computed)
+      - display_change (display $ change aligned to clamped %)
+      - change_raw (raw $ change before clamping; kept for UI compatibility)
     """
     sym = str(row.get("symbol") or row.get("ticker") or "").upper()
     price = _to_float(row.get("price"))
@@ -64,12 +66,12 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
     normalized_reason: List[str] = []
     was_clamped = False
 
-    # If vendor didn't give pct, compute it from price/prev
+    # Fill missing percent from price/prev if possible
     if pct is None:
         pct = _safe_pct(price, prev)
         normalized_reason.append("computed_percent_from_prices")
 
-    # Some vendors accidentally put a dollar delta in the percent field
+    # Some vendors send "dollars" in % field by mistake
     if pct is not None and abs(pct) > 60 and prev and prev != 0:
         as_dollars_pct = (pct / prev) * 100.0
         if abs(as_dollars_pct) <= 60:
@@ -77,7 +79,7 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
             pct = _safe_pct(price, prev)
             normalized_reason.append("vendor_percent_was_dollars")
 
-    # If last is wildly off vs prev, try recomputing last from prev + change
+    # If current price looks off vs prev, recompute implied price from change
     if prev and price and (price <= (1 - HARD_LAST_MULTIPLIER) * prev or price >= HARD_LAST_MULTIPLIER * prev):
         if chg is not None:
             recomputed_last = prev + chg
@@ -86,34 +88,29 @@ def _normalize_tile_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 pct = _safe_pct(price, prev)
                 normalized_reason.append("recomputed_last_from_change")
 
-    # If we still don't have change but have pct/prev, derive change
     if prev and pct is not None and chg is None:
         chg = (pct / 100.0) * prev
 
-    # Clamp percent to sane bounds
     lb, ub = CLAMP_PCT_BOUNDS
     pct_raw = pct
     if pct is not None and pct < lb:
-        pct = lb; was_clamped = True
+        pct = lb
+        was_clamped = True
     elif pct is not None and pct > ub:
-        pct = ub; was_clamped = True
+        pct = ub
+        was_clamped = True
 
-    # Recompute display $ change to match the (possibly clamped) percent
     base_for_delta = prev if prev is not None else price
-    ui_change = ((pct or 0.0) / 100.0 * base_for_delta) if (base_for_delta is not None and pct is not None) else chg
-    ui_change = round((ui_change or 0.0), 4)
-    ui_pct = round((pct or 0.0), 4)
+    chg_display = ((pct or 0.0) / 100.0 * base_for_delta) if (base_for_delta is not None and pct is not None) else chg
 
     return {
         "symbol": sym,
         "price": price,
-        # 🔒 Display-safe fields (used by UI)
-        "change": ui_change,
-        "change_pct": ui_pct,
-        # 🛠️ Debug/raw
-        "change_raw": chg,
+        "change": chg,
+        "change_raw": chg,  # keep raw $ change for any legacy UI code
+        "change_pct": round(pct or 0.0, 4),
         "change_pct_raw": pct_raw,
-        "display_change": ui_change,
+        "display_change": round((chg_display or 0.0), 4),
         "normalized": bool(normalized_reason or was_clamped),
         "normalized_reason": "|".join(normalized_reason) if normalized_reason else None,
         "was_clamped": was_clamped,
@@ -209,7 +206,7 @@ async def _pin_last_close_async(symbol: str, dates: List[str], closes: List[floa
     try:
         q = await asyncio.to_thread(get_quote, symbol)
         last_close = q.get("last_close")
-        if last_close is not None:
+        if last_close is not None and math.isfinite(float(last_close)):
             closes[-1] = float(last_close)
     except Exception:
         pass
@@ -235,7 +232,7 @@ _FALLBACK_UNIVERSE = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","NFLX","AMD",
     "JPM","V","MA","XOM","CVX","WMT","HD","PG","KO","PEP",
     "UNH","JNJ","LLY","PFE","BAC","C","GS","MS","CSCO","ORCL",
-    "ADBE","CRM","QCOM","TXN","INTC","T","VZ","DIS","NKE","COST",
+    "ADBE","CRM","QCOM","TXN","INTC","T","V","VZ","DIS","NKE","COST",
     "MCD","ABT","TMO","UPS","LOW","IBM","CAT","HON","BA","PYPL",
     "AMAT","MU","NOW","SHOP","PLTR","UBER","ABNB","MRNA","SQ","ROKU",
     "SNOW","ZS","CRWD","PANW","SMCI","DE","GM","F","FDX","LMT",
@@ -390,7 +387,7 @@ async def predict_history(
         try:
             import yfinance as yf
             df = await asyncio.to_thread(
-                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=False
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
             )
             if df is not None and not df.empty and "Close" in df:
                 s = df["Close"].dropna().astype(float)
@@ -453,7 +450,7 @@ async def quote_endpoint(ticker: str):
 async def earnings_endpoint(ticker: str):
     return await asyncio.to_thread(get_earnings, ticker)
 
-@router.get("/dividends", summary="Dividends Endpoint")  # NEW to match frontend fetchDividends()
+@router.get("/dividends", summary="Dividends Endpoint")
 async def dividends_endpoint(ticker: str):
     return await asyncio.to_thread(get_dividends, ticker)
 
@@ -538,7 +535,7 @@ async def closes_endpoint(ticker: str, days: int = 60):
         try:
             import yfinance as yf
             df = await asyncio.to_thread(
-                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=False
+                yf.download, symbol, period="3mo", interval="1d", progress=False, auto_adjust=True
             )
             if df is not None and not df.empty and "Close" in df:
                 s = df["Close"].dropna().astype(float)
@@ -574,7 +571,7 @@ async def stats_endpoint(ticker: str):
     try:
         import yfinance as yf
         df = await asyncio.to_thread(
-            yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=False
+            yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=True
         )
         if df is not None and not df.empty and "Close" in df:
             s = df["Close"].dropna().astype(float)
@@ -598,10 +595,55 @@ async def stats_endpoint(ticker: str):
     }
 
 # ----------------------- Movers (Top gainers/losers) -----------------------
+
+async def _last_two_closes(sym: str) -> Optional[Tuple[float, float]]:
+    """
+    Return (last_close, prev_close) with a generous timeout + yfinance fallback.
+    This fixes the '0.00%' issue when quotes are stale and closes fetch is slow.
+    """
+    # A) Provider with dates (preferred)
+    try:
+        series = await asyncio.wait_for(
+            asyncio.to_thread(get_daily_closes_with_dates, sym, 4),
+            timeout=4.5,  # was ~1.5 — too tight on Render
+        )
+        closes = series.get("closes") or []
+        closes = [float(x) for x in closes if _to_float(x) is not None]
+        if len(closes) >= 2:
+            return float(closes[-1]), float(closes[-2])
+    except Exception:
+        pass
+
+    # B) Simple closes (second try)
+    try:
+        closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 4), timeout=4.5)
+        closes = [float(x) for x in closes if _to_float(x) is not None]
+        if len(closes) >= 2:
+            return float(closes[-1]), float(closes[-2])
+    except Exception:
+        pass
+
+    # C) yfinance (final safety net)
+    try:
+        import yfinance as yf
+        df = await asyncio.to_thread(
+            yf.download, sym, period="7d", interval="1d", progress=False, auto_adjust=True
+        )
+        if df is not None and not df.empty and "Close" in df:
+            s = df["Close"].dropna().astype(float)
+            if len(s) >= 2:
+                return float(s.iloc[-1]), float(s.iloc[-2])
+    except Exception:
+        pass
+
+    return None
+
 @router.get("/movers", summary="Movers")
 async def movers():
     """
-    Returns normalized gainers/losers with display-safe %:
+    Returns normalized gainers/losers with display-safe % based on **EOD calibration**:
+      - Prefer last_close vs prev_close from daily closes
+      - Fall back to quote when closes unavailable
       { "gainers": [...], "losers": [...], "source": "alphavantage|fallback-local" }
     """
     key = os.getenv("ALPHAVANTAGE_API_KEY")
@@ -632,41 +674,64 @@ async def movers():
         except Exception:
             pass  # fall through to local fallback
 
-    # ---- 2) Local fallback with hard budget ----
+    # ---- 2) Local fallback with EOD-calibrated change ----
     used_source = "fallback-local"
     universe = _universe_from_env()[:96]
 
     async def compute_row(sym: str) -> Optional[Dict[str, Any]]:
+        """
+        Strategy:
+          A) Try quote quickly.
+          B) If quote looks stale (pct≈0 or price==last) or missing → compute EOD % from last two closes.
+          C) If closes unavailable, use quote-derived % as last resort.
+        """
+        price = last = pct = chg = None
+
+        # A) Quote first (low-latency)
         try:
-            q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=1.5)
+            q = await asyncio.wait_for(asyncio.to_thread(get_quote, sym), timeout=1.2)
             price = _to_float(q.get("current_price"))
             last  = _to_float(q.get("last_close"))
             pct   = _to_float(q.get("change_pct"))
-            if (pct is None or pct == 0.0) and price is not None and last:
-                pct = ((price - last) / last) * 100.0
-            chg = None
-            if price is not None and last is not None:
+
+            # Stale if pct ~ 0 OR price == last
+            is_stale = (pct is None or abs(pct) < 0.01) or (
+                price is not None and last is not None and abs(price - last) < 1e-9
+            )
+
+            if not is_stale and price is not None and last is not None:
                 chg = price - last
-            if isinstance(price, float) and isinstance(pct, float) and math.isfinite(price) and math.isfinite(pct):
-                return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
+                if pct is None:
+                    pct = _safe_pct(price, last)
         except Exception:
             pass
 
-        try:
-            closes = await asyncio.wait_for(asyncio.to_thread(get_daily_closes, sym, 3), timeout=1.5)
-            closes = [float(x) for x in closes if isinstance(x, (int, float, str))]
-            if len(closes) >= 2:
-                last = float(closes[-1]); prev = float(closes[-2])
-                chg = last - prev
-                pct = (chg / prev) * 100.0 if prev else 0.0
-                if math.isfinite(last) and math.isfinite(pct):
-                    return {"symbol": sym, "price": last, "change": chg, "change_pct": pct}
-        except Exception:
-            pass
+        # B) Prefer EOD closes if quote stale or incomplete
+        need_eod = (
+            pct is None or abs(pct) < 0.01 or last is None or price is None or
+            (price is not None and last is not None and abs(price - last) < 1e-9)
+        )
+        if need_eod:
+            twc = await _last_two_closes(sym)
+            if twc:
+                last_c, prev_c = twc
+                if prev_c and last_c:
+                    chg_eod = last_c - prev_c
+                    pct_eod = (chg_eod / prev_c) * 100.0 if prev_c != 0 else 0.0
+                    return {"symbol": sym, "price": last_c, "change": chg_eod, "change_pct": pct_eod}
+
+        # C) Fall back to quote-derived if we have it
+        if price is not None and last is not None:
+            if pct is None:
+                pct = _safe_pct(price, last)
+            if chg is None:
+                chg = price - last
+            return {"symbol": sym, "price": price, "change": chg, "change_pct": pct}
+
         return None
 
     tasks = [asyncio.create_task(compute_row(s)) for s in universe]
-    done, pending = await asyncio.wait(tasks, timeout=7.5)
+    done, pending = await asyncio.wait(tasks, timeout=8.0)  # was 7.5
     rows: List[Dict[str, Any]] = []
     for t in done:
         try:
